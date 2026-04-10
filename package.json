@@ -1,0 +1,55 @@
+{
+	"name": "@harperfast/integration-testing",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Integration testing utilities for Harper-based projects. Provides Harper instance lifecycle management, loopback address pooling, and a test runner script.",
+	"license": "Apache-2.0",
+	"exports": {
+		".": "./src/index.ts",
+		"./run": "./src/scripts/run.ts"
+	},
+	"bin": {
+		"harper-integration-test-run": "./dist/run.js",
+		"harper-integration-test-setup-loopback": "./scripts/setup-loopback.sh"
+	},
+	"files": [
+		"dist",
+		"scripts",
+		"api.md",
+		"README.md"
+	],
+	"scripts": {
+		"check": "tsc",
+		"build": "tsc -p tsconfig.build.json"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"devEngines": {
+		"runtime": {
+			"name": "node",
+			"version": ">=22",
+			"onFail": "error"
+		},
+		"packageManager": {
+			"name": "npm",
+			"onFail": "error"
+		}
+	},
+	"dependencies": {
+		"tar-fs": "3.1.2"
+	},
+	"devDependencies": {
+		"@types/node": "22.0.0",
+		"@types/tar-fs": "2.0.4",
+		"typescript": "6.0.2"
+	},
+	"peerDependencies": {
+		"harper": "^5.0.0"
+	},
+	"peerDependenciesMeta": {
+		"harper": {
+			"optional": false
+		}
+	}
+}
