@@ -5,8 +5,10 @@
 	"description": "Integration testing utilities for Harper-based projects. Provides Harper instance lifecycle management, loopback address pooling, and a test runner script.",
 	"license": "Apache-2.0",
 	"exports": {
-		".": "./src/index.ts",
-		"./run": "./src/scripts/run.ts"
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
 	},
 	"bin": {
 		"harper-integration-test-run": "dist/run.js",
