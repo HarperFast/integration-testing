@@ -9,8 +9,8 @@
 		"./run": "./src/scripts/run.ts"
 	},
 	"bin": {
-		"harper-integration-test-run": "./dist/run.js",
-		"harper-integration-test-setup-loopback": "./scripts/setup-loopback.sh"
+		"harper-integration-test-run": "dist/run.js",
+		"harper-integration-test-setup-loopback": "scripts/setup-loopback.sh"
 	},
 	"files": [
 		"dist",
