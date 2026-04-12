@@ -97,21 +97,66 @@ Kills Harper, releases the loopback address back to the pool, and removes the in
 
 Helper to POST an operation to the Operations API and assert HTTP 200.
 
-### `ContextWithHarper`
+### `createHarperContext(name?)`
 
-TypeScript interface for the test context populated by `startHarper()`. When using `node:test`, pass it as the suite context type:
+Creates a plain object satisfying `HarperTestContext`, for use outside `node:test` (e.g. Playwright worker fixtures). The `name` is optional and used for log directory naming.
+
+```ts
+// Playwright example
+const ctx = createHarperContext(`worker-${workerInfo.workerIndex}`);
+await startHarper(ctx);
+```
+
+### Types
+
+There are four related TypeScript types — it helps to understand how they compose.
+
+**`HarperContext`** is the instance data object stored at `ctx.harper` after `startHarper()` resolves. It describes a running Harper instance:
 
 ```ts
 interface HarperContext {
-  dataRootDir: string;          // Harper install directory
+  dataRootDir: string;          // absolute path to the Harper install directory
   admin: { username: string; password: string };
   httpURL: string;              // e.g. 'http://127.0.0.2:9926'
   operationsAPIURL: string;     // e.g. 'http://127.0.0.2:9925'
   hostname: string;             // e.g. '127.0.0.2'
   process: ChildProcess;
-  logDir?: string;
+  logDir?: string;              // set when HARPER_INTEGRATION_TEST_LOG_DIR is configured
 }
 ```
+
+**`HarperTestContext`** is the minimal context shape accepted by `startHarper()`, `setupHarperWithFixture()`, `killHarper()`, and `teardownHarper()`. It is intentionally loose so it can be satisfied by a plain object or a `node:test` context:
+
+```ts
+interface HarperTestContext {
+  name?: string;                // used for log directory naming
+  harper?: Partial<HarperContext>;  // populated by startHarper()
+}
+```
+
+**`StartedHarperTestContext`** is the same as `HarperTestContext` but with `harper` guaranteed to be a fully populated `HarperContext`. It is the return type of `startHarper()` and `setupHarperWithFixture()`, and the required parameter type of `killHarper()` and `teardownHarper()`:
+
+```ts
+interface StartedHarperTestContext extends HarperTestContext {
+  harper: HarperContext;
+}
+```
+
+**`ContextWithHarper`** is for `node:test` only. It extends both `SuiteContext` and `TestContext` from `node:test` with `harper: HarperContext`, so you can use it as the typed context parameter in a `suite()` callback:
+
+```ts
+// node:test usage
+suite('my suite', (ctx: ContextWithHarper) => {
+  before(async () => { await startHarper(ctx); });
+  after(async () => { await teardownHarper(ctx); });
+
+  test('example', async () => {
+    const res = await fetch(ctx.harper.httpURL);
+  });
+});
+```
+
+If you are not using `node:test`, use `createHarperContext()` to create a plain `HarperTestContext` instead.
 
 ### Server Log Capture
 
