@@ -4,6 +4,7 @@
 		"noEmit": false,
 		"sourceMap": true,
 		"declaration": true,
+		"rootDir": "src",
 		"outDir": "dist",
 	}
 }
