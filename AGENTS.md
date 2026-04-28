@@ -5,7 +5,7 @@ Review the `README.md` and `CONTRIBUTING.md` for all relevant repository informa
 ## Development Tips
 - Ensure you're on at least Node.js v22 or greater when contributing
 - Use `npm install` to install dependencies
-- Use `npm run build` to build the project in preparation for publishing
+- Use `npm run build` to build the project
 - Do not run `npm version` or `npm publish`; these commands are for humans only.
 - When updating core code, make sure to update relevant documentation.
   - Public API and usage docs are in `README.md`
@@ -21,4 +21,4 @@ Review the `README.md` and `CONTRIBUTING.md` for all relevant repository informa
 ## Testing Tips
 - Use `npm link` in this directory and `npm link @harperfast/integration-testing` in other project directories to test out changes locally
 - Use `npm run check` to type-check the project without generating a build output
-- There is currently no tests for this project
+- There are currently no tests for this project
