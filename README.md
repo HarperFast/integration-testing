@@ -122,6 +122,7 @@ interface HarperContext {
   hostname: string;             // e.g. '127.0.0.2'
   process: ChildProcess;
   logDir?: string;              // set when HARPER_INTEGRATION_TEST_LOG_DIR is configured
+  startupOutput?: { stdout: string; stderr: string }; // captured startup output
 }
 ```
 
@@ -160,10 +161,30 @@ If you are not using `node:test`, use `createHarperContext()` to create a plain 
 
 ### Server Log Capture
 
-When `HARPER_INTEGRATION_TEST_LOG_DIR` is set, each Harper instance writes its logs to a per-suite subdirectory. Logs from passing suites are automatically cleaned up; only failing suite logs are retained.
+When `HARPER_INTEGRATION_TEST_LOG_DIR` is set, each Harper instance writes its logs to a per-suite subdirectory. Logs are preserved for the lifetime of the log directory. In CI, combine with artifact upload steps that run on failure to capture logs from failing runs.
 
 ```sh
 HARPER_INTEGRATION_TEST_LOG_DIR=/tmp/harper-test-logs npx harper-integration-test-run "integrationTests/**/*.test.ts"
+```
+
+Additionally, `startupOutput` on `HarperContext` provides the captured stdout/stderr from Harper startup for programmatic access (e.g. attaching to Playwright test results).
+
+### `HarperStartupError`
+
+When Harper fails to start or times out, a `HarperStartupError` is thrown. It extends `Error` and includes structured `stdout` and `stderr` properties for diagnostics:
+
+```ts
+import { HarperStartupError } from '@harperfast/integration-testing';
+
+try {
+  await startHarper(ctx);
+} catch (error) {
+  if (error instanceof HarperStartupError) {
+    console.error('Startup failed:', error.message);
+    console.error('stdout:', error.stdout);
+    console.error('stderr:', error.stderr);
+  }
+}
 ```
 
 ### `targz(dirPath)`
