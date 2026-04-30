@@ -169,6 +169,15 @@ function getHarperScript(harperBinPath?: string): string {
 }
 
 /**
+ * Strips ANSI escape sequences (colors, bold, underline, cursor movement, etc.) from a string.
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_REGEX = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
+function stripAnsi(str: string): string {
+	return str.replace(ANSI_REGEX, '');
+}
+
+/**
  * Sanitizes a string for use as a filesystem directory name.
  */
 function sanitizeForFilesystem(name: string): string {
@@ -268,12 +277,8 @@ function runHarperCommand({
 		}, effectiveTimeout);
 
 		proc.stdout?.on('data', (data: Buffer) => {
-			const dataString = data.toString();
-			if (dataString.includes('[38;5;16m')) {
-				// Including the dog logo makes it very difficult to decifer the logs
-				return;
-			}
-			stdoutStream?.write(data);
+			const dataString = stripAnsi(data.toString());
+			stdoutStream?.write(dataString);
 			if (completionMessage && dataString.includes(completionMessage)) {
 				clearTimeout(timer);
 				resolve({ process: proc, stdout, stderr });
@@ -282,8 +287,9 @@ function runHarperCommand({
 		});
 
 		proc.stderr?.on('data', (data: Buffer) => {
-			stderrStream?.write(data);
-			stderr += data.toString();
+			const dataString = stripAnsi(data.toString());
+			stderrStream?.write(dataString);
+			stderr += dataString;
 		});
 
 		proc.on('error', (error) => {
@@ -368,7 +374,8 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	let logDir: string | undefined;
 	if (LOG_DIR) {
 		const suiteName = sanitizeForFilesystem(ctx.name || 'unknown');
-		logDir = join(LOG_DIR, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}`);
+		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+		logDir = join(LOG_DIR, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
 		await mkdir(logDir, { recursive: true });
 	}
 
