@@ -170,6 +170,84 @@ HARPER_INTEGRATION_TEST_LOG_DIR=/tmp/harper-test-logs npx harper-integration-tes
 
 Packs and compresses a directory into a base64-encoded tar.gz string. Useful for `deploy_component` Operations API calls.
 
+### Security Testing Utilities
+
+A set of utilities for testing Harper's mTLS certificate verification features (OCSP and CRL). All certificate generation is done in pure Node.js using the built-in `webcrypto` API and `pkijs` — no `openssl` CLI dependency.
+
+#### `setupOcspResponderWithCerts(certsPath, hostname?, maxRetries?)`
+
+Generates OCSP test certificates and starts a Node.js OCSP responder server on a random port (with automatic retry on port conflict). Returns an `OcspResponderContext` containing the server, port, certs path, and certificate file paths.
+
+#### `stopOcspResponder(ctx)`
+
+Stops a running OCSP responder server.
+
+#### `setupCrlServerWithCerts(certsPath, hostname?, maxRetries?)`
+
+Generates CRL test certificates and starts a Node.js HTTP server that serves the CRL file at `/test.crl`. Returns a `CrlServerContext` containing the server, port, certs path, and certificate file paths.
+
+#### `stopCrlServer(ctx)`
+
+Stops a running CRL server.
+
+#### `startCrlServer(certsPath, port, certs)`
+
+Low-level function to start a CRL server on a specific port with pre-generated certificates.
+
+#### `generateOcspCertificates(outputDir, ocspHost, ocspPort)`
+
+Generates a complete set of OCSP test certificates: CA, OCSP responder, valid client, and revoked client. Writes PEM files to `outputDir`. Returns both file paths and in-memory certificate objects for use with the OCSP server.
+
+#### `generateCrlCertificates(outputDir, crlHost, crlPort)`
+
+Generates a complete set of CRL test certificates: CA, valid client, and revoked client, plus a CRL with the revoked serial. Writes PEM files to `outputDir`.
+
+#### `startOcspServer(port, certs)` / `stopOcspServer(server)`
+
+Low-level functions to start and stop a Node.js OCSP responder server on a specific port with pre-generated certificates.
+
+#### Certificate generation primitives
+
+Lower-level utilities exported for advanced use: `generateEd25519KeyPair`, `createCertificate`, `createCRL`, `certToPem`, `crlToPem`, `makeCRLDistributionPointsExt`, `makeOCSPAIAExt`, `makeExtKeyUsageExt`, `signBasicOCSPResponse`, `OCSP_SIGNING_OID`, `CLIENT_AUTH_OID`.
+
+#### Example: OCSP test setup
+
+```ts
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  setupHarperWithFixture,
+  teardownHarper,
+  setupOcspResponderWithCerts,
+  stopOcspResponder,
+  type ContextWithHarper,
+  type OcspResponderContext,
+} from '@harperfast/integration-testing';
+
+suite('mTLS OCSP', (ctx: ContextWithHarper) => {
+  let ocspResponder: OcspResponderContext;
+  let certsPath: string;
+
+  before(async () => {
+    certsPath = await mkdtemp(join(tmpdir(), 'harper-ocsp-'));
+    ocspResponder = await setupOcspResponderWithCerts(certsPath);
+    await setupHarperWithFixture(ctx, FIXTURE_PATH, {
+      config: {
+        tls: { certificateAuthority: ocspResponder.certs.ca },
+        http: { mtls: { user: 'admin', certificateVerification: { ocsp: { enabled: true } } } },
+      },
+    });
+  });
+
+  after(async () => {
+    await stopOcspResponder(ocspResponder);
+    await teardownHarper(ctx);
+    await rm(certsPath, { recursive: true, force: true });
+  });
+});
+```
+
 ### Loopback Pool Utilities
 
 These are used internally by `startHarper` and `teardownHarper`, but are exported for advanced use cases or custom runner integrations.
