@@ -9,6 +9,7 @@ export {
 	DEFAULT_ADMIN_USERNAME,
 	DEFAULT_ADMIN_PASSWORD,
 	DEFAULT_STARTUP_TIMEOUT_MS,
+	HARPER_RUNTIME,
 	type StartHarperOptions,
 	type HarperContext,
 	type HarperTestContext,

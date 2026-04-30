@@ -42,13 +42,20 @@ export function createHarperContext(name?: string): HarperTestContext {
 // Constants
 const HTTP_PORT = 9926;
 const HTTPS_PORT = 9927;
+const MQTT_PORT = 1883;
+const MQTTS_PORT = 8883;
 export const OPERATIONS_API_PORT = 9925;
 export const DEFAULT_ADMIN_USERNAME = 'admin';
 export const DEFAULT_ADMIN_PASSWORD = 'Abc1234!';
-export const DEFAULT_STARTUP_TIMEOUT_MS = process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
-	? parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS, 10)
-	: 30000;
+export const DEFAULT_STARTUP_TIMEOUT_MS = parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS || '', 10) || 60000;
 const LOG_DIR = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
+
+/**
+ * The runtime to use for running Harper during tests.
+ * Set via the HARPER_RUNTIME environment variable ('node' or 'bun').
+ * Defaults to 'node'.
+ */
+export const HARPER_RUNTIME: 'node' | 'bun' = (process.env.HARPER_RUNTIME as any) || 'node';
 
 /**
  * Options for setting up a Harper instance.
@@ -194,13 +201,14 @@ function runHarperCommand({
 	harperBinPath,
 }: RunHarperCommandOptions): Promise<ChildProcess> {
 	const harperScript = getHarperScript(harperBinPath);
-	const proc = spawn(
-		'node',
-		['--trace-warnings', '--force-node-api-uncaught-exceptions-policy=true', harperScript, ...args],
-		{
-			env: { ...process.env, ...env },
-		}
-	);
+	const runtime = HARPER_RUNTIME;
+	const runtimeArgs =
+		runtime === 'bun'
+			? [harperScript, ...args]
+			: ['--trace-warnings', '--force-node-api-uncaught-exceptions-policy=true', harperScript, ...args];
+	const proc = spawn(runtime, runtimeArgs, {
+		env: { ...process.env, ...env },
+	});
 
 	let stdoutStream: WriteStream | undefined;
 	let stderrStream: WriteStream | undefined;
@@ -226,6 +234,10 @@ function runHarperCommand({
 
 		proc.stdout?.on('data', (data: Buffer) => {
 			const dataString = data.toString();
+			if (dataString.includes('[38;5;16m')) {
+				// Including the dog logo makes it very difficult to decifer the logs
+				return;
+			}
 			stdoutStream?.write(data);
 			if (completionMessage && dataString.includes(completionMessage)) {
 				clearTimeout(timer);
@@ -345,7 +357,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 
 	const args = [
 		`--ROOTPATH=${dataRootDir}`,
-		'--DEFAULTS_MODE=dev',
+		`--AUTHENTICATION_AUTHORIZELOCAL=true`,
 		`--HDB_ADMIN_USERNAME=${DEFAULT_ADMIN_USERNAME}`,
 		`--HDB_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}`,
 		'--THREADS_COUNT=1',
@@ -353,6 +365,8 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		`--NODE_HOSTNAME=${loopbackAddress}`,
 		`--HTTP_PORT=${loopbackAddress}:${HTTP_PORT}`,
 		`--OPERATIONSAPI_NETWORK_PORT=${loopbackAddress}:${OPERATIONS_API_PORT}`,
+		`--MQTT_NETWORK_PORT=${loopbackAddress}:${MQTT_PORT}`,
+		`--MQTT_NETWORK_SECUREPORT=${loopbackAddress}:${MQTTS_PORT}`,
 		'--LOGGING_LEVEL=debug',
 		'--LOGGING_STDSTREAMS=false',
 	];
@@ -398,6 +412,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
  * @param ctx
  */
 export async function killHarper(ctx: StartedHarperTestContext): Promise<void> {
+	if (!ctx.harper?.process) return;
 	await new Promise<void>((resolve) => {
 		let timer: NodeJS.Timeout;
 		ctx.harper.process.on('exit', () => {
@@ -437,6 +452,7 @@ export async function killHarper(ctx: StartedHarperTestContext): Promise<void> {
  * ```
  */
 export async function teardownHarper(ctx: StartedHarperTestContext): Promise<void> {
+	if (!ctx.harper) return;
 	await killHarper(ctx);
 
 	await releaseLoopbackAddress(ctx.harper.hostname);
