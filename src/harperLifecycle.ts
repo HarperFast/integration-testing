@@ -1,5 +1,5 @@
 import { spawn, ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, rmSync, type WriteStream } from 'node:fs';
+import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
@@ -104,6 +104,8 @@ export interface HarperContext {
 	process: ChildProcess;
 	/** Absolute path to the log directory for this suite (only set when HARPER_INTEGRATION_TEST_LOG_DIR is configured) */
 	logDir?: string;
+	/** Captured stdout/stderr from Harper startup, up to the point it reported ready. */
+	startupOutput?: { stdout: string; stderr: string };
 }
 
 /**
@@ -167,6 +169,15 @@ function getHarperScript(harperBinPath?: string): string {
 }
 
 /**
+ * Strips ANSI escape sequences (colors, bold, underline, cursor movement, etc.) from a string.
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_REGEX = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
+function stripAnsi(str: string): string {
+	return str.replace(ANSI_REGEX, '');
+}
+
+/**
  * Sanitizes a string for use as a filesystem directory name.
  */
 function sanitizeForFilesystem(name: string): string {
@@ -176,6 +187,29 @@ function sanitizeForFilesystem(name: string): string {
 		.substring(0, 100);
 }
 
+/**
+ * Error thrown when a Harper process fails to start or times out.
+ * Includes captured stdout and stderr for diagnostics.
+ */
+export class HarperStartupError extends Error {
+	stdout: string;
+	stderr: string;
+
+	constructor(message: string, stdout: string, stderr: string) {
+		let fullMessage = message;
+		if (stdout) {
+			fullMessage += `\n\nstdout:\n${stdout}`;
+		}
+		if (stderr) {
+			fullMessage += `\n\nstderr:\n${stderr}`;
+		}
+		super(fullMessage);
+		this.name = 'HarperStartupError';
+		this.stdout = stdout;
+		this.stderr = stderr;
+	}
+}
+
 interface RunHarperCommandOptions {
 	args: string[];
 	env: any;
@@ -183,6 +217,16 @@ interface RunHarperCommandOptions {
 	/** When set, stdout and stderr are written to files in this directory */
 	logDir?: string;
 	harperBinPath?: string;
+	/** Timeout in milliseconds to wait for the process to complete or emit the completionMessage. Falls back to DEFAULT_STARTUP_TIMEOUT_MS. */
+	timeoutMs?: number;
+}
+
+interface RunHarperCommandResult {
+	process: ChildProcess;
+	/** Captured stdout up to the point the process was considered ready or exited. */
+	stdout: string;
+	/** Captured stderr up to the point the process was considered ready or exited. */
+	stderr: string;
 }
 
 /**
@@ -191,7 +235,7 @@ interface RunHarperCommandOptions {
  * When `logDir` is provided, stdout and stderr are also written to files
  * (`stdout.log` and `stderr.log`) in that directory.
  *
- * @throws {AssertionError} If the command exits with a non-zero status code
+ * @throws {HarperStartupError} If the command times out or exits with a non-zero status code
  */
 function runHarperCommand({
 	args,
@@ -199,7 +243,8 @@ function runHarperCommand({
 	completionMessage,
 	logDir,
 	harperBinPath,
-}: RunHarperCommandOptions): Promise<ChildProcess> {
+	timeoutMs,
+}: RunHarperCommandOptions): Promise<RunHarperCommandResult> {
 	const harperScript = getHarperScript(harperBinPath);
 	const runtime = HARPER_RUNTIME;
 	const runtimeArgs =
@@ -217,38 +262,34 @@ function runHarperCommand({
 		stderrStream = createWriteStream(join(logDir, 'stderr.log'));
 	}
 
+	const effectiveTimeout = timeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+
 	return new Promise((resolve, reject) => {
 		let stdout = '';
 		let stderr = '';
 		let timer = setTimeout(() => {
-			let errorMessage = `Harper process timed out after ${DEFAULT_STARTUP_TIMEOUT_MS}ms`;
-			if (stdout) {
-				errorMessage += `\n\nstdout:\n${stdout}`;
-			}
-			if (stderr) {
-				errorMessage += `\n\nstderr:\n${stderr}`;
-			}
-			reject(errorMessage);
+			reject(new HarperStartupError(
+				`Harper process timed out after ${effectiveTimeout}ms`,
+				stdout,
+				stderr
+			));
 			proc.kill();
-		}, DEFAULT_STARTUP_TIMEOUT_MS);
+		}, effectiveTimeout);
 
 		proc.stdout?.on('data', (data: Buffer) => {
-			const dataString = data.toString();
-			if (dataString.includes('[38;5;16m')) {
-				// Including the dog logo makes it very difficult to decifer the logs
-				return;
-			}
-			stdoutStream?.write(data);
+			const dataString = stripAnsi(data.toString());
+			stdoutStream?.write(dataString);
 			if (completionMessage && dataString.includes(completionMessage)) {
 				clearTimeout(timer);
-				resolve(proc);
+				resolve({ process: proc, stdout, stderr });
 			}
 			stdout += dataString;
 		});
 
 		proc.stderr?.on('data', (data: Buffer) => {
-			stderrStream?.write(data);
-			stderr += data.toString();
+			const dataString = stripAnsi(data.toString());
+			stderrStream?.write(dataString);
+			stderr += dataString;
 		});
 
 		proc.on('error', (error) => {
@@ -257,14 +298,11 @@ function runHarperCommand({
 		proc.on('exit', (statusCode, signal) => {
 			clearTimeout(timer);
 			if (statusCode === 0) {
-				resolve(proc);
+				resolve({ process: proc, stdout, stderr });
 			} else {
-				let errorMessage = `Harper process failed with exit code/signal ${statusCode ?? signal}`;
+				const errorMessage = `Harper process failed with exit code/signal ${statusCode ?? signal}`;
 				stderrStream?.write(errorMessage);
-				if (stderr) {
-					errorMessage += `\n\nstderr:\n${stderr}`;
-				}
-				reject(errorMessage);
+				reject(new HarperStartupError(errorMessage, stdout, stderr));
 			}
 			stdoutStream?.end();
 			stderrStream?.end();
@@ -336,7 +374,8 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	let logDir: string | undefined;
 	if (LOG_DIR) {
 		const suiteName = sanitizeForFilesystem(ctx.name || 'unknown');
-		logDir = join(LOG_DIR, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}`);
+		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+		logDir = join(LOG_DIR, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
 		await mkdir(logDir, { recursive: true });
 	}
 
@@ -344,15 +383,6 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	const config = { ...options?.config };
 	if (logDir) {
 		config.logging = { ...config.logging, root: logDir };
-
-		// Clean up log directory on successful exit — only keep logs when tests fail
-		process.on('exit', (code) => {
-			if (code === 0) {
-				try {
-					rmSync(logDir, { recursive: true, force: true });
-				} catch {}
-			}
-		});
 	}
 
 	const args = [
@@ -383,12 +413,13 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		...options?.env,
 	};
 
-	const harperProcess = await runHarperCommand({
+	const result = await runHarperCommand({
 		args,
 		env: harperEnv,
 		completionMessage: 'successfully started',
 		logDir,
 		harperBinPath: options?.harperBinPath,
+		timeoutMs: options?.startupTimeoutMs,
 	});
 
 	ctx.harper = {
@@ -400,8 +431,9 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		httpURL: `http://${loopbackAddress}:${HTTP_PORT}`,
 		operationsAPIURL: `http://${loopbackAddress}:${OPERATIONS_API_PORT}`,
 		hostname: loopbackAddress,
-		process: harperProcess,
+		process: result.process,
 		logDir,
+		startupOutput: { stdout: result.stdout, stderr: result.stderr },
 	};
 
 	return ctx as StartedHarperTestContext;

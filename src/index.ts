@@ -5,6 +5,7 @@ export {
 	teardownHarper,
 	sendOperation,
 	createHarperContext,
+	HarperStartupError,
 	OPERATIONS_API_PORT,
 	DEFAULT_ADMIN_USERNAME,
 	DEFAULT_ADMIN_PASSWORD,
