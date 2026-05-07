@@ -48,7 +48,6 @@ export const OPERATIONS_API_PORT = 9925;
 export const DEFAULT_ADMIN_USERNAME = 'admin';
 export const DEFAULT_ADMIN_PASSWORD = 'Abc1234!';
 export const DEFAULT_STARTUP_TIMEOUT_MS = parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS || '', 10) || 60000;
-const LOG_DIR = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
 
 /**
  * The runtime to use for running Harper during tests.
@@ -371,12 +370,16 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	const loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
 
 	// Set up per-suite log directory when HARPER_INTEGRATION_TEST_LOG_DIR is configured
+	const logDirEnv = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
 	let logDir: string | undefined;
-	if (LOG_DIR) {
+	if (logDirEnv) {
 		const suiteName = sanitizeForFilesystem(ctx.name || 'unknown');
 		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-		logDir = join(LOG_DIR, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
+		logDir = join(logDirEnv, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
 		await mkdir(logDir, { recursive: true });
+
+		// Output for the test runner (e.g. run.ts) to map this log dir to the current test file
+		process.stdout.write(`[Harper] Logs for this instance will be stored in: ${logDir}\n`);
 	}
 
 	// Point Harper's log directory to the suite log dir so hdb.log is preserved for upload
