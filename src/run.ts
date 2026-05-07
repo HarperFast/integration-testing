@@ -121,7 +121,7 @@ runner.on('test:stdout', (data: any) => {
 
 runner.on('test:fail', (data: any) => {
 	process.exitCode = 1;
-	if (data.file && data.details?.type === 'test') {
+	if (data.file) {
 		failedFiles.add(resolve(data.file));
 	}
 });
