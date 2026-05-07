@@ -1,6 +1,6 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
 import { type SuiteContext, type TestContext } from 'node:test';
@@ -148,7 +148,21 @@ function getHarperScript(harperBinPath?: string): string {
 		return envPath;
 	}
 
-	// 3. Auto-resolve from node_modules
+	// 3. Auto-resolve from current directory or ancestors
+	let currentDir = process.cwd();
+	while (true) {
+		const potentialPath = join(currentDir, 'dist/bin/harper.js');
+		if (existsSync(potentialPath)) {
+			return potentialPath;
+		}
+		const parentDir = dirname(currentDir);
+		if (parentDir === currentDir) {
+			break;
+		}
+		currentDir = parentDir;
+	}
+
+	// 4. Auto-resolve from node_modules
 	try {
 		const require = createRequire(import.meta.url);
 		const resolved = require.resolve('harper/dist/bin/harper.js');
@@ -163,6 +177,7 @@ function getHarperScript(harperBinPath?: string): string {
 		`Harper CLI script not found. Provide the path via:\n` +
 			`  - harperBinPath option: startHarper(ctx, { harperBinPath: '/path/to/dist/bin/harper.js' })\n` +
 			`  - HARPER_INTEGRATION_TEST_INSTALL_SCRIPT environment variable\n` +
+			`  - Run tests within a directory containing 'dist/bin/harper.js'\n` +
 			`  - Install 'harper' as a dependency in your project`
 	);
 }
