@@ -509,7 +509,11 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 	await releaseLoopbackAddress(ctx.harper.hostname);
 
 	// a few retries are typically necessary, might take a sec for a process to finish, especially since rocksdb may be flushing
-	await rm(ctx.harper.dataRootDir, { recursive: true, force: true, maxRetries: 4 });
+	try {
+		await rm(ctx.harper.dataRootDir, { recursive: true, force: true, maxRetries: 10 });
+	} catch(error) {
+		console.error('Error removing directory', error);
+	}
 }
 
 export async function sendOperation(context: HarperContext, operation: any) {
