@@ -127,6 +127,7 @@ export interface ContextWithHarper extends SuiteContext, TestContext {
  * 1. `harperBinPath` argument
  * 2. `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` environment variable
  * 3. Auto-resolved from 'harper' package in node_modules
+ * 4. Auto-resolved from current directory or ancestors ('dist/bin/harper.js')
  *
  * @returns The absolute path to the Harper CLI entry script
  * @throws {AssertionError} If the script cannot be found
@@ -148,7 +149,18 @@ function getHarperScript(harperBinPath?: string): string {
 		return envPath;
 	}
 
-	// 3. Auto-resolve from current directory or ancestors
+	// 3. Auto-resolve from node_modules
+	try {
+		const require = createRequire(import.meta.url);
+		const resolved = require.resolve('harper/dist/bin/harper.js');
+		if (existsSync(resolved)) {
+			return resolved;
+		}
+	} catch {
+		// harper package not found in node_modules
+	}
+
+	// 4. Auto-resolve from current directory or ancestors
 	let currentDir = process.cwd();
 	while (true) {
 		const potentialPath = join(currentDir, 'dist/bin/harper.js');
@@ -162,23 +174,12 @@ function getHarperScript(harperBinPath?: string): string {
 		currentDir = parentDir;
 	}
 
-	// 4. Auto-resolve from node_modules
-	try {
-		const require = createRequire(import.meta.url);
-		const resolved = require.resolve('harper/dist/bin/harper.js');
-		if (existsSync(resolved)) {
-			return resolved;
-		}
-	} catch {
-		// harper package not found in node_modules
-	}
-
 	throw new Error(
 		`Harper CLI script not found. Provide the path via:\n` +
 			`  - harperBinPath option: startHarper(ctx, { harperBinPath: '/path/to/dist/bin/harper.js' })\n` +
 			`  - HARPER_INTEGRATION_TEST_INSTALL_SCRIPT environment variable\n` +
-			`  - Run tests within a directory containing 'dist/bin/harper.js'\n` +
-			`  - Install 'harper' as a dependency in your project`
+			`  - Install 'harper' as a dependency in your project\n` +
+			`  - Run tests within a directory containing 'dist/bin/harper.js'`
 	);
 }
 
