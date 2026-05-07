@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import { run } from 'node:test';
-import { availableParallelism } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { spec } from 'node:test/reporters';
 import { parseArgs } from 'node:util';
 import { validateLoopbackAddressPool } from './loopbackAddressPool.ts';
+import { mkdtemp } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { readFileSync, rmSync, existsSync } from 'node:fs';
 
 /**
  * Important! This script should not be required to execute integration tests.
+
  * Thus, it should not be responsible for any stateful management or setup/teardown logic.
  * All such logic should be contained within the individual test suites or utility functions.
  * Tests (individuals or multiples) should be executable directly via the Node.js Test Runner CLI and
@@ -77,7 +81,16 @@ if (ISOLATION !== 'none' && CONCURRENCY > 1) {
 	}
 }
 
-run({
+let createdTempLogDir: string | undefined;
+if (!process.env.HARPER_INTEGRATION_TEST_LOG_DIR) {
+	createdTempLogDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-logs-'));
+	process.env.HARPER_INTEGRATION_TEST_LOG_DIR = createdTempLogDir;
+}
+
+const fileToLogDirs = new Map<string, Set<string>>();
+const failedFiles = new Set<string>();
+
+const runner = run({
 	concurrency: ISOLATION === 'none' ? undefined : CONCURRENCY,
 	// @ts-expect-error - ignore until we do better env var / cli arg handling/validation
 	isolation: ISOLATION,
@@ -87,12 +100,74 @@ run({
 		index: SHARD_INDEX,
 		total: SHARD_TOTAL,
 	},
-})
-	.on('test:fail', () => {
-		process.exitCode = 1;
-	})
-	.compose(spec)
-	.pipe(process.stdout);
+});
+
+runner.on('test:stdout', (data: any) => {
+	const msg = data.message;
+	if (typeof msg === 'string' && msg.includes('[Harper] Logs for this instance will be stored in:')) {
+		const match = msg.match(/\[Harper\] Logs for this instance will be stored in: (.*)/);
+		if (match && data.file) {
+			const logDir = match[1].trim();
+			const normalizedFile = resolve(data.file);
+			let dirs = fileToLogDirs.get(normalizedFile);
+			if (!dirs) {
+				dirs = new Set();
+				fileToLogDirs.set(normalizedFile, dirs);
+			}
+			dirs.add(logDir);
+		}
+	}
+});
+
+runner.on('test:fail', (data: any) => {
+	process.exitCode = 1;
+	if (data.file && data.details?.type === 'test') {
+		failedFiles.add(resolve(data.file));
+	}
+});
+
+// @ts-expect-error - spec reporter type compatibility
+runner.compose(spec).pipe(process.stdout);
+
+process.on('exit', () => {
+	if (failedFiles.size > 0) {
+		console.log('\n\n' + '='.repeat(80));
+		console.log('--- TEST FAILURES DETECTED: HARPER LOGS ---');
+		console.log('='.repeat(80));
+
+		for (const file of failedFiles) {
+			const dirs = fileToLogDirs.get(file);
+			if (dirs && dirs.size > 0) {
+				for (const dir of dirs) {
+					const hdbLogPath = join(dir, 'hdb.log');
+					if (existsSync(hdbLogPath)) {
+						try {
+							const content = readFileSync(hdbLogPath, 'utf8');
+							// Capture the last 200 lines to avoid spamming the console too much, but enough to see context
+							const lines = content.split('\n');
+							const lastLines = lines.slice(-200).join('\n');
+							console.log(`\n--- Log for instance in ${file} ---`);
+							console.log(`Directory: ${dir}`);
+							console.log('-'.repeat(80));
+							console.log(lastLines);
+							console.log('-'.repeat(80));
+						} catch (e) {
+							console.error(`Failed to read log file ${hdbLogPath}:`, e);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (createdTempLogDir) {
+		try {
+			rmSync(createdTempLogDir, { recursive: true, force: true });
+		} catch (e) {
+			console.error(`Failed to clean up temporary log directory ${createdTempLogDir}:`, e);
+		}
+	}
+});
 
 function parseBoolean(value: string | undefined): boolean | undefined {
 	if (value === undefined) return undefined;
