@@ -57,6 +57,13 @@ export const DEFAULT_STARTUP_TIMEOUT_MS = parseInt(process.env.HARPER_INTEGRATIO
 export const HARPER_RUNTIME: 'node' | 'bun' = (process.env.HARPER_RUNTIME as any) || 'node';
 
 /**
+ * Marker emitted on stdout by startHarper() so the test runner (run.ts) can map
+ * a Harper instance's log directory to the currently executing test file via
+ * the node:test `test:stdout` event.
+ */
+export const LOG_DIR_MARKER_PREFIX = '[Harper] Logs for this instance will be stored in:';
+
+/**
  * Options for setting up a Harper instance.
  */
 export interface StartHarperOptions {
@@ -395,7 +402,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		await mkdir(logDir, { recursive: true });
 
 		// Output for the test runner (e.g. run.ts) to map this log dir to the current test file
-		process.stdout.write(`[Harper] Logs for this instance will be stored in: ${logDir}\n`);
+		process.stdout.write(`${LOG_DIR_MARKER_PREFIX} ${logDir}\n`);
 	}
 
 	// Point Harper's log directory to the suite log dir so hdb.log is preserved for upload

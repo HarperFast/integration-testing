@@ -4,6 +4,7 @@ import { availableParallelism, tmpdir } from 'node:os';
 import { spec } from 'node:test/reporters';
 import { parseArgs } from 'node:util';
 import { validateLoopbackAddressPool } from './loopbackAddressPool.ts';
+import { LOG_DIR_MARKER_PREFIX } from './harperLifecycle.ts';
 import { mkdtemp } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { readFileSync, rmSync, existsSync } from 'node:fs';
@@ -61,6 +62,11 @@ const [SHARD_INDEX, SHARD_TOTAL] = (process.env.HARPER_INTEGRATION_TEST_SHARD ||
 	.map((v) => parseInt(v, 10));
 // https://nodejs.org/docs/latest-v24.x/api/cli.html#--test-only
 const ONLY = parseBoolean(process.env.HARPER_INTEGRATION_TEST_ONLY) ?? values.only ?? false;
+// Number of trailing hdb.log lines to print per failed test. 0 (or any non-positive value) prints the entire log.
+const LOG_TAIL_LINES = (() => {
+	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_LOG_TAIL_LINES || '', 10);
+	return Number.isFinite(parsed) ? parsed : 200;
+})();
 
 const TEST_FILES = positionals;
 
@@ -102,20 +108,19 @@ const runner = run({
 	},
 });
 
+const logDirMarkerPattern = new RegExp(`${LOG_DIR_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} (.*)`);
+
 runner.on('test:stdout', (data: any) => {
-	const msg = data.message;
-	if (typeof msg === 'string' && msg.includes('[Harper] Logs for this instance will be stored in:')) {
-		const match = msg.match(/\[Harper\] Logs for this instance will be stored in: (.*)/);
-		if (match && data.file) {
-			const logDir = match[1].trim();
-			const normalizedFile = resolve(data.file);
-			let dirs = fileToLogDirs.get(normalizedFile);
-			if (!dirs) {
-				dirs = new Set();
-				fileToLogDirs.set(normalizedFile, dirs);
-			}
-			dirs.add(logDir);
+	const match = typeof data.message === 'string' && data.message.match(logDirMarkerPattern);
+	if (match && data.file) {
+		const logDir = match[1].trim();
+		const normalizedFile = resolve(data.file);
+		let dirs = fileToLogDirs.get(normalizedFile);
+		if (!dirs) {
+			dirs = new Set();
+			fileToLogDirs.set(normalizedFile, dirs);
 		}
+		dirs.add(logDir);
 	}
 });
 
@@ -143,13 +148,23 @@ process.on('exit', () => {
 					if (existsSync(hdbLogPath)) {
 						try {
 							const content = readFileSync(hdbLogPath, 'utf8');
-							// Capture the last 200 lines to avoid spamming the console too much, but enough to see context
-							const lines = content.split('\n');
-							const lastLines = lines.slice(-200).join('\n');
-							console.log(`\n--- Log for instance in ${file} ---`);
+							let output: string;
+							let tailNote = '';
+							if (LOG_TAIL_LINES > 0) {
+								const lines = content.split('\n');
+								if (lines.length > LOG_TAIL_LINES) {
+									output = lines.slice(-LOG_TAIL_LINES).join('\n');
+									tailNote = ` (last ${LOG_TAIL_LINES} of ${lines.length} lines; set HARPER_INTEGRATION_TEST_LOG_TAIL_LINES=0 for full log)`;
+								} else {
+									output = content;
+								}
+							} else {
+								output = content;
+							}
+							console.log(`\n--- Log for instance in ${file}${tailNote} ---`);
 							console.log(`Directory: ${dir}`);
 							console.log('-'.repeat(80));
-							console.log(lastLines);
+							console.log(output);
 							console.log('-'.repeat(80));
 						} catch (e) {
 							console.error(`Failed to read log file ${hdbLogPath}:`, e);
