@@ -131,7 +131,6 @@ runner.on('test:fail', (data: any) => {
 	}
 });
 
-// @ts-expect-error - spec reporter type compatibility
 runner.compose(spec).pipe(process.stdout);
 
 process.on('exit', () => {
