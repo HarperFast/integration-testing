@@ -5,11 +5,15 @@ import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 
 // Configuration constants
+// The pool starts at 127.0.0.2 (rather than 127.0.0.1) to avoid conflicting with
+// other servers commonly bound to localhost.
+const HARPER_LOOPBACK_POOL_START = 2;
 const HARPER_LOOPBACK_POOL_COUNT = process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT
 	? parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT, 10)
 	: 32;
-if (HARPER_LOOPBACK_POOL_COUNT < 1 || HARPER_LOOPBACK_POOL_COUNT > 255) {
-	throw new Error('HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT must be between 1 and 255');
+const HARPER_LOOPBACK_POOL_MAX = 256 - HARPER_LOOPBACK_POOL_START;
+if (HARPER_LOOPBACK_POOL_COUNT < 1 || HARPER_LOOPBACK_POOL_COUNT > HARPER_LOOPBACK_POOL_MAX) {
+	throw new Error(`HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT must be between 1 and ${HARPER_LOOPBACK_POOL_MAX}`);
 }
 const HARPER_LOOPBACK_POOL_PATH = join(tmpdir(), 'harper-integration-test-loopback-pool.json');
 const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-loopback-pool.lock');
@@ -41,7 +45,7 @@ class LoopbackAddressValidationError extends Error {
 class InvalidLoopbackAddressError extends Error {
 	constructor(address: string) {
 		super(
-			`Invalid loopback address format: ${address}. Expected format: 127.0.0.X where X is between 1 and ${HARPER_LOOPBACK_POOL_COUNT}`
+			`Invalid loopback address format: ${address}. Expected format: 127.0.0.X where X is between ${HARPER_LOOPBACK_POOL_START} and ${HARPER_LOOPBACK_POOL_START + HARPER_LOOPBACK_POOL_COUNT - 1}`
 		);
 		this.name = 'InvalidLoopbackAddressError';
 	}
@@ -118,7 +122,7 @@ async function withLock<T>(callback: () => Promise<T>): Promise<T> {
 
 /**
  * Reads the loopback pool from the pool file. The pool is a JSON array where each
- * index represents a loopback address (127.0.0.1, 127.0.0.2, etc.) and the value
+ * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
  * If the file doesn't exist, creates and returns a new empty pool with all addresses
@@ -167,8 +171,9 @@ function findAvailableIndex(pool: LoopbackPool): number | null {
 /**
  * Validates the format of a loopback address and extracts the pool index.
  *
- * Expects addresses in the format "127.0.0.X" where X is between 1 and the pool count.
- * The returned index is 0-based (e.g., "127.0.0.1" returns index 0).
+ * Expects addresses in the format "127.0.0.X" where X is between the pool start
+ * (127.0.0.2) and the pool start + pool count - 1. The returned index is 0-based
+ * (e.g., "127.0.0.2" returns index 0).
  *
  * @param address The loopback address to parse (e.g., "127.0.0.2")
  * @returns The 0-based pool index for this address
@@ -180,7 +185,7 @@ function parseLoopbackAddress(address: string): number {
 		throw new InvalidLoopbackAddressError(address);
 	}
 
-	const index = parseInt(parts[3], 10) - 1;
+	const index = parseInt(parts[3], 10) - HARPER_LOOPBACK_POOL_START;
 	if (isNaN(index) || index < 0 || index >= HARPER_LOOPBACK_POOL_COUNT) {
 		throw new InvalidLoopbackAddressError(address);
 	}
@@ -221,17 +226,19 @@ function validateLoopbackAddress(loopbackAddress: string): Promise<string> {
  * bind to each one. It returns an object containing arrays of successfully bound
  * loopback addresses and those that failed along with their errors.
  *
- * It will check all loopback addresses from 127.0.0.1 to 127.0.0.32 (by default).
+ * It will check all loopback addresses from 127.0.0.2 to 127.0.0.33 (by default).
  *
  * Use the HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT environment variable to
- * adjust the number of loopback addresses to validate (up to 255).
+ * adjust the number of loopback addresses to validate (up to 254).
  */
 export async function validateLoopbackAddressPool(): Promise<{
 	successful: string[];
 	failed: { loopbackAddress: string; error: Error }[];
 }> {
 	return Promise.allSettled(
-		Array.from({ length: HARPER_LOOPBACK_POOL_COUNT }, (_, i) => validateLoopbackAddress(`127.0.0.${i + 1}`))
+		Array.from({ length: HARPER_LOOPBACK_POOL_COUNT }, (_, i) =>
+			validateLoopbackAddress(`127.0.0.${i + HARPER_LOOPBACK_POOL_START}`)
+		)
 	).then((results) =>
 		results.reduce<{ successful: string[]; failed: { loopbackAddress: string; error: Error }[] }>(
 			(acc, result) => {
@@ -270,10 +277,10 @@ export async function validateLoopbackAddressPool(): Promise<{
  * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
-	// Each index+1 is a different loopback address that a test process will be assigned to
-	// So if the first test process number is 42, it would be assigned to index 0 associated with address 127.0.0.1
+	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
+	// So if the first test process number is 42, it would be assigned to index 0 associated with address 127.0.0.2
 	// [42, null, null, ...];
-	// Then the next process (call is 43) gets the next available, so index 1 -> 127.0.0.2
+	// Then the next process (call is 43) gets the next available, so index 1 -> 127.0.0.3
 	// [42, 43, null, ...];
 	// And so on...
 	// As processes exit and release their loopback addresses, those addresses become available for new processes to use
@@ -306,7 +313,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 
 		// If we got an index, validate and return the address
 		if (assignedIndex !== null) {
-			const loopbackAddress = `127.0.0.${assignedIndex + 1}`;
+			const loopbackAddress = `127.0.0.${assignedIndex + HARPER_LOOPBACK_POOL_START}`;
 			try {
 				await validateLoopbackAddress(loopbackAddress);
 				return loopbackAddress;
@@ -339,7 +346,7 @@ function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
 /**
  * Releases a loopback address back to the pool, making it available for other processes.
  *
- * @param address The loopback address to release (e.g., "127.0.0.1")
+ * @param address The loopback address to release (e.g., "127.0.0.2")
  * @throws InvalidLoopbackAddressError if the address format is invalid
  */
 export async function releaseLoopbackAddress(address: string): Promise<void> {
