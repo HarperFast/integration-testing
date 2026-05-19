@@ -5,9 +5,15 @@ import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 
 // Configuration constants
-// The pool starts at 127.0.0.2 (rather than 127.0.0.1) to avoid conflicting with
-// other servers commonly bound to localhost.
-const HARPER_LOOPBACK_POOL_START = 2;
+// The pool starts at 127.0.0.2 by default (rather than 127.0.0.1) to avoid conflicting
+// with other servers commonly bound to localhost. Override via the
+// HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START environment variable.
+const HARPER_LOOPBACK_POOL_START = process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START
+	? parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START, 10)
+	: 2;
+if (HARPER_LOOPBACK_POOL_START < 1 || HARPER_LOOPBACK_POOL_START > 255) {
+	throw new Error('HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START must be between 1 and 255');
+}
 const HARPER_LOOPBACK_POOL_COUNT = process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT
 	? parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT, 10)
 	: 32;
