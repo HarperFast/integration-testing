@@ -353,7 +353,7 @@ export async function setupHarperWithFixture(
 		'harper-integration-test-'
 	);
 	const dataRootDir = await mkdtemp(dataRootDirPrefix);
-	await cp(fixturePath, join(dataRootDir, 'components', basename(fixturePath)), { recursive: true });
+	await cp(fixturePath, join(dataRootDir, 'components', basename(fixturePath)), { recursive: true, dereference: true });
 	ctx.harper = { dataRootDir };
 	return startHarper(ctx, options);
 }
