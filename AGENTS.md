@@ -3,7 +3,7 @@
 Review the `README.md` and `CONTRIBUTING.md` for all relevant repository information.
 
 ## Development Tips
-- Ensure you're on at least Node.js v22 or greater when contributing
+- Ensure you're on at least Node.js v22.18 or greater when contributing (native TypeScript stripping for `npm test` requires it; see `devEngines`)
 - Use `npm install` to install dependencies
 - Use `npm run build` to build the project
 - Do not run `npm version` or `npm publish`; these commands are for humans only.

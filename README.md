@@ -78,6 +78,8 @@ interface StartHarperOptions {
 
 Startup readiness is detected by Harper printing `successfully started`. Rather than a single wall-clock deadline (which makes a slow-but-healthy boot indistinguishable from a hang), the watchdog uses an **idle timeout** that resets on every chunk of output — so the limit is time-since-last-progress — plus a generous absolute ceiling as a backstop. This is why a slow CI boot that keeps logging no longer trips the timeout.
 
+> **Behavior change:** `startupTimeoutMs` (and `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS`) previously meant an absolute startup deadline. It now means the **idle / no-output window**. If you relied on it as a hard ceiling to fail slow boots quickly, set `startupMaxMs` (or `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS`) instead.
+
 **Environment Variables:**
 
 - `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Idle startup timeout: max time between chunks of startup output before Harper is treated as hung (resets on output). Default `60000`.

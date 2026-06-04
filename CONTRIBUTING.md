@@ -22,9 +22,12 @@ There are two `tsconfig` files:
 ```sh
 npm run check   # Type-check only (no output)
 npm run build   # Compile src/ → dist/
+npm test        # Run the unit tests (node:test over src/**/*.test.ts)
 ```
 
-There are no automated tests in this package yet. Validation is type-checking plus manual testing via dependent projects.
+Unit tests live alongside the source as `src/*.test.ts` and run on the built-in Node.js test runner via `npm test`. They execute the `.ts` files directly using Node's native type stripping, which requires **Node 22.18+** (reflected in `devEngines`). Tests are excluded from the published build (`tsconfig.build.json`), so they are not shipped. Beyond unit tests, validation also includes type-checking and manual testing via dependent projects.
+
+Internal-only helpers may be exported from their modules for testing (e.g. `runHarperCommand` in `harperLifecycle.ts`) but are deliberately **not** re-exported from `src/index.ts`, keeping them out of the public API.
 
 ## Releases
 

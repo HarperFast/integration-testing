@@ -397,7 +397,9 @@ export function runHarperCommand({
 			if (settled) return;
 			resetIdleTimer();
 			stdout += dataString;
-			if (completionMessage && dataString.includes(completionMessage)) {
+			// Match against the accumulated output, not just this chunk, so a marker split across
+			// two stream chunks is still detected.
+			if (completionMessage && stdout.includes(completionMessage)) {
 				succeed();
 			}
 		});
@@ -414,6 +416,9 @@ export function runHarperCommand({
 			if (settled) return;
 			settled = true;
 			clearTimers();
+			// 'exit' won't fire for a failed spawn, so close the log streams here to avoid leaking FDs.
+			stdoutStream?.end();
+			stderrStream?.end();
 			reject(error);
 		});
 		proc.on('exit', (statusCode, signal) => {
@@ -541,6 +546,16 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		...options?.env,
 	};
 
+	// Defend against a prior instance's ports still being held on this address before we spawn —
+	// e.g. a quick killHarper()→startHarper() restart (which bypasses teardown's port-free wait),
+	// or a crashed earlier suite. The pool only guarantees the address is bindable to an ephemeral
+	// port, not that Harper's fixed ports are free, so without this the new instance can hit
+	// EADDRINUSE. For a freshly-allocated address the ports are already free and this returns at once.
+	const portsFree = await waitForPortsFree(loopbackAddress, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
+	if (!portsFree) {
+		console.warn(`Harper ports on ${loopbackAddress} still in use after ${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms; starting anyway`);
+	}
+
 	const result = await runHarperCommand({
 		args,
 		env: harperEnv,
@@ -595,6 +610,7 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 		const finish = () => {
 			if (done) return;
 			done = true;
+			proc.off('exit', finish);
 			clearTimeout(sigkillTimer);
 			clearTimeout(backstopTimer);
 			resolve();
