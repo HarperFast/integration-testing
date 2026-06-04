@@ -68,16 +68,20 @@ The Harper binary is resolved in the following order:
 
 ```ts
 interface StartHarperOptions {
-  startupTimeoutMs?: number;   // Default: 30000 or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
+  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
+  startupMaxMs?: number;       // Absolute startup ceiling regardless of output. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
   config?: object;             // Harper config overrides (passed via HARPER_SET_CONFIG)
   env?: object;                // Additional environment variables for the Harper process
   harperBinPath?: string;      // Explicit path to dist/bin/harper.js
 }
 ```
 
+Startup readiness is detected by Harper printing `successfully started`. Rather than a single wall-clock deadline (which makes a slow-but-healthy boot indistinguishable from a hang), the watchdog uses an **idle timeout** that resets on every chunk of output — so the limit is time-since-last-progress — plus a generous absolute ceiling as a backstop. This is why a slow CI boot that keeps logging no longer trips the timeout.
+
 **Environment Variables:**
 
-- `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Default startup timeout
+- `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Idle startup timeout: max time between chunks of startup output before Harper is treated as hung (resets on output). Default `60000`.
+- `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
 
@@ -85,13 +89,22 @@ interface StartHarperOptions {
 
 Like `startHarper()`, but copies a component directory into the Harper install before starting, so it's available on first boot without a deploy.
 
-### `killHarper(ctx)`
+### `killHarper(ctx, options?)`
 
-Sends SIGTERM to the Harper process and waits for it to exit. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+Sends SIGTERM to the Harper process and waits for it to exit, giving it a grace period to shut down cleanly (flush RocksDB, release ports, reap worker children) before escalating to SIGKILL. After SIGKILL it waits briefly for the process to actually exit. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+
+`options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
 ### `teardownHarper(ctx)`
 
-Kills Harper, releases the loopback address back to the pool, and removes the install directory. Call in a teardown/`after()` hook.
+Kills Harper, waits for its fixed ports to be released on the loopback address, releases the address back to the pool, and removes the install directory. Call in a teardown/`after()` hook.
+
+The pool only verifies that an address is *bindable* (to an ephemeral port), not that Harper's fixed ports (Operations API, HTTP/S, MQTT/S) are free — and Harper's worker children/sockets can briefly outlive the parent. So before recycling the address, teardown waits until those ports are actually free, preventing `EADDRINUSE`/`ECONNREFUSED` for the next suite that grabs the address. If the ports are still held at the deadline, the address is recycled anyway.
+
+**Environment Variables:**
+
+- `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS` - Grace period after SIGTERM before escalating to SIGKILL. Default `5000`.
+- `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS` - Max time to wait for Harper's ports to be released before recycling the loopback address. Default `5000`.
 
 ### `sendOperation(context, operation)`
 
