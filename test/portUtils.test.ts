@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { ok, strictEqual } from 'node:assert';
 import { createServer, type Server } from 'node:net';
-import { isPortFree, waitForPortsFree } from './portUtils.ts';
+import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 
 const HOST = '127.0.0.1';
 

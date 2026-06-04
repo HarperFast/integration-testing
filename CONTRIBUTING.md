@@ -22,10 +22,10 @@ There are two `tsconfig` files:
 ```sh
 npm run check   # Type-check only (no output)
 npm run build   # Compile src/ → dist/
-npm test        # Run the unit tests (node:test over src/**/*.test.ts)
+npm test        # Run the tests (node:test over test/**/*.test.ts)
 ```
 
-Unit tests live alongside the source as `src/*.test.ts` and run on the built-in Node.js test runner via `npm test`. They execute the `.ts` files directly using Node's native type stripping, which requires **Node 22.18+** (reflected in `devEngines`). Tests are excluded from the published build (`tsconfig.build.json`), so they are not shipped. Beyond unit tests, validation also includes type-checking and manual testing via dependent projects.
+Tests live in `test/` (separate from `src/`) and run on the built-in Node.js test runner via `npm test`. They execute the `.ts` files directly using Node's native type stripping, which requires **Node 22.18+** (reflected in `devEngines`). Because they live outside `src/`, the published build (which emits only `src/` → `dist/`) never includes them. `tsconfig.json` type-checks both `src/` and `test/`; `tsconfig.build.json` narrows the build to `src/`. Beyond these tests, validation also includes type-checking and manual testing via dependent projects.
 
 Internal-only helpers may be exported from their modules for testing (e.g. `runHarperCommand` in `harperLifecycle.ts`) but are deliberately **not** re-exported from `src/index.ts`, keeping them out of the public API.
 

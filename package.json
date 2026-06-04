@@ -23,7 +23,7 @@
 	"scripts": {
 		"check": "tsc",
 		"build": "tsc -p tsconfig.build.json",
-		"test": "node --test \"src/**/*.test.ts\""
+		"test": "node --test \"test/**/*.test.ts\""
 	},
 	"engines": {
 		"node": ">=20"

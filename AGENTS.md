@@ -21,5 +21,5 @@ Review the `README.md` and `CONTRIBUTING.md` for all relevant repository informa
 ## Testing Tips
 - Use `npm link` in this directory and `npm link @harperfast/integration-testing` in other project directories to test out changes locally
 - Use `npm run check` to type-check the project without generating a build output
-- Use `npm test` to run the unit tests (`node --test` over `src/**/*.test.ts`). Tests are excluded from the build (`tsconfig.build.json`) so they are not published.
+- Use `npm test` to run the tests (`node --test` over `test/**/*.test.ts`). Tests live in `test/`, separate from `src/`, so the build (which emits only `src/`) never includes them.
   - To keep them runnable without a real Harper, internal-only helpers are exported from their modules (e.g. `runHarperCommand` in `harperLifecycle.ts`) but intentionally NOT re-exported from `index.ts`, so they stay out of the public API.

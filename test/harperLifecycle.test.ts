@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { killHarper, runHarperCommand, HarperStartupError, type StartedHarperTestContext } from './harperLifecycle.ts';
+import { killHarper, runHarperCommand, HarperStartupError, type StartedHarperTestContext } from '../src/harperLifecycle.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
 // runHarperCommand's startup watchdog through specific timing scenarios without a real Harper.
