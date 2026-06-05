@@ -83,9 +83,11 @@ export const DEFAULT_STARTUP_MAX_MS = parseInt(process.env.HARPER_INTEGRATION_TE
 export const DEFAULT_TEARDOWN_GRACE_MS = parseInt(process.env.HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS || '', 10) || 5000;
 
 /**
- * Maximum time teardown waits for Harper's fixed ports to be released on the loopback address
- * before recycling it back to the pool. If the ports are still in use at the deadline, the
- * address is recycled anyway (no worse than not waiting).
+ * Time teardown's safety assertion waits for Harper's fixed ports to be free before recycling the
+ * loopback address. Killing Harper's process tree (and waiting for exit) should free them
+ * immediately, so this normally returns on the first check; it only matters if a child process
+ * escaped the kill. If the ports are still in use at the deadline, the address is recycled anyway
+ * (no worse than not waiting) and a warning is logged.
  *
  * Override with `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS`. Default 5s.
  */
@@ -331,6 +333,11 @@ export function runHarperCommand({
 			: ['--trace-warnings', '--force-node-api-uncaught-exceptions-policy=true', harperScript, ...args];
 	const proc = spawn(runtime, runtimeArgs, {
 		env: { ...process.env, ...env },
+		// On POSIX, run Harper as its own process-group leader so teardown can signal the whole
+		// group (parent + any worker children), not just the direct child. Windows has no process
+		// groups; killHarper uses `taskkill /T` there instead. stdio stays piped (not detached),
+		// and we never unref, so output capture and lifetime management are unchanged.
+		detached: process.platform !== 'win32',
 	});
 
 	let stdoutStream: WriteStream | undefined;
@@ -546,16 +553,6 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		...options?.env,
 	};
 
-	// Defend against a prior instance's ports still being held on this address before we spawn —
-	// e.g. a quick killHarper()→startHarper() restart (which bypasses teardown's port-free wait),
-	// or a crashed earlier suite. The pool only guarantees the address is bindable to an ephemeral
-	// port, not that Harper's fixed ports are free, so without this the new instance can hit
-	// EADDRINUSE. For a freshly-allocated address the ports are already free and this returns at once.
-	const portsFree = await waitForPortsFree(loopbackAddress, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
-	if (!portsFree) {
-		console.warn(`Harper ports on ${loopbackAddress} still in use after ${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms; starting anyway`);
-	}
-
 	const result = await runHarperCommand({
 		args,
 		env: harperEnv,
@@ -584,11 +581,55 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 }
 
 /**
+ * Signals Harper's entire process tree, not just the direct child.
+ *
+ * Harper runs its listeners in worker threads (in-process), but components can also spawn
+ * child processes, so we target the whole tree to be safe:
+ * - POSIX: Harper is spawned as its own process-group leader (`detached`), so a negative PID
+ *   signals the group (parent + descendants).
+ * - Windows: there are no process groups, so we shell out to `taskkill /T` (tree). `/F` (force)
+ *   is required to actually terminate console processes, so it is used for the SIGKILL step.
+ *
+ * Best-effort: errors (e.g. the process already exited) are swallowed; teardown's port assertion
+ * and the wait-for-exit are the safety nets.
+ */
+function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
+	const pid = proc.pid;
+	if (pid === undefined) return;
+	if (process.platform === 'win32') {
+		const args = ['/pid', String(pid), '/T'];
+		if (signal === 'SIGKILL') args.push('/F');
+		try {
+			spawn('taskkill', args, { stdio: 'ignore' }).on('error', () => {});
+		} catch {
+			try {
+				proc.kill(signal);
+			} catch {
+				// process already gone
+			}
+		}
+		return;
+	}
+	try {
+		// Negative PID => signal the whole process group (proc is the group leader via `detached`).
+		process.kill(-pid, signal);
+	} catch {
+		// Group already gone, or (defensively) not a group leader — fall back to the direct child.
+		try {
+			proc.kill(signal);
+		} catch {
+			// process already gone
+		}
+	}
+}
+
+/**
  * Kill harper process (can be used for teardown, or killing it before a restart).
  *
- * Sends SIGTERM first and gives Harper a grace period to shut down cleanly (flush RocksDB,
- * release ports, reap worker children) before escalating to SIGKILL. After SIGKILL it waits
- * briefly for the process to actually exit, so callers can rely on it being gone.
+ * Sends SIGTERM to Harper's whole process tree first and gives it a grace period to shut down
+ * cleanly (flush RocksDB, release ports, reap worker children) before escalating to SIGKILL.
+ * After SIGKILL it waits briefly for the process to actually exit, so callers can rely on it
+ * being gone — and, since a dead process releases its listening sockets, on its ports being free.
  *
  * @param ctx
  * @param options.graceMs Time to wait after SIGTERM before sending SIGKILL. Defaults to
@@ -618,17 +659,13 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 
 		proc.once('exit', finish);
 
-		// Ask Harper to shut down cleanly first.
-		proc.kill();
+		// Ask the whole Harper tree to shut down cleanly first.
+		signalHarperTree(proc, 'SIGTERM');
 
-		// If it hasn't exited within the grace period, force-kill and wait briefly for the
+		// If it hasn't exited within the grace period, force-kill the tree and wait briefly for the
 		// 'exit' event before resolving (with a backstop in case it never fires).
 		sigkillTimer = setTimeout(() => {
-			try {
-				proc.kill('SIGKILL');
-			} catch {
-				// possible that the process terminated but the exit event hasn't fired yet
-			}
+			signalHarperTree(proc, 'SIGKILL');
 			backstopTimer = setTimeout(finish, SIGKILL_EXIT_WAIT_MS);
 		}, graceMs);
 	});
@@ -658,16 +695,17 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 	if (!ctx.harper) return;
 	await killHarper(ctx);
 
-	// Before returning the loopback address to the pool, wait until Harper's fixed ports are
-	// actually free on it. The pool only checks that the *address* is bindable (to an ephemeral
-	// port), not that these specific ports are released — and Harper's worker children/sockets
-	// can briefly outlive the parent — so recycling too early causes EADDRINUSE/ECONNREFUSED for
-	// the next suite that grabs this address.
+	// Safety assertion: killHarper waits for Harper's process tree to exit, which releases its
+	// listening sockets, so the fixed ports should already be free here. We still verify before
+	// recycling the address (the pool only guarantees the *address* is bindable, not that these
+	// specific ports are free) and warn if anything is somehow still holding them — that warning
+	// is a signal that a Harper child process escaped the tree kill, not normal operation. The
+	// address is recycled regardless.
 	if (ctx.harper.hostname) {
 		const portsFreed = await waitForPortsFree(ctx.harper.hostname, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
 		if (!portsFreed) {
 			console.warn(
-				`Harper ports on ${ctx.harper.hostname} still in use after ${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms; recycling the address anyway`
+				`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); recycling the address anyway. This usually means a Harper child process outlived the kill.`
 			);
 		}
 	}

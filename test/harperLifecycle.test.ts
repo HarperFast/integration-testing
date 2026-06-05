@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { killHarper, runHarperCommand, HarperStartupError, type StartedHarperTestContext } from '../src/harperLifecycle.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
@@ -52,6 +53,32 @@ function waitForOutput(child: ChildProcess, needle: string): Promise<void> {
 			if (buffer.includes(needle)) resolve();
 		});
 	});
+}
+
+/** Resolves with the regex match once it appears on the child's stdout. */
+function waitForMatch(child: ChildProcess, regex: RegExp): Promise<RegExpMatchArray> {
+	return new Promise((resolve) => {
+		let buffer = '';
+		child.stdout?.on('data', (chunk: Buffer) => {
+			buffer += chunk.toString();
+			const matched = buffer.match(regex);
+			if (matched) resolve(matched);
+		});
+	});
+}
+
+/** Polls (signal 0) until `pid` no longer exists, or the timeout elapses. */
+async function waitProcessGone(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return true; // ESRCH — process is gone
+		}
+		if (Date.now() >= deadline) return false;
+		await sleep(50);
+	}
 }
 
 // --- Startup watchdog (Race 1) ---
@@ -144,8 +171,11 @@ test('runHarperCommand rejects when the process exits non-zero', async () => {
 
 // --- Teardown kill (Race 2) ---
 
+// Children are spawned `detached` to mirror how Harper is spawned: as a process-group leader,
+// so killHarper's group signal (negative PID on POSIX) targets the whole tree.
+
 test('killHarper terminates a process that exits on SIGTERM, before the grace deadline', async () => {
-	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true });
 	await once(child, 'spawn');
 	const start = Date.now();
 	await killHarper(fakeCtx(child), { graceMs: 2000 });
@@ -156,15 +186,36 @@ test('killHarper terminates a process that exits on SIGTERM, before the grace de
 test('killHarper escalates to SIGKILL when SIGTERM is ignored', async () => {
 	// Announce 'ready' only after the SIGTERM handler is installed, so the parent doesn't race
 	// the child's startup and send SIGTERM before the handler exists.
-	const child = spawn(process.execPath, [
-		'-e',
-		"process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)",
-	]);
+	const child = spawn(
+		process.execPath,
+		['-e', "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"],
+		{ detached: true }
+	);
 	await waitForOutput(child, 'ready');
 	const start = Date.now();
 	await killHarper(fakeCtx(child), { graceMs: 200 });
 	strictEqual(child.signalCode, 'SIGKILL');
 	ok(Date.now() - start >= 150, 'should wait the grace period before escalating to SIGKILL');
+});
+
+test('killHarper kills the whole process tree, not just the direct child', { skip: process.platform === 'win32' }, async () => {
+	// A detached parent that spawns its own (non-detached) child, so the child shares the parent's
+	// process group. A group-targeted kill must reap the child too — the core of the fix.
+	const parent = spawn(
+		process.execPath,
+		[
+			'-e',
+			"const{spawn}=require('node:child_process');" +
+				"const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});" +
+				"process.stdout.write('child:'+c.pid+'\\n');" +
+				'setInterval(()=>{},1000)',
+		],
+		{ detached: true }
+	);
+	const childPid = parseInt((await waitForMatch(parent, /child:(\d+)/))[1], 10);
+	await killHarper(fakeCtx(parent), { graceMs: 200 });
+	ok(parent.exitCode !== null || parent.signalCode !== null, 'parent should be dead');
+	ok(await waitProcessGone(childPid, 2000), `grandchild ${childPid} should have been killed with the group`);
 });
 
 test('killHarper returns immediately when there is no process', async () => {
