@@ -93,20 +93,20 @@ Like `startHarper()`, but copies a component directory into the Harper install b
 
 ### `killHarper(ctx, options?)`
 
-Sends SIGTERM to the Harper process and waits for it to exit, giving it a grace period to shut down cleanly (flush RocksDB, release ports, reap worker children) before escalating to SIGKILL. After SIGKILL it waits briefly for the process to actually exit. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
 
 `options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
 ### `teardownHarper(ctx)`
 
-Kills Harper, waits for its fixed ports to be released on the loopback address, releases the address back to the pool, and removes the install directory. Call in a teardown/`after()` hook.
+Kills Harper's process tree, releases the loopback address back to the pool, and removes the install directory. Call in a teardown/`after()` hook.
 
-The pool only verifies that an address is *bindable* (to an ephemeral port), not that Harper's fixed ports (Operations API, HTTP/S, MQTT/S) are free — and Harper's worker children/sockets can briefly outlive the parent. So before recycling the address, teardown waits until those ports are actually free, preventing `EADDRINUSE`/`ECONNREFUSED` for the next suite that grabs the address. If the ports are still held at the deadline, the address is recycled anyway.
+Since `killHarper` waits for the process tree to exit, its fixed ports (Operations API, HTTP/S, MQTT/S) are already released by the time the address is recycled. As a safety assertion, teardown still verifies those ports are free before recycling — the pool only guarantees the *address* is bindable, not that these specific ports are free — and logs a warning if any are somehow still held (a sign a Harper child process escaped the kill). The address is recycled regardless.
 
 **Environment Variables:**
 
 - `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS` - Grace period after SIGTERM before escalating to SIGKILL. Default `5000`.
-- `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS` - Max time to wait for Harper's ports to be released before recycling the loopback address. Default `5000`.
+- `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS` - Max time teardown's safety assertion waits for Harper's ports to be free before recycling the loopback address (normally instant, since the process tree is already dead). Default `5000`.
 
 ### `sendOperation(context, operation)`
 

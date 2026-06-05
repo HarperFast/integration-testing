@@ -340,6 +340,10 @@ export function runHarperCommand({
 		detached: process.platform !== 'win32',
 	});
 
+	// Reap this process's tree if the runner exits/is interrupted before teardown (it's detached,
+	// so it would otherwise survive signals sent to the runner's group).
+	trackHarperProcess(proc);
+
 	let stdoutStream: WriteStream | undefined;
 	let stderrStream: WriteStream | undefined;
 	if (logDir) {
@@ -620,6 +624,38 @@ function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): vo
 		} catch {
 			// process already gone
 		}
+	}
+}
+
+/**
+ * Tracks live Harper processes so that if the test runner exits or is interrupted before teardown
+ * runs (Ctrl+C, or a CI job killing the runner), their process trees are reaped instead of left
+ * orphaned holding the fixed ports. This matters specifically because Harper is spawned `detached`
+ * (its own process group), so it would otherwise survive signals delivered to the runner's group.
+ *
+ * Best-effort: on POSIX the group SIGKILL is delivered synchronously (works even from the 'exit'
+ * handler); on Windows the `taskkill` shell-out may not complete before the runner exits.
+ */
+const liveHarperProcesses = new Set<ChildProcess>();
+let runnerCleanupRegistered = false;
+
+function trackHarperProcess(proc: ChildProcess): void {
+	liveHarperProcesses.add(proc);
+	proc.once('exit', () => liveHarperProcesses.delete(proc));
+
+	if (runnerCleanupRegistered) return;
+	runnerCleanupRegistered = true;
+
+	const reapAll = () => {
+		for (const child of liveHarperProcesses) signalHarperTree(child, 'SIGKILL');
+	};
+	process.once('exit', reapAll);
+	// SIGINT/SIGTERM don't fire 'exit'; reap, then re-raise so the runner still terminates normally.
+	for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+		process.once(signal, () => {
+			reapAll();
+			process.kill(process.pid, signal);
+		});
 	}
 }
 
