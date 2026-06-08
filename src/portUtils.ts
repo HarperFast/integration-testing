@@ -42,7 +42,7 @@ export async function waitForPortsFree(
 	pollIntervalMs = 100
 ): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
-	for (;;) {
+	while (true) {
 		const results = await Promise.all(ports.map((port) => isPortFree(host, port)));
 		if (results.every(Boolean)) return true;
 		if (Date.now() >= deadline) return false;

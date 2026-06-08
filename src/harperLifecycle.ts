@@ -371,7 +371,9 @@ export function runHarperCommand({
 			settled = true;
 			clearTimers();
 			reject(new HarperStartupError(message, stdout, stderr));
-			proc.kill();
+			// Harper is spawned detached (its own process group), so `proc.kill()` would only hit the
+			// direct child and orphan any worker children still holding ports. Reap the whole tree.
+			signalHarperTree(proc, 'SIGKILL');
 		};
 
 		const succeed = () => {

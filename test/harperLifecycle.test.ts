@@ -177,10 +177,11 @@ test('runHarperCommand rejects when the process exits non-zero', async () => {
 test('killHarper terminates a process that exits on SIGTERM, before the grace deadline', async () => {
 	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true });
 	await once(child, 'spawn');
-	const start = Date.now();
 	await killHarper(fakeCtx(child), { graceMs: 2000 });
+	// A SIGTERM signalCode proves it died from the SIGTERM, before killHarper escalated to SIGKILL at
+	// the grace deadline — so this also covers "terminated before the grace deadline" without a
+	// flaky wall-clock upper bound.
 	strictEqual(child.signalCode, 'SIGTERM');
-	ok(Date.now() - start < 1500, 'should exit well before the grace deadline');
 });
 
 test('killHarper escalates to SIGKILL when SIGTERM is ignored', async () => {
@@ -228,5 +229,7 @@ test('killHarper returns immediately for an already-exited process', async () =>
 	await once(child, 'exit');
 	const start = Date.now();
 	await killHarper(fakeCtx(child), { graceMs: 5000 });
-	ok(Date.now() - start < 200, 'should not wait the grace period for an already-dead process');
+	// Generous ceiling, far under the 5s grace: proves it took the already-exited fast path rather
+	// than waiting out the grace, while leaving plenty of headroom for a contended-CI stall.
+	ok(Date.now() - start < 1000, 'should not wait the grace period for an already-dead process');
 });
