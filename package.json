@@ -22,7 +22,8 @@
 	],
 	"scripts": {
 		"check": "tsc",
-		"build": "tsc -p tsconfig.build.json"
+		"build": "tsc -p tsconfig.build.json",
+		"test": "node --test \"test/**/*.test.ts\""
 	},
 	"engines": {
 		"node": ">=20"
@@ -30,7 +31,7 @@
 	"devEngines": {
 		"runtime": {
 			"name": "node",
-			"version": ">=22",
+			"version": ">=22.18.0",
 			"onFail": "error"
 		},
 		"packageManager": {

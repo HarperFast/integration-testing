@@ -3,7 +3,7 @@
 Review the `README.md` and `CONTRIBUTING.md` for all relevant repository information.
 
 ## Development Tips
-- Ensure you're on at least Node.js v22 or greater when contributing
+- Ensure you're on at least Node.js v22.18 or greater when contributing (native TypeScript stripping for `npm test` requires it; see `devEngines`)
 - Use `npm install` to install dependencies
 - Use `npm run build` to build the project
 - Do not run `npm version` or `npm publish`; these commands are for humans only.
@@ -21,4 +21,5 @@ Review the `README.md` and `CONTRIBUTING.md` for all relevant repository informa
 ## Testing Tips
 - Use `npm link` in this directory and `npm link @harperfast/integration-testing` in other project directories to test out changes locally
 - Use `npm run check` to type-check the project without generating a build output
-- There are currently no tests for this project
+- Use `npm test` to run the tests (`node --test` over `test/**/*.test.ts`). Tests live in `test/`, separate from `src/`, so the build (which emits only `src/`) never includes them.
+  - To keep them runnable without a real Harper, internal-only helpers are exported from their modules (e.g. `runHarperCommand` in `harperLifecycle.ts`) but intentionally NOT re-exported from `index.ts`, so they stay out of the public API.
