@@ -171,20 +171,30 @@ test('runHarperCommand rejects when the process exits non-zero', async () => {
 
 // --- Teardown kill (Race 2) ---
 
-// Children are spawned `detached` to mirror how Harper is spawned: as a process-group leader,
-// so killHarper's group signal (negative PID on POSIX) targets the whole tree.
+// On POSIX, children are spawned `detached` to mirror how Harper is spawned (a process-group
+// leader), so killHarper's group signal (negative PID) targets the whole tree. Windows has no
+// process groups — killHarper uses `taskkill /T` there — and no real POSIX signals, so the
+// signal-specific assertions below are guarded to POSIX.
+const isPosix = process.platform !== 'win32';
 
 test('killHarper terminates a process that exits on SIGTERM, before the grace deadline', async () => {
-	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true });
+	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: isPosix });
 	await once(child, 'spawn');
-	await killHarper(fakeCtx(child), { graceMs: 2000 });
-	// A SIGTERM signalCode proves it died from the SIGTERM, before killHarper escalated to SIGKILL at
-	// the grace deadline — so this also covers "terminated before the grace deadline" without a
-	// flaky wall-clock upper bound.
-	strictEqual(child.signalCode, 'SIGTERM');
+	// On Windows the SIGTERM-equivalent (taskkill without /F) won't stop a background node process,
+	// so killHarper waits the full grace before force-killing; use a short grace there to avoid a
+	// needless multi-second delay.
+	await killHarper(fakeCtx(child), { graceMs: isPosix ? 2000 : 100 });
+	ok(child.exitCode !== null || child.signalCode !== null, 'process should be dead after killHarper');
+	if (isPosix) {
+		// A SIGTERM signalCode proves it died from the SIGTERM, before killHarper escalated to SIGKILL
+		// at the grace deadline — so this also covers "terminated before the grace deadline" without a
+		// flaky wall-clock upper bound.
+		strictEqual(child.signalCode, 'SIGTERM');
+	}
 });
 
-test('killHarper escalates to SIGKILL when SIGTERM is ignored', async () => {
+test('killHarper escalates to SIGKILL when SIGTERM is ignored', { skip: !isPosix }, async () => {
+	// POSIX-only: relies on the child trapping SIGTERM, which Windows has no real equivalent for.
 	// Announce 'ready' only after the SIGTERM handler is installed, so the parent doesn't race
 	// the child's startup and send SIGTERM before the handler exists.
 	const child = spawn(
@@ -199,7 +209,7 @@ test('killHarper escalates to SIGKILL when SIGTERM is ignored', async () => {
 	ok(Date.now() - start >= 150, 'should wait the grace period before escalating to SIGKILL');
 });
 
-test('killHarper kills the whole process tree, not just the direct child', { skip: process.platform === 'win32' }, async () => {
+test('killHarper kills the whole process tree, not just the direct child', { skip: !isPosix }, async () => {
 	// A detached parent that spawns its own (non-detached) child, so the child shares the parent's
 	// process group. A group-targeted kill must reap the child too — the core of the fix.
 	const parent = spawn(
