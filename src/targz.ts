@@ -7,11 +7,11 @@ import { createGzip } from 'node:zlib';
  * @param dirPath path to directory to pack and compress
  */
 export async function targz(dirPath: string): Promise<string> {
-	const chunks: Buffer[] = [];
+	const chunks: Uint8Array[] = [];
 	return new Promise((resolve, reject) => {
 		pack(dirPath)
 			.pipe(createGzip())
-			.on('data', (chunk: Buffer) => chunks.push(chunk))
+			.on('data', (chunk: Uint8Array) => chunks.push(chunk))
 			.on('end', () => {
 				resolve(Buffer.concat(chunks).toString('base64'));
 			})

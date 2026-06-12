@@ -34,6 +34,10 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Type-check
+        run: npm run check
+      - name: Build
+        run: npm run build
       # Tests run the TypeScript sources directly via Node's native type stripping (Node >= 22.18,
       # enforced by devEngines). They spawn short-lived node processes and bind loopback ports, so
       # no real Harper instance or loopback-pool setup is required.
