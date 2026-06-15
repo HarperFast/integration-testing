@@ -38,9 +38,12 @@ const RETRY_DELAY_MS = 1000;
 // both suites. Override via HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT if the operations
 // port ever changes. (Hardcoded rather than imported from harperLifecycle to avoid a
 // circular import between these two modules.)
-const CONFLICT_PROBE_PORT = process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT
-	? parseInt(process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT, 10)
-	: 9925;
+const CONFLICT_PROBE_PORT = (() => {
+	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT || '', 10);
+	// Fall back to the default if unset/non-numeric/out-of-range, so an invalid override
+	// can't turn into a `server.listen(NaN)` crash during allocation.
+	return Number.isNaN(parsed) || parsed < 0 || parsed > 65535 ? 9925 : parsed;
+})();
 
 // Type definitions
 type LoopbackPool = (number | null)[];
@@ -173,22 +176,6 @@ async function writePoolFile(pool: LoopbackPool): Promise<void> {
 }
 
 /**
- * Finds the first available (null) index in the pool. This implements a simple
- * first-available allocation strategy.
- *
- * @param pool The loopback pool array
- * @returns The first available index, or null if the pool is full
- */
-function findAvailableIndex(pool: LoopbackPool): number | null {
-	for (let i = 0; i < pool.length; i++) {
-		if (pool[i] === null) {
-			return i;
-		}
-	}
-	return null;
-}
-
-/**
  * Validates the format of a loopback address and extracts the pool index.
  *
  * Expects addresses in the format "127.0.0.X" where X is between the pool start
@@ -256,7 +243,7 @@ function validateLoopbackAddress(loopbackAddress: string): Promise<string> {
 function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
 	return new Promise((resolve, reject) => {
 		const server = createServer();
-		server.once('error', (error: NodeJS.ErrnoException) => {
+		const onError = (error: NodeJS.ErrnoException) => {
 			if (error.code === 'EADDRINUSE') {
 				resolve(true);
 				return;
@@ -264,8 +251,12 @@ function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
 			const enhancedError = error as LoopbackAddressError;
 			enhancedError.loopbackAddress = loopbackAddress;
 			reject(enhancedError);
-		});
+		};
+		server.once('error', onError);
 		server.listen(CONFLICT_PROBE_PORT, loopbackAddress, () => {
+			// Bind succeeded — the address is free. Drop the error listener so a stray
+			// post-bind socket error during close() can't flip the resolved verdict.
+			server.off('error', onError);
 			server.close(() => {
 				resolve(false);
 			});
@@ -342,16 +333,31 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// This continues until all loopback addresses are used, at which point new processes will wait until an address becomes available
 
 	// Since multiple processes may be trying to get a loopback address at the same time, we need to implement a simple file-based locking mechanism to prevent race conditions
+
+	// Indices found in-use by the conflict canary during THIS call. Tracked locally (not by
+	// parking them in the shared pool) so we never deadlock ourselves: if we parked every
+	// poisoned slot under our own live PID, the pool could fill with our PID, the free-slot search
+	// would find nothing, removeDeadProcessesFromPool couldn't reclaim them (we're alive), and we'd
+	// spin forever. Instead we release poisoned slots back to the pool and just avoid re-trying
+	// them within this attempt; the set is cleared before each wait so they can be re-probed once
+	// the lingering node has had time to exit.
+	const triedIndices = new Set<number>();
 	while (true) {
 		const assignedIndex = await withLock(async () => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile();
 
-			// Find the first available index
-			const index = findAvailableIndex(loopbackPool);
+			// Find the first available index we haven't already found in-use this attempt
+			let index: number | null = null;
+			for (let i = 0; i < loopbackPool.length; i++) {
+				if (loopbackPool[i] === null && !triedIndices.has(i)) {
+					index = i;
+					break;
+				}
+			}
 
 			if (index === null) {
-				// No available addresses - remove any dead processes from the pool and wait for one to become available
+				// Nothing available - remove any dead processes from the pool and wait for one to become available
 				removeDeadProcessesFromPool(loopbackPool);
 			} else {
 				// Assign the process PID to that index to mark it as used
@@ -389,16 +395,19 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				return loopbackAddress;
 			}
 
-			// Leave the slot parked under our PID so no other process retries this poisoned
-			// address, then loop to claim the next available one. Parked slots are reclaimed
-			// when this (short-lived, per-file) process exits and its PID goes dead.
+			// Release the slot back to the pool (so it isn't leaked under our PID) and remember
+			// not to re-try it this attempt; loop to claim the next available one.
+			await releaseLoopbackAddress(loopbackAddress);
+			triedIndices.add(assignedIndex);
 			console.warn(
 				`[loopback-pool] ${loopbackAddress} is still in use by another Harper node (operations port ${CONFLICT_PROBE_PORT} bound); skipping to avoid an SO_REUSEPORT co-bind.`
 			);
 			continue;
 		}
 
-		// No available addresses; wait and retry
+		// No available addresses; clear the per-attempt skip set so poisoned addresses can be
+		// re-probed (their lingering node may have exited during the wait), then wait and retry.
+		triedIndices.clear();
 		await sleep(RETRY_DELAY_MS);
 	}
 }
