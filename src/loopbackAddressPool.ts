@@ -28,6 +28,20 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
 
+// Port used as a conflict canary when allocating an address. This MUST be a port that
+// Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
+// harperLifecycle.ts — does exactly that, main-thread-only). Because that port is
+// exclusive, a stale/overlapping Harper node still holding the address makes a plain
+// (non-reusePort) bind here fail with EADDRINUSE — which is precisely the signal we
+// need. Without this check, SO_REUSEPORT on the shared HTTP/replication ports would let
+// a freshly-assigned node silently co-bind an address another node still owns, corrupting
+// both suites. Override via HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT if the operations
+// port ever changes. (Hardcoded rather than imported from harperLifecycle to avoid a
+// circular import between these two modules.)
+const CONFLICT_PROBE_PORT = process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT
+	? parseInt(process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT, 10)
+	: 9925;
+
 // Type definitions
 type LoopbackPool = (number | null)[];
 
@@ -228,6 +242,38 @@ function validateLoopbackAddress(loopbackAddress: string): Promise<string> {
 }
 
 /**
+ * Conflict canary: detects whether a Harper node is already bound to `loopbackAddress`
+ * by attempting an exclusive (non-SO_REUSEPORT) bind on the operations-API port. Node's
+ * `net` server does not set SO_REUSEPORT, so if a stale/overlapping Harper node still
+ * owns the address's operations port, this bind fails with EADDRINUSE.
+ *
+ * Returns `true` if the address appears in use (EADDRINUSE), `false` if it is free.
+ * Re-throws any other bind error (e.g. EADDRNOTAVAIL) — that's a real configuration
+ * problem the caller should surface, not a transient conflict to skip.
+ *
+ * @param loopbackAddress The loopback IP address to probe (e.g., "127.0.0.2")
+ */
+function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.once('error', (error: NodeJS.ErrnoException) => {
+			if (error.code === 'EADDRINUSE') {
+				resolve(true);
+				return;
+			}
+			const enhancedError = error as LoopbackAddressError;
+			enhancedError.loopbackAddress = loopbackAddress;
+			reject(enhancedError);
+		});
+		server.listen(CONFLICT_PROBE_PORT, loopbackAddress, () => {
+			server.close(() => {
+				resolve(false);
+			});
+		});
+	});
+}
+
+/**
  * This method attempts to validate all loopback addresses in the pool by trying to
  * bind to each one. It returns an object containing arrays of successfully bound
  * loopback addresses and those that failed along with their errors.
@@ -322,11 +368,34 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			const loopbackAddress = `127.0.0.${assignedIndex + HARPER_LOOPBACK_POOL_START}`;
 			try {
 				await validateLoopbackAddress(loopbackAddress);
-				return loopbackAddress;
 			} catch (error) {
 				// Validation failed - throw a proper error instead of breaking
 				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
 			}
+
+			// Conflict canary: a stale or still-running Harper node from an overlapping
+			// suite may already hold this address (e.g. the pool slot was freed while its
+			// node lingered). SO_REUSEPORT on Harper's shared HTTP/replication ports would
+			// otherwise let our node silently co-bind it, splitting connections between two
+			// nodes and corrupting both suites. Detect that here via the exclusive
+			// operations port and skip the poisoned address.
+			let inUse: boolean;
+			try {
+				inUse = await isLoopbackAddressInUse(loopbackAddress);
+			} catch (error) {
+				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
+			}
+			if (!inUse) {
+				return loopbackAddress;
+			}
+
+			// Leave the slot parked under our PID so no other process retries this poisoned
+			// address, then loop to claim the next available one. Parked slots are reclaimed
+			// when this (short-lived, per-file) process exits and its PID goes dead.
+			console.warn(
+				`[loopback-pool] ${loopbackAddress} is still in use by another Harper node (operations port ${CONFLICT_PROBE_PORT} bound); skipping to avoid an SO_REUSEPORT co-bind.`
+			);
+			continue;
 		}
 
 		// No available addresses; wait and retry
