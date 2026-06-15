@@ -739,16 +739,24 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 	// specific ports are free) and warn if anything is somehow still holding them — that warning
 	// is a signal that a Harper child process escaped the tree kill, not normal operation. The
 	// address is recycled regardless.
+	let portsFreed = true;
 	if (ctx.harper.hostname) {
-		const portsFreed = await waitForPortsFree(ctx.harper.hostname, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
-		if (!portsFreed) {
-			console.warn(
-				`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); recycling the address anyway. This usually means a Harper child process outlived the kill.`
-			);
-		}
+		portsFreed = await waitForPortsFree(ctx.harper.hostname, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
 	}
 
-	await releaseLoopbackAddress(ctx.harper.hostname);
+	if (portsFreed) {
+		await releaseLoopbackAddress(ctx.harper.hostname);
+	} else {
+		// A Harper child escaped the tree kill and still holds this address's ports. Do NOT
+		// recycle the address — under SO_REUSEPORT a later suite could silently co-bind it
+		// (the exact failure the loopback pool exists to prevent). Leave the slot parked under
+		// this process's PID; it is reclaimed when this (per-file) process exits and its PID
+		// goes dead. The conflict canary in getNextAvailableLoopbackAddress is the backstop if
+		// the address is somehow handed out before then.
+		console.warn(
+			`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); NOT recycling the address (a Harper child outlived the kill). The slot will be reclaimed when this process exits.`
+		);
+	}
 
 	// a few retries are typically necessary, might take a sec for a process to finish, especially since rocksdb may be flushing
 	try {
