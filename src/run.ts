@@ -131,7 +131,7 @@ runner.on('test:fail', (data: any) => {
 	}
 });
 
-runner.compose(spec).pipe(process.stdout);
+runner.compose(new spec()).pipe(process.stdout);
 
 process.on('exit', () => {
 	if (failedFiles.size > 0) {
