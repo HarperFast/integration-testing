@@ -6,7 +6,13 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { killHarper, runHarperCommand, HarperStartupError, type StartedHarperTestContext } from '../src/harperLifecycle.ts';
+import {
+	killHarper,
+	runHarperCommand,
+	HarperStartupError,
+	buildHarperChildEnv,
+	type StartedHarperTestContext,
+} from '../src/harperLifecycle.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
 // runHarperCommand's startup watchdog through specific timing scenarios without a real Harper.
@@ -242,4 +248,25 @@ test('killHarper returns immediately for an already-exited process', async () =>
 	// Generous ceiling, far under the 5s grace: proves it took the already-exited fast path rather
 	// than waiting out the grace, while leaving plenty of headroom for a contended-CI stall.
 	ok(Date.now() - start < 1000, 'should not wait the grace period for an already-dead process');
+});
+
+// Regression guard: the dataRootDir HOME isolation must take precedence over any caller-supplied env (or a
+// spread of process.env, which contains HOME). If a caller could clobber HOME/USERPROFILE, Harper's global
+// boot pointer would land in the developer's real ~/.harperdb and outlive the throwaway instance.
+test('buildHarperChildEnv: HOME/USERPROFILE isolation wins over caller-supplied env', () => {
+	const env = buildHarperChildEnv('/tmp/data-root', { logging: { level: 'debug' } }, {
+		HOME: '/should/not/win',
+		USERPROFILE: '/should/not/win',
+		CUSTOM_VAR: 'kept',
+	});
+	strictEqual(env.HOME, '/tmp/data-root', 'isolated HOME must override caller env');
+	strictEqual(env.USERPROFILE, '/tmp/data-root', 'isolated USERPROFILE must override caller env');
+	strictEqual(env.CUSTOM_VAR, 'kept', 'non-isolation caller env is still passed through');
+	strictEqual(env.HARPER_SET_CONFIG, JSON.stringify({ logging: { level: 'debug' } }));
+});
+
+test('buildHarperChildEnv: isolates HOME/USERPROFILE to dataRootDir by default', () => {
+	const env = buildHarperChildEnv('/tmp/data-root', {});
+	strictEqual(env.HOME, '/tmp/data-root');
+	strictEqual(env.USERPROFILE, '/tmp/data-root');
 });
