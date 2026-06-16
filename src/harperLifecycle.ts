@@ -143,6 +143,28 @@ export interface StartHarperOptions {
 	harperBinPath?: string;
 }
 
+/**
+ * Build the environment for the spawned Harper child process. Exported for testing.
+ *
+ * `HOME`/`USERPROFILE` are applied LAST so the dataRootDir isolation always takes precedence over
+ * caller-supplied `env` (and over a spread of `process.env`, which contains HOME) — otherwise a caller could
+ * clobber it and re-expose the developer's real home. The isolation keeps Harper's global boot pointer
+ * (`$HOME/.harperdb/hdb_boot_properties.file`) and generated license keys inside the throwaway dataRootDir:
+ * cleaned up with it, never touching the real home, and isolated across concurrent suites. On first start
+ * Harper records its rootPath in that global boot file and — with an explicit `--ROOTPATH` — never overwrites
+ * it again; teardown removes only dataRootDir, so without this isolation the developer's real `~/.harperdb`
+ * would be left pointing at a since-deleted temp install, silently breaking the next `harper dev`/`harper run`
+ * anywhere on the machine.
+ */
+export function buildHarperChildEnv(dataRootDir: string, config: any, env?: any): Record<string, string | undefined> {
+	return {
+		HARPER_SET_CONFIG: JSON.stringify(config),
+		...env,
+		HOME: dataRootDir,
+		USERPROFILE: dataRootDir,
+	};
+}
+
 export interface HarperContext {
 	/** Absolute path to the Harper installation directory */
 	dataRootDir: string;
@@ -552,12 +574,10 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		args.push(`--HTTP_SECUREPORT=${loopbackAddress}:${HTTPS_PORT}`);
 	}
 
-	// HARPER_SET_CONFIG must be passed as an environment variable, not a CLI arg,
-	// because applyRuntimeEnvVarConfig reads from process.env.HARPER_SET_CONFIG
-	const harperEnv = {
-		HARPER_SET_CONFIG: JSON.stringify(config),
-		...options?.env,
-	};
+	// HARPER_SET_CONFIG must be passed as an environment variable, not a CLI arg, because
+	// applyRuntimeEnvVarConfig reads from process.env.HARPER_SET_CONFIG. buildHarperChildEnv also isolates the
+	// child's HOME into dataRootDir so Harper's global boot pointer never lands in the developer's real home.
+	const harperEnv = buildHarperChildEnv(dataRootDir, config, options?.env);
 
 	const result = await runHarperCommand({
 		args,
