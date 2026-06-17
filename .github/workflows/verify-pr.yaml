@@ -1,13 +1,13 @@
-name: CI
+name: Verify PR
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   pull_request:
+    branches: [main]
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: verify-pr-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

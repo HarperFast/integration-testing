@@ -4,6 +4,22 @@
 	"type": "module",
 	"description": "Integration testing utilities for Harper-based projects. Provides Harper instance lifecycle management, loopback address pooling, and a test runner script.",
 	"license": "Apache-2.0",
+	"publishConfig": {
+		"access": "public"
+	},
+	"homepage": "https://github.com/HarperFast/integration-testing",
+	"bugs": {
+		"url": "https://github.com/HarperFast/integration-testing/issues",
+		"email": "support@harperdb.io"
+	},
+	"author": {
+		"name": "Harper",
+		"email": "support@harperdb.io"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/HarperFast/integration-testing"
+	},
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
@@ -44,8 +60,17 @@
 		"tar-fs": "3.1.2"
 	},
 	"devDependencies": {
+		"@commitlint/cli": "^20.0.0",
+		"@commitlint/config-conventional": "^20.0.0",
+		"@semantic-release/commit-analyzer": "^13.0.1",
+		"@semantic-release/git": "^10.0.1",
+		"@semantic-release/github": "^12.0.2",
+		"@semantic-release/npm": "^13.1.1",
+		"@semantic-release/release-notes-generator": "^14.1.0",
 		"@types/node": "22.0.0",
 		"@types/tar-fs": "2.0.4",
+		"conventional-changelog-conventionalcommits": "^9.1.0",
+		"semantic-release": "^25.0.2",
 		"typescript": "6.0.2"
 	},
 	"peerDependencies": {
