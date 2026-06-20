@@ -54,8 +54,10 @@ const CONFLICT_PROBE_PORT = (() => {
 // a silent SO_REUSEPORT co-bind on the HTTP port. A plain (non-reusePort) bind still fails
 // with EADDRINUSE against a lingering SO_REUSEPORT socket (Linux disallows mixing reusePort
 // and non-reusePort binders on the same address:port), so probing the HTTP port here closes
-// that blind spot. Override via HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT if HTTP_PORT
-// ever changes. (Hardcoded rather than imported from harperLifecycle to avoid a circular import.)
+// that blind spot. (This detection is Linux-effective — macOS/BSD SO_REUSEPORT semantics differ
+// and may not surface EADDRINUSE here, but macOS also doesn't exhibit the silent co-bind in the
+// first place, and CI runs on Linux.) Override via HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT
+// if HTTP_PORT ever changes. (Hardcoded rather than imported from harperLifecycle to avoid a circular import.)
 const HTTP_CONFLICT_PROBE_PORT = (() => {
 	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT || '', 10);
 	return Number.isNaN(parsed) || parsed < 0 || parsed > 65535 ? 9926 : parsed;
