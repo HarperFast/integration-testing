@@ -45,6 +45,25 @@ const CONFLICT_PROBE_PORT = (() => {
 	return Number.isNaN(parsed) || parsed < 0 || parsed > 65535 ? 9925 : parsed;
 })();
 
+// Second conflict-canary port: Harper's HTTP listener (`HTTP_PORT` in harperLifecycle.ts).
+// The operations port above is bound by the MAIN thread without SO_REUSEPORT, so it catches
+// a fully-alive (or recently-signalled) node. But the most common contamination shape after
+// a kill/teardown is different: the main thread has already exited (freeing the operations
+// port) while the HTTP WORKER threads still linger holding the address with SO_REUSEPORT.
+// The operations-port probe alone reports such an address as free and hands it out, producing
+// a silent SO_REUSEPORT co-bind on the HTTP port. A plain (non-reusePort) bind still fails
+// with EADDRINUSE against a lingering SO_REUSEPORT socket (Linux disallows mixing reusePort
+// and non-reusePort binders on the same address:port), so probing the HTTP port here closes
+// that blind spot. Override via HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT if HTTP_PORT
+// ever changes. (Hardcoded rather than imported from harperLifecycle to avoid a circular import.)
+const HTTP_CONFLICT_PROBE_PORT = (() => {
+	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT || '', 10);
+	return Number.isNaN(parsed) || parsed < 0 || parsed > 65535 ? 9926 : parsed;
+})();
+
+// The set of ports the conflict canary probes, de-duplicated in case the two overrides collide.
+const CONFLICT_PROBE_PORTS = [...new Set([CONFLICT_PROBE_PORT, HTTP_CONFLICT_PROBE_PORT])];
+
 // Type definitions
 type LoopbackPool = (number | null)[];
 
@@ -229,18 +248,15 @@ function validateLoopbackAddress(loopbackAddress: string): Promise<string> {
 }
 
 /**
- * Conflict canary: detects whether a Harper node is already bound to `loopbackAddress`
- * by attempting an exclusive (non-SO_REUSEPORT) bind on the operations-API port. Node's
- * `net` server does not set SO_REUSEPORT, so if a stale/overlapping Harper node still
- * owns the address's operations port, this bind fails with EADDRINUSE.
+ * Probes a single port on `loopbackAddress` with an exclusive (non-SO_REUSEPORT) bind.
+ * Node's `net` server does not set SO_REUSEPORT, so if a stale/overlapping Harper node still
+ * holds this port — even via a SO_REUSEPORT worker socket — the bind fails with EADDRINUSE.
  *
- * Returns `true` if the address appears in use (EADDRINUSE), `false` if it is free.
+ * Returns `true` if the port appears in use (EADDRINUSE), `false` if it is free.
  * Re-throws any other bind error (e.g. EADDRNOTAVAIL) — that's a real configuration
  * problem the caller should surface, not a transient conflict to skip.
- *
- * @param loopbackAddress The loopback IP address to probe (e.g., "127.0.0.2")
  */
-function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
+function isPortInUseOnAddress(port: number, loopbackAddress: string): Promise<boolean> {
 	return new Promise((resolve, reject) => {
 		const server = createServer();
 		const onError = (error: NodeJS.ErrnoException) => {
@@ -253,8 +269,8 @@ function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
 			reject(enhancedError);
 		};
 		server.once('error', onError);
-		server.listen(CONFLICT_PROBE_PORT, loopbackAddress, () => {
-			// Bind succeeded — the address is free. Drop the error listener so a stray
+		server.listen(port, loopbackAddress, () => {
+			// Bind succeeded — the port is free. Drop the error listener so a stray
 			// post-bind socket error during close() can't flip the resolved verdict.
 			server.off('error', onError);
 			server.close(() => {
@@ -262,6 +278,30 @@ function isLoopbackAddressInUse(loopbackAddress: string): Promise<boolean> {
 			});
 		});
 	});
+}
+
+/**
+ * Conflict canary: detects whether a Harper node is already bound to `loopbackAddress` by
+ * probing each of Harper's canary ports (see `CONFLICT_PROBE_PORTS`). Two ports are checked
+ * because a lingering node can hold the address in two distinct states:
+ *   - the operations port (main-thread, non-reusePort) — a fully-alive or recently-signalled node;
+ *   - the HTTP port (worker-thread, SO_REUSEPORT) — a node whose main thread already exited but
+ *     whose HTTP workers still linger, the common post-kill/post-teardown shape.
+ * A plain bind fails with EADDRINUSE against either, so probing both catches both shapes and
+ * prevents an SO_REUSEPORT co-bind that would split connections between two nodes.
+ *
+ * Returns the first in-use port number, or `null` if the address is free.
+ * Re-throws any non-EADDRINUSE bind error (a real configuration problem).
+ *
+ * @param loopbackAddress The loopback IP address to probe (e.g., "127.0.0.2")
+ */
+async function findConflictingPort(loopbackAddress: string): Promise<number | null> {
+	for (const port of CONFLICT_PROBE_PORTS) {
+		if (await isPortInUseOnAddress(port, loopbackAddress)) {
+			return port;
+		}
+	}
+	return null;
 }
 
 /**
@@ -381,17 +421,19 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 
 			// Conflict canary: a stale or still-running Harper node from an overlapping
 			// suite may already hold this address (e.g. the pool slot was freed while its
-			// node lingered). SO_REUSEPORT on Harper's shared HTTP/replication ports would
-			// otherwise let our node silently co-bind it, splitting connections between two
-			// nodes and corrupting both suites. Detect that here via the exclusive
-			// operations port and skip the poisoned address.
-			let inUse: boolean;
+			// node lingered — including the common shape where the main thread exited but the
+			// HTTP workers still hold the address). SO_REUSEPORT on Harper's shared HTTP/
+			// replication ports would otherwise let our node silently co-bind it, splitting
+			// connections between two nodes and corrupting both suites. Detect that here by
+			// probing both the exclusive operations port and the worker-held HTTP port, and
+			// skip the poisoned address.
+			let conflictingPort: number | null;
 			try {
-				inUse = await isLoopbackAddressInUse(loopbackAddress);
+				conflictingPort = await findConflictingPort(loopbackAddress);
 			} catch (error) {
 				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
 			}
-			if (!inUse) {
+			if (conflictingPort === null) {
 				return loopbackAddress;
 			}
 
@@ -400,7 +442,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			await releaseLoopbackAddress(loopbackAddress);
 			triedIndices.add(assignedIndex);
 			console.warn(
-				`[loopback-pool] ${loopbackAddress} is still in use by another Harper node (operations port ${CONFLICT_PROBE_PORT} bound); skipping to avoid an SO_REUSEPORT co-bind.`
+				`[loopback-pool] ${loopbackAddress} is still in use by another Harper node (port ${conflictingPort} bound); skipping to avoid an SO_REUSEPORT co-bind.`
 			);
 			continue;
 		}
