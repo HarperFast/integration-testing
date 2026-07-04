@@ -35,7 +35,20 @@ fi
 
 END=$((START + COUNT - 1))
 for i in $(seq $START $END); do
-  sudo ifconfig lo0 alias 127.0.0.$i up
+  # Use a host (/32) netmask, not the implicit class-A /8. Without an explicit netmask,
+  # macOS gives each 127.0.0.x alias a 255.0.0.0 mask, so every alias claims to own the
+  # entire 127.0.0.0/8 network. With a large COUNT that means dozens/hundreds of interface
+  # addresses all asserting the same subnet, which drives mDNSResponder's address-conflict
+  # defense (PacketRRConflict) into an O(n^2) storm — pinning a CPU core and flooding
+  # 5353 with loopback announcements. A /32 host route removes the subnet overlap: each
+  # alias is an isolated host, so there is no conflict cascade even at the full 254-address
+  # pool. (Measured: 254 aliases /8 => ~65% CPU; 254 aliases /32 => ~0% CPU.)
+  #
+  # Remove any pre-existing alias first so re-running this converts a machine previously
+  # configured with the old /8 aliases; ifconfig alias on an existing address does not
+  # reliably reset its netmask. The `-alias` is a harmless no-op if the address is absent.
+  sudo ifconfig lo0 -alias 127.0.0.$i 2>/dev/null
+  sudo ifconfig lo0 alias 127.0.0.$i netmask 255.255.255.255 up
 done
 
 echo "✓ Configured $COUNT loopback addresses (127.0.0.$START-127.0.0.$END)"

@@ -50,6 +50,8 @@ npx harper-integration-test-setup-loopback
 
 This script requires `sudo` and respects the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` environment variable (defaults to 32).
 
+On macOS the aliases are configured with a host (`/32`) netmask. This matters: with the default class-A (`/8`) netmask every `127.0.0.x` alias claims the whole `127.0.0.0/8` network, and at large pool counts the resulting set of overlapping-subnet interface addresses drives `mDNSResponder`'s address-conflict defense into a CPU-pinning storm of mDNS announcements on port 5353. If you previously ran an older version of this script, re-run it to convert the existing aliases to `/32`.
+
 ## API
 
 The lifecycle and utility APIs below are framework-agnostic. They manage Harper child processes and a cross-process loopback address pool. Use them in the setup/teardown hooks of whichever test framework you prefer.
