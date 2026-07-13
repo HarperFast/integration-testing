@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.harperdb.loopback-setup</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/usr/local/sbin/harper-loopback-setup.sh</string>
+	</array>
+
+	<!-- One-shot at boot. Not a long-running service, so no KeepAlive. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Pool size. Omit to use the script default (32); raise to 254 for the full pool. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT</key>
+		<string>32</string>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/harper-loopback-setup.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/harper-loopback-setup.log</string>
+</dict>
+</plist>

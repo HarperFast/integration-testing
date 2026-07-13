@@ -52,6 +52,32 @@ This script requires `sudo` and respects the `HARPER_INTEGRATION_TEST_LOOPBACK_P
 
 On macOS the aliases are configured with a host (`/32`) netmask. This matters: with the default class-A (`/8`) netmask every `127.0.0.x` alias claims the whole `127.0.0.0/8` network, and at large pool counts the resulting set of overlapping-subnet interface addresses drives `mDNSResponder`'s address-conflict defense into a CPU-pinning storm of mDNS announcements on port 5353. If you previously ran an older version of this script, re-run it to convert the existing aliases to `/32`.
 
+### Persisting across reboots (macOS)
+
+`ifconfig` aliases live only in the running kernel — macOS does not persist manually added `lo0` aliases, so they vanish on every reboot and the pool has to be reconfigured. For a dev machine that reboots regularly, install a `launchd` daemon that runs the setup script at boot. `scripts/io.harperdb.loopback-setup.plist` is provided for this; the script is root-aware, so it needs no `sudo` when launchd runs it as root.
+
+```sh
+# 1. Copy the setup script to a stable, root-owned path (the plist points here)
+sudo mkdir -p /usr/local/sbin
+sudo install -m 755 -o root -g wheel \
+  "$(npm root)/@harperfast/integration-testing/scripts/setup-loopback.sh" \
+  /usr/local/sbin/harper-loopback-setup.sh
+
+# 2. Install the daemon (must be root:wheel and mode 644 or launchd rejects it)
+sudo install -m 644 -o root -g wheel \
+  "$(npm root)/@harperfast/integration-testing/scripts/io.harperdb.loopback-setup.plist" \
+  /Library/LaunchDaemons/io.harperdb.loopback-setup.plist
+
+# 3. Load and run it now (also runs at every boot via RunAtLoad)
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.harperdb.loopback-setup.plist
+
+# 4. Verify
+cat /var/log/harper-loopback-setup.log        # ✓ Configured ... line
+ifconfig lo0 | grep '127.0.0' | tail -3       # aliases present
+```
+
+Edit the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` value in the installed plist to change the pool size (it defaults to 32, matching the script). To remove the daemon: `sudo launchctl bootout system/io.harperdb.loopback-setup` and delete the plist. If you edit the installed plist, `bootout` then `bootstrap` again to reload it.
+
 ## API
 
 The lifecycle and utility APIs below are framework-agnostic. They manage Harper child processes and a cross-process loopback address pool. Use them in the setup/teardown hooks of whichever test framework you prefer.

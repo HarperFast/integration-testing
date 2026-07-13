@@ -1,7 +1,14 @@
 #!/bin/bash
 
-# Prompt for password upfront
-sudo -v
+# Run ifconfig via sudo when invoked interactively, or directly when already root
+# (e.g. from the launchd daemon at boot, where there is no tty for `sudo -v`).
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+  # Prompt for password upfront
+  sudo -v
+fi
 
 # The pool starts at 127.0.0.2 by default (127.0.0.1 is left for other services on localhost).
 # Override via the HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START environment variable.
@@ -47,8 +54,8 @@ for i in $(seq $START $END); do
   # Remove any pre-existing alias first so re-running this converts a machine previously
   # configured with the old /8 aliases; ifconfig alias on an existing address does not
   # reliably reset its netmask. The `-alias` is a harmless no-op if the address is absent.
-  sudo ifconfig lo0 -alias 127.0.0.$i 2>/dev/null
-  sudo ifconfig lo0 alias 127.0.0.$i netmask 255.255.255.255 up
+  $SUDO ifconfig lo0 -alias 127.0.0.$i 2>/dev/null
+  $SUDO ifconfig lo0 alias 127.0.0.$i netmask 255.255.255.255 up
 done
 
 echo "✓ Configured $COUNT loopback addresses (127.0.0.$START-127.0.0.$END)"
