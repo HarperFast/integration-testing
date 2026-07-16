@@ -96,7 +96,7 @@ The Harper binary is resolved in the following order:
 
 ```ts
 interface StartHarperOptions {
-  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
+  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
   startupMaxMs?: number;       // Absolute startup ceiling regardless of output. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
   config?: object;             // Harper config overrides (passed via HARPER_SET_CONFIG)
   env?: object;                // Additional environment variables for the Harper process
@@ -110,7 +110,7 @@ Startup readiness is detected by Harper printing `successfully started`. Rather 
 
 **Environment Variables:**
 
-- `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Idle startup timeout: max time between chunks of startup output before Harper is treated as hung (resets on output). Default `60000`.
+- `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Idle startup timeout: max time between chunks of startup output before Harper is treated as hung (resets on output). Default `60000` (`150000` under CI).
 - `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
