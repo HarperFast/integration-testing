@@ -59,11 +59,15 @@ const IS_CI = !!process.env.CI;
  * Maximum time to wait between chunks of Harper startup output before treating the process
  * as hung. The startup watchdog resets this window on every chunk of output, so the limit is
  * time-since-last-progress rather than total boot time: a slow-but-healthy boot that keeps
- * logging never trips it — only true silence does.
+ * logging never trips it — only true silence does. Higher under CI, matching
+ * {@link DEFAULT_STARTUP_MAX_MS}'s CI scaling — shared/contended runners can go quiet between
+ * log lines for longer without actually being hung (e.g. native module load/RocksDB open
+ * competing with sibling concurrently-booting Harper instances for CPU).
  *
- * Override with `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS`. Default 60s.
+ * Override with `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS`. Default 60s (150s under CI).
  */
-export const DEFAULT_STARTUP_TIMEOUT_MS = parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS || '', 10) || 60000;
+export const DEFAULT_STARTUP_TIMEOUT_MS =
+	parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS || '', 10) || (IS_CI ? 150000 : 60000);
 
 /**
  * Absolute ceiling on total startup time, regardless of ongoing output — a generous backstop
@@ -117,7 +121,7 @@ export interface StartHarperOptions {
 	/**
 	 * Maximum time (ms) to wait between chunks of startup output before treating Harper as hung.
 	 * Resets on every chunk of output, so it bounds silence, not total boot time.
-	 * Falls back to {@link DEFAULT_STARTUP_TIMEOUT_MS} (60s).
+	 * Falls back to {@link DEFAULT_STARTUP_TIMEOUT_MS} (60s locally, 150s under CI).
 	 */
 	startupTimeoutMs?: number;
 	/**
