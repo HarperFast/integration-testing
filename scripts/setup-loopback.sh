@@ -58,4 +58,22 @@ for i in $(seq $START $END); do
   $SUDO ifconfig lo0 alias 127.0.0.$i netmask 255.255.255.255 up
 done
 
-echo "✓ Configured $COUNT loopback addresses (127.0.0.$START-127.0.0.$END)"
+# Verify every alias actually landed before claiming success. A partial run
+# (expired sudo credential mid-loop, interruption) previously still printed ✓,
+# leaving the test runner failing later on the missing addresses.
+MISSING=()
+for i in $(seq $START $END); do
+  if ! ifconfig lo0 | grep -q "inet 127\.0\.0\.$i "; then
+    MISSING+=("127.0.0.$i")
+  fi
+done
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "✗ ${#MISSING[@]} loopback address(es) failed to configure. Fix with:"
+  for addr in "${MISSING[@]}"; do
+    echo "  sudo ifconfig lo0 alias $addr netmask 255.255.255.255 up"
+  done
+  exit 1
+fi
+
+echo "✓ Configured and verified $COUNT loopback addresses (127.0.0.$START-127.0.0.$END)"
