@@ -285,12 +285,21 @@ function logResolvedHarperScript(scriptPath: string, source: string): string {
 	loggedHarperScripts.add(scriptPath);
 	console.log(`[integration-testing] Using Harper at ${scriptPath} (via ${source})`);
 	if (source === 'node_modules') {
-		const cwdDist = join(process.cwd(), 'dist/bin/harper.js');
-		if (existsSync(cwdDist) && cwdDist !== scriptPath) {
-			console.warn(
-				`[integration-testing] Warning: resolved the 'harper' package from node_modules, but ${cwdDist} also exists. ` +
-					`If you meant to test the local build, set HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=dist/bin/harper.js.`
-			);
+		// Mirror resolution step 4's ancestor walk so the warning fires even when
+		// tests run from a subdirectory of the repo that holds the local build.
+		let currentDir = process.cwd();
+		while (true) {
+			const localDist = join(currentDir, 'dist/bin/harper.js');
+			if (existsSync(localDist) && localDist !== scriptPath) {
+				console.warn(
+					`[integration-testing] Warning: resolved the 'harper' package from node_modules, but ${localDist} also exists. ` +
+						`If you meant to test the local build, set HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=${localDist}.`
+				);
+				break;
+			}
+			const parentDir = dirname(currentDir);
+			if (parentDir === currentDir) break;
+			currentDir = parentDir;
 		}
 	}
 	return scriptPath;
