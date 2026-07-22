@@ -222,7 +222,7 @@ function getHarperScript(harperBinPath?: string): string {
 	// 1. Explicit option
 	if (harperBinPath) {
 		ok(existsSync(harperBinPath), `Harper script not found at provided harperBinPath: ${harperBinPath}`);
-		return harperBinPath;
+		return logResolvedHarperScript(harperBinPath, 'harperBinPath option');
 	}
 
 	// 2. Environment variable
@@ -232,7 +232,7 @@ function getHarperScript(harperBinPath?: string): string {
 			existsSync(envPath),
 			`Harper script not found at HARPER_INTEGRATION_TEST_INSTALL_SCRIPT path: ${envPath}`
 		);
-		return envPath;
+		return logResolvedHarperScript(envPath, 'HARPER_INTEGRATION_TEST_INSTALL_SCRIPT');
 	}
 
 	// 3. Auto-resolve from node_modules
@@ -240,7 +240,7 @@ function getHarperScript(harperBinPath?: string): string {
 		const require = createRequire(import.meta.url);
 		const resolved = require.resolve('harper/dist/bin/harper.js');
 		if (existsSync(resolved)) {
-			return resolved;
+			return logResolvedHarperScript(resolved, 'node_modules');
 		}
 	} catch {
 		// harper package not found in node_modules
@@ -251,7 +251,7 @@ function getHarperScript(harperBinPath?: string): string {
 	while (true) {
 		const potentialPath = join(currentDir, 'dist/bin/harper.js');
 		if (existsSync(potentialPath)) {
-			return potentialPath;
+			return logResolvedHarperScript(potentialPath, 'ancestor dist');
 		}
 		const parentDir = dirname(currentDir);
 		if (parentDir === currentDir) {
@@ -267,6 +267,42 @@ function getHarperScript(harperBinPath?: string): string {
 			`  - Install 'harper' as a dependency in your project\n` +
 			`  - Run tests within a directory containing 'dist/bin/harper.js'`
 	);
+}
+
+const loggedHarperScripts = new Set<string>();
+
+/**
+ * Logs which Harper binary was resolved and how, once per distinct path.
+ *
+ * Which binary runs is the single most consequential (and previously invisible)
+ * decision the harness makes: resolving a stale `harper` package from
+ * node_modules while the caller expected their local build produces confusing
+ * wholesale test failures with no hint of the cause. When the `node_modules`
+ * path wins while `./dist/bin/harper.js` also exists, warn with the override.
+ */
+function logResolvedHarperScript(scriptPath: string, source: string): string {
+	if (loggedHarperScripts.has(scriptPath)) return scriptPath;
+	loggedHarperScripts.add(scriptPath);
+	console.log(`[integration-testing] Using Harper at ${scriptPath} (via ${source})`);
+	if (source === 'node_modules') {
+		// Mirror resolution step 4's ancestor walk so the warning fires even when
+		// tests run from a subdirectory of the repo that holds the local build.
+		let currentDir = process.cwd();
+		while (true) {
+			const localDist = join(currentDir, 'dist/bin/harper.js');
+			if (existsSync(localDist) && localDist !== scriptPath) {
+				console.warn(
+					`[integration-testing] Warning: resolved the 'harper' package from node_modules, but ${localDist} also exists. ` +
+						`If you meant to test the local build, set HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=${localDist}.`
+				);
+				break;
+			}
+			const parentDir = dirname(currentDir);
+			if (parentDir === currentDir) break;
+			currentDir = parentDir;
+		}
+	}
+	return scriptPath;
 }
 
 /**
