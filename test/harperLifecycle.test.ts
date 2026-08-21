@@ -5,7 +5,6 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { createServer, type AddressInfo } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -80,10 +79,12 @@ const result = await runHarperCommand({
 });
 const match = result.stdout.match(/tree-ready:(\\d+):(\\d+)/);
 if (!match) throw new Error('Missing fake Harper process markers: ' + result.stdout);
-process.stdout.write('runner-ready:' + result.process.pid + ':' + match[1] + ':' + match[2] + '\\n');
+process.stdout.write('runner-ready:' + result.process.pid + ':' + result.harperPid + ':' + match[1] + ':' + match[2] + '\\n');
 if (process.env.HARPER_RUNNER_MODE === 'teardown') {
   await killHarper({ harper: { process: result.process } }, { graceMs: 2000 });
-  process.stdout.write('teardown-complete\\n');
+  let harperGone = false;
+  try { process.kill(result.harperPid, 0); } catch { harperGone = true; }
+  process.stdout.write('teardown-complete:' + harperGone + '\\n');
 } else {
   setInterval(() => {}, 1000);
 }
@@ -181,7 +182,7 @@ async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarper
 	const runner = spawn(process.execPath, [fixtures['orphan-runner.mjs']], {
 		env: {
 			...process.env,
-			HARPER_LIFECYCLE_URL: pathToFileURL(join(process.cwd(), 'src/harperLifecycle.ts')).href,
+			HARPER_LIFECYCLE_URL: new URL('../src/harperLifecycle.ts', import.meta.url).href,
 			HARPER_FAKE_SCRIPT: fixtures['process-tree.cjs'],
 			HARPER_PORT: String(ports[0]),
 			HARPER_DESCENDANT_PORT: String(ports[1]),
@@ -192,16 +193,17 @@ async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarper
 	});
 	let match: RegExpMatchArray;
 	try {
-		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+)/);
+		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+):(\d+)/);
 	} catch (error) {
 		forceKill(runner.pid);
 		throw error;
 	}
+	strictEqual(Number(match[2]), Number(match[3]), 'reported harperPid should match the Harper runtime PID');
 	return {
 		runner,
 		supervisorPid: Number(match[1]),
-		harperPid: Number(match[2]),
-		descendantPid: Number(match[3]),
+		harperPid: Number(match[3]),
+		descendantPid: Number(match[4]),
 		ports,
 	};
 }
@@ -283,6 +285,7 @@ test('runHarperCommand keeps a slow-but-progressing boot alive past the idle win
 		env: {},
 		completionMessage: 'successfully started',
 		harperBinPath: fixtures['idle-reset.cjs'],
+		// The idle window includes launching both the supervisor and fake Harper before first output.
 		timeoutMs: 700,
 		maxMs: 10000,
 	});
@@ -334,17 +337,15 @@ test('unexpected supervisor death falls back to reaping the Harper tree', async 
 });
 
 test('killHarper waits for supervised Harper shutdown and does not keep the runner alive', { skip: !isPosix }, async () => {
-	const startedAt = Date.now();
 	const tree = await startFakeHarperTree('teardown');
 	try {
-		await waitForMatch(tree.runner, /teardown-complete/);
+		await waitForMatch(tree.runner, /teardown-complete:true/);
 		await Promise.race([
 			once(tree.runner, 'exit'),
 			sleep(3000).then(() => {
 				throw new Error('Runner stayed alive after supervised teardown');
 			}),
 		]);
-		ok(Date.now() - startedAt >= 250, 'killHarper should wait for Harper to finish its delayed SIGTERM handler');
 		ok(await waitForPortsFree('127.0.0.1', tree.ports, 2000, 50), 'ports should be free when killHarper resolves');
 	} finally {
 		await cleanupFakeHarperTree(tree);

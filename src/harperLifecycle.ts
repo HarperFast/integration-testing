@@ -121,7 +121,8 @@ export const LOG_DIR_MARKER_PREFIX = '[Harper] Logs for this instance will be st
 export interface StartHarperOptions {
 	/**
 	 * Maximum time (ms) to wait between chunks of startup output before treating Harper as hung.
-	 * Resets on every chunk of output, so it bounds silence, not total boot time.
+	 * Resets on every chunk of output, so it bounds silence, including the supervisor launch before
+	 * Harper emits its first chunk, rather than total boot time.
 	 * Falls back to {@link DEFAULT_STARTUP_TIMEOUT_MS} (60s locally, 150s under CI).
 	 */
 	startupTimeoutMs?: number;
@@ -461,10 +462,11 @@ export function runHarperCommand({
 		const succeed = () => {
 			if (settled || readinessDetected) return;
 			readinessDetected = true;
-			clearTimers();
+			clearTimeout(idleTimer);
 			void trackedProcess.harperPidReady.then((harperPid) => {
 				if (settled) return;
 				settled = true;
+				clearTimers();
 				resolve({ process: proc, harperPid, stdout, stderr });
 			});
 		};
@@ -521,11 +523,16 @@ export function runHarperCommand({
 			reject(error);
 		});
 		proc.on('exit', (statusCode, signal) => {
-			clearTimers();
 			if (!settled) {
 				settled = true;
+				clearTimers();
 				if (statusCode === 0) {
-					void trackedProcess.harperPidReady.then((harperPid) => resolve({ process: proc, harperPid, stdout, stderr }));
+					if (trackedProcess.harperPid === undefined) {
+						const errorMessage = 'Harper supervisor exited without reporting the Harper PID';
+						reject(new HarperStartupError(errorMessage, stdout, stderr));
+					} else {
+						resolve({ process: proc, harperPid: trackedProcess.harperPid, stdout, stderr });
+					}
 				} else {
 					const errorMessage = `Harper process failed with exit code/signal ${statusCode ?? signal}`;
 					stderrStream?.write(errorMessage);
@@ -673,25 +680,19 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	return ctx as StartedHarperTestContext;
 }
 
-/**
- * Signals Harper's entire process tree, not just the direct child.
- *
- * Harper runs its listeners in worker threads (in-process), but components can also spawn
- * child processes, so we target the whole tree to be safe:
- * - POSIX: Harper is spawned as its own process-group leader (`detached`), so a negative PID
- *   signals the group (parent + descendants).
- * - Windows: there are no process groups, so we shell out to `taskkill /T` (tree). `/F` (force)
- *   is required to actually terminate console processes, so it is used for the SIGKILL step.
- *
- * Best-effort: errors (e.g. the process already exited) are swallowed; teardown's port assertion
- * and the wait-for-exit are the safety nets.
- */
 function signalWindowsProcessTree(pid: number, signal: 'SIGTERM' | 'SIGKILL'): void {
 	const args = ['/pid', String(pid), '/T'];
 	if (signal === 'SIGKILL') args.push('/F');
 	spawn('taskkill', args, { stdio: 'ignore' }).on('error', () => {});
 }
 
+/**
+ * Signals Harper's entire process tree, not just the lifecycle process.
+ *
+ * The supervisor is the detached POSIX process-group leader, with Harper and its descendants in
+ * that group. Windows has no process groups, so `taskkill /T` terminates the supervisor's tree.
+ * Errors are best-effort because the target may already have exited.
+ */
 function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
 	const pid = proc.pid;
 	if (pid === undefined) return;
@@ -723,8 +724,8 @@ function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): vo
 /**
  * Tracks live Harper processes so that if the test runner exits or is interrupted before teardown
  * runs (Ctrl+C, or a CI job killing the runner), their process trees are reaped instead of left
- * orphaned holding the fixed ports. This matters specifically because Harper is spawned `detached`
- * (its own process group), so it would otherwise survive signals delivered to the runner's group.
+ * orphaned holding the fixed ports. The detached supervisor group would otherwise survive signals
+ * delivered to the runner's group.
  *
  * The supervisor's liveness pipe handles uncatchable runner death. These parent-side hooks provide
  * immediate cleanup for cooperative exits and retain a fallback for unexpected supervisor death.
@@ -755,11 +756,9 @@ function trackHarperProcess(proc: ChildProcess): TrackedHarperProcess {
 	});
 	proc.channel?.unref();
 	proc.once('exit', () => {
-		if (!trackedProcess.harperExited) {
-			signalHarperTree(proc, 'SIGKILL');
-			if (process.platform === 'win32' && trackedProcess.harperPid !== undefined) {
-				signalWindowsProcessTree(trackedProcess.harperPid, 'SIGKILL');
-			}
+		signalHarperTree(proc, 'SIGKILL');
+		if (process.platform === 'win32' && !trackedProcess.harperExited && trackedProcess.harperPid !== undefined) {
+			signalWindowsProcessTree(trackedProcess.harperPid, 'SIGKILL');
 		}
 		trackedProcess.livenessPipe.destroy();
 		liveHarperProcesses.delete(proc);

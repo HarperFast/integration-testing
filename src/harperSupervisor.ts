@@ -45,9 +45,7 @@ function terminateHarperTree(): never {
 		if (harperPid !== undefined) {
 			try {
 				process.kill(harperPid, 'SIGKILL');
-			} catch {
-				// The Harper process already exited.
-			}
+			} catch {}
 		}
 	}
 	process.exit(SUPERVISOR_FAILURE_EXIT_CODE);
@@ -85,7 +83,9 @@ process.channel?.unref();
 
 let spawnedHarperProcess: ChildProcess;
 try {
-	spawnedHarperProcess = spawn(runtime, runtimeArgs, { stdio: ['inherit', 'inherit', 'inherit'] });
+	spawnedHarperProcess = spawn(runtime, runtimeArgs, {
+		stdio: ['inherit', 'inherit', 'inherit', 'ignore', 'ignore'],
+	});
 } catch (error) {
 	reportUnexpectedFailure(error);
 }

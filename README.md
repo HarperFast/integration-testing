@@ -100,7 +100,7 @@ The Harper binary is resolved in the following order:
 
 ```ts
 interface StartHarperOptions {
-  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
+  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks, including supervisor launch before the first chunk. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
   startupMaxMs?: number;       // Absolute startup ceiling regardless of output. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
   config?: object;             // Harper config overrides (passed via HARPER_SET_CONFIG)
   env?: object;                // Additional environment variables for the Harper process
