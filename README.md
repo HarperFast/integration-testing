@@ -125,7 +125,7 @@ Like `startHarper()`, but copies a component directory into the Harper install b
 
 ### `killHarper(ctx, options?)`
 
-Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. The lifecycle supervisor is the detached POSIX process-group leader, with Harper and its children in that group; on Windows the harness uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
 
 `options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
