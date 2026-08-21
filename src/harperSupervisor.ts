@@ -23,10 +23,15 @@ function sendToRunner(message: SupervisorMessage, callback?: () => void): void {
 		callback?.();
 		return;
 	}
-	process.send(message, (error: Error | null) => {
-		if (error) process.stderr.write(`[harper-supervisor] Failed to notify runner: ${error.message}\n`);
+	try {
+		process.send(message, (error: Error | null) => {
+			if (error) process.stderr.write(`[harper-supervisor] Failed to notify runner: ${error.message}\n`);
+			callback?.();
+		});
+	} catch (error) {
+		process.stderr.write(`[harper-supervisor] Failed to notify runner: ${(error as Error).message}\n`);
 		callback?.();
-	});
+	}
 }
 
 function terminateHarperTree(): never {
@@ -45,7 +50,9 @@ function terminateHarperTree(): never {
 		if (harperPid !== undefined) {
 			try {
 				process.kill(harperPid, 'SIGKILL');
-			} catch {}
+			} catch {
+				// The Harper process already exited.
+			}
 		}
 	}
 	process.exit(SUPERVISOR_FAILURE_EXIT_CODE);

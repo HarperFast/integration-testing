@@ -5,7 +5,6 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, type AddressInfo } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
 	killHarper,
@@ -41,8 +40,8 @@ const { createServer } = require('node:net');
 const host = '127.0.0.1';
 if (process.env.HARPER_FAKE_DESCENDANT === '1') {
   const server = createServer();
-  server.listen(Number(process.env.HARPER_DESCENDANT_PORT), host, () => {
-    process.stdout.write('descendant-ready:' + process.pid + '\\n');
+  server.listen(0, host, () => {
+    process.stdout.write('descendant-ready:' + process.pid + ':' + server.address().port + '\\n');
   });
 } else {
   const descendant = spawn(process.execPath, [__filename], {
@@ -52,10 +51,11 @@ if (process.env.HARPER_FAKE_DESCENDANT === '1') {
   let descendantOutput = '';
   descendant.stdout.on('data', (chunk) => {
     descendantOutput += chunk;
-    if (!descendantOutput.includes('descendant-ready:')) return;
+    const descendantMatch = descendantOutput.match(/descendant-ready:(\\d+):(\\d+)/);
+    if (!descendantMatch) return;
     const server = createServer();
-    server.listen(Number(process.env.HARPER_PORT), host, () => {
-      process.stdout.write('tree-ready:' + process.pid + ':' + descendant.pid + '\\n');
+    server.listen(0, host, () => {
+      process.stdout.write('tree-ready:' + process.pid + ':' + descendant.pid + ':' + server.address().port + ':' + descendantMatch[2] + '\\n');
       process.stdout.write('successfully started\\n');
     });
     const delay = Number(process.env.HARPER_TERM_DELAY_MS || 0);
@@ -68,8 +68,6 @@ const { runHarperCommand, killHarper } = await import(process.env.HARPER_LIFECYC
 const result = await runHarperCommand({
   args: [],
   env: {
-    HARPER_PORT: process.env.HARPER_PORT,
-    HARPER_DESCENDANT_PORT: process.env.HARPER_DESCENDANT_PORT,
     HARPER_TERM_DELAY_MS: process.env.HARPER_TERM_DELAY_MS,
   },
   completionMessage: 'successfully started',
@@ -77,9 +75,9 @@ const result = await runHarperCommand({
   timeoutMs: 5000,
   maxMs: 10000,
 });
-const match = result.stdout.match(/tree-ready:(\\d+):(\\d+)/);
+const match = result.stdout.match(/tree-ready:(\\d+):(\\d+):(\\d+):(\\d+)/);
 if (!match) throw new Error('Missing fake Harper process markers: ' + result.stdout);
-process.stdout.write('runner-ready:' + result.process.pid + ':' + result.harperPid + ':' + match[1] + ':' + match[2] + '\\n');
+process.stdout.write('runner-ready:' + result.process.pid + ':' + result.harperPid + ':' + match[1] + ':' + match[2] + ':' + match[3] + ':' + match[4] + '\\n');
 if (process.env.HARPER_RUNNER_MODE === 'teardown') {
   await killHarper({ harper: { process: result.process } }, { graceMs: 2000 });
   let harperGone = false;
@@ -154,21 +152,6 @@ async function waitProcessGone(pid: number, timeoutMs: number): Promise<boolean>
 	}
 }
 
-async function getFreePorts(count: number): Promise<number[]> {
-	const servers = await Promise.all(
-		Array.from({ length: count }, () =>
-			new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
-				const server = createServer();
-				server.once('error', reject);
-				server.listen(0, '127.0.0.1', () => resolve(server));
-			})
-		)
-	);
-	const ports = servers.map((server) => (server.address() as AddressInfo).port);
-	await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-	return ports;
-}
-
 interface RunningFakeHarperTree {
 	runner: ChildProcess;
 	supervisorPid: number;
@@ -178,14 +161,11 @@ interface RunningFakeHarperTree {
 }
 
 async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarperTree> {
-	const ports = await getFreePorts(2);
 	const runner = spawn(process.execPath, [fixtures['orphan-runner.mjs']], {
 		env: {
 			...process.env,
 			HARPER_LIFECYCLE_URL: new URL('../src/harperLifecycle.ts', import.meta.url).href,
 			HARPER_FAKE_SCRIPT: fixtures['process-tree.cjs'],
-			HARPER_PORT: String(ports[0]),
-			HARPER_DESCENDANT_PORT: String(ports[1]),
 			HARPER_TERM_DELAY_MS: mode === 'teardown' ? '300' : '0',
 			HARPER_RUNNER_MODE: mode,
 		},
@@ -193,7 +173,7 @@ async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarper
 	});
 	let match: RegExpMatchArray;
 	try {
-		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+):(\d+)/);
+		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+):(\d+):(\d+):(\d+)/);
 	} catch (error) {
 		forceKill(runner.pid);
 		throw error;
@@ -204,7 +184,7 @@ async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarper
 		supervisorPid: Number(match[1]),
 		harperPid: Number(match[3]),
 		descendantPid: Number(match[4]),
-		ports,
+		ports: [Number(match[5]), Number(match[6])],
 	};
 }
 
