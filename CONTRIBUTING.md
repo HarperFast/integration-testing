@@ -6,7 +6,7 @@ Contributors are encouraged to communicate with maintainers in issues or other c
 
 Source files are located in `src/`. These are built to the `dist/` directory. The published package includes `dist/`, `scripts/`, and the regular npm metadata and documentation files.
 
-The `src/index.ts` is the source for the main export. This is the public re-export of all the various utilities from `src/harperLifecycle.ts`, `targz.ts`, and more. The `src/run.ts` is the source for the `harper-integration-test-run` bin script. And the `scripts/setup-loopback.sh` is the source for the `harper-integration-test-setup-loopback` bin script.
+The `src/index.ts` is the source for the main export. This is the public re-export of all the various utilities from `src/harperLifecycle.ts`, `targz.ts`, and more. The `src/run.ts` is the source for the `harper-integration-test-run` bin script. The internal `src/harperSupervisor.ts` process owns the detached Harper group and watches a runner-liveness pipe so hard runner death cannot orphan Harper. And the `scripts/setup-loopback.sh` is the source for the `harper-integration-test-setup-loopback` bin script.
 
 The package is `"type": "module"` — all source files are ESM by default.
 

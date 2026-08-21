@@ -88,6 +88,8 @@ The lifecycle and utility APIs below are framework-agnostic. They manage Harper 
 
 Allocates a loopback address from the pool, creates a temporary install directory, starts a Harper process, and waits for it to be ready. Populates `ctx.harper` with the instance details. Call in a setup/`before()` hook.
 
+The harness starts Harper behind a small lifecycle supervisor. A private pipe lets the supervisor detect runner death even when JavaScript cleanup cannot run (for example `SIGKILL` or a hard crash), then terminate Harper's detached process tree so it cannot remain orphaned holding ports. `ctx.harper.process` is the supervisor-backed lifecycle handle used by `killHarper`; use `ctx.harper.harperPid` when the Harper runtime's own PID is specifically needed.
+
 The Harper binary is resolved in the following order:
 
 1. `harperBinPath` option passed directly to `startHarper()`
@@ -165,7 +167,8 @@ interface HarperContext {
   httpURL: string;              // e.g. 'http://127.0.0.2:9926'
   operationsAPIURL: string;     // e.g. 'http://127.0.0.2:9925'
   hostname: string;             // e.g. '127.0.0.2'
-  process: ChildProcess;
+  process: ChildProcess;        // supervisor-backed lifecycle handle; pass to lifecycle APIs
+  harperPid?: number;           // PID of the managed Harper runtime
   logDir?: string;              // set when HARPER_INTEGRATION_TEST_LOG_DIR is configured
   startupOutput?: { stdout: string; stderr: string }; // captured startup output
 }

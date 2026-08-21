@@ -5,6 +5,8 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createServer, type AddressInfo } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
 	killHarper,
@@ -18,6 +20,7 @@ import {
 	buildHarperChildEnv,
 	type StartedHarperTestContext,
 } from '../src/harperLifecycle.ts';
+import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
 // runHarperCommand's startup watchdog through specific timing scenarios without a real Harper.
@@ -33,7 +36,61 @@ const FIXTURE_SOURCES: Record<string, string> = {
 	'idle-reset.cjs': "let n = 0;\nconst t = setInterval(() => {\n  n++;\n  process.stdout.write('progress ' + n + '\\n');\n  if (n >= 8) { clearInterval(t); process.stdout.write('successfully started\\n'); }\n}, 100);\nsetInterval(() => {}, 1000);\n",
 	// Exits non-zero.
 	'exit-nonzero.cjs': "process.stderr.write('boom\\n');\nprocess.exit(1);\n",
+	'process-tree.cjs': `
+const { spawn } = require('node:child_process');
+const { createServer } = require('node:net');
+const host = '127.0.0.1';
+if (process.env.HARPER_FAKE_DESCENDANT === '1') {
+  const server = createServer();
+  server.listen(Number(process.env.HARPER_DESCENDANT_PORT), host, () => {
+    process.stdout.write('descendant-ready:' + process.pid + '\\n');
+  });
+} else {
+  const descendant = spawn(process.execPath, [__filename], {
+    env: { ...process.env, HARPER_FAKE_DESCENDANT: '1' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  let descendantOutput = '';
+  descendant.stdout.on('data', (chunk) => {
+    descendantOutput += chunk;
+    if (!descendantOutput.includes('descendant-ready:')) return;
+    const server = createServer();
+    server.listen(Number(process.env.HARPER_PORT), host, () => {
+      process.stdout.write('tree-ready:' + process.pid + ':' + descendant.pid + '\\n');
+      process.stdout.write('successfully started\\n');
+    });
+    const delay = Number(process.env.HARPER_TERM_DELAY_MS || 0);
+    if (delay > 0) process.on('SIGTERM', () => setTimeout(() => server.close(() => process.exit(0)), delay));
+  });
+}
+`,
+	'orphan-runner.mjs': `
+const { runHarperCommand, killHarper } = await import(process.env.HARPER_LIFECYCLE_URL);
+const result = await runHarperCommand({
+  args: [],
+  env: {
+    HARPER_PORT: process.env.HARPER_PORT,
+    HARPER_DESCENDANT_PORT: process.env.HARPER_DESCENDANT_PORT,
+    HARPER_TERM_DELAY_MS: process.env.HARPER_TERM_DELAY_MS,
+  },
+  completionMessage: 'successfully started',
+  harperBinPath: process.env.HARPER_FAKE_SCRIPT,
+  timeoutMs: 5000,
+  maxMs: 10000,
+});
+const match = result.stdout.match(/tree-ready:(\\d+):(\\d+)/);
+if (!match) throw new Error('Missing fake Harper process markers: ' + result.stdout);
+process.stdout.write('runner-ready:' + result.process.pid + ':' + match[1] + ':' + match[2] + '\\n');
+if (process.env.HARPER_RUNNER_MODE === 'teardown') {
+  await killHarper({ harper: { process: result.process } }, { graceMs: 2000 });
+  process.stdout.write('teardown-complete\\n');
+} else {
+  setInterval(() => {}, 1000);
+}
+`,
 };
+
+const isPosix = process.platform !== 'win32';
 
 let fixtureDir: string;
 const fixtures: Record<string, string> = {};
@@ -67,13 +124,17 @@ function waitForOutput(child: ChildProcess, needle: string): Promise<void> {
 }
 
 /** Resolves with the regex match once it appears on the child's stdout. */
-function waitForMatch(child: ChildProcess, regex: RegExp): Promise<RegExpMatchArray> {
-	return new Promise((resolve) => {
+function waitForMatch(child: ChildProcess, regex: RegExp, timeoutMs = 5000): Promise<RegExpMatchArray> {
+	return new Promise((resolve, reject) => {
 		let buffer = '';
+		const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${regex}; output: ${buffer}`)), timeoutMs);
 		child.stdout?.on('data', (chunk: Buffer) => {
 			buffer += chunk.toString();
 			const matched = buffer.match(regex);
-			if (matched) resolve(matched);
+			if (matched) {
+				clearTimeout(timeout);
+				resolve(matched);
+			}
 		});
 	});
 }
@@ -90,6 +151,76 @@ async function waitProcessGone(pid: number, timeoutMs: number): Promise<boolean>
 		if (Date.now() >= deadline) return false;
 		await sleep(50);
 	}
+}
+
+async function getFreePorts(count: number): Promise<number[]> {
+	const servers = await Promise.all(
+		Array.from({ length: count }, () =>
+			new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
+				const server = createServer();
+				server.once('error', reject);
+				server.listen(0, '127.0.0.1', () => resolve(server));
+			})
+		)
+	);
+	const ports = servers.map((server) => (server.address() as AddressInfo).port);
+	await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+	return ports;
+}
+
+interface RunningFakeHarperTree {
+	runner: ChildProcess;
+	supervisorPid: number;
+	harperPid: number;
+	descendantPid: number;
+	ports: number[];
+}
+
+async function startFakeHarperTree(mode?: 'teardown'): Promise<RunningFakeHarperTree> {
+	const ports = await getFreePorts(2);
+	const runner = spawn(process.execPath, [fixtures['orphan-runner.mjs']], {
+		env: {
+			...process.env,
+			HARPER_LIFECYCLE_URL: pathToFileURL(join(process.cwd(), 'src/harperLifecycle.ts')).href,
+			HARPER_FAKE_SCRIPT: fixtures['process-tree.cjs'],
+			HARPER_PORT: String(ports[0]),
+			HARPER_DESCENDANT_PORT: String(ports[1]),
+			HARPER_TERM_DELAY_MS: mode === 'teardown' ? '300' : '0',
+			HARPER_RUNNER_MODE: mode,
+		},
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	let match: RegExpMatchArray;
+	try {
+		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+)/);
+	} catch (error) {
+		forceKill(runner.pid);
+		throw error;
+	}
+	return {
+		runner,
+		supervisorPid: Number(match[1]),
+		harperPid: Number(match[2]),
+		descendantPid: Number(match[3]),
+		ports,
+	};
+}
+
+function forceKill(pid: number | undefined): void {
+	if (pid === undefined) return;
+	try {
+		process.kill(pid, 'SIGKILL');
+	} catch {
+		// The process already exited.
+	}
+}
+
+async function cleanupFakeHarperTree(tree: Partial<RunningFakeHarperTree>): Promise<void> {
+	forceKill(tree.runner?.pid);
+	forceKill(tree.supervisorPid);
+	forceKill(tree.harperPid);
+	forceKill(tree.descendantPid);
+	if (tree.ports) await waitForPortsFree('127.0.0.1', tree.ports, 2000, 50);
 }
 
 // --- Startup watchdog (Race 1) ---
@@ -152,13 +283,71 @@ test('runHarperCommand keeps a slow-but-progressing boot alive past the idle win
 		env: {},
 		completionMessage: 'successfully started',
 		harperBinPath: fixtures['idle-reset.cjs'],
-		timeoutMs: 400,
+		timeoutMs: 700,
 		maxMs: 10000,
 	});
 	try {
 		match(result.stdout, /successfully started/);
 	} finally {
 		result.process.kill('SIGKILL');
+	}
+});
+
+test('runner SIGKILL reaps the supervised Harper tree and releases its ports', async () => {
+	const tree = await startFakeHarperTree();
+	try {
+		strictEqual(await isPortFree('127.0.0.1', tree.ports[0]), false);
+		strictEqual(await isPortFree('127.0.0.1', tree.ports[1]), false);
+		tree.runner.kill('SIGKILL');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.harperPid, 5000), `Harper ${tree.harperPid} should die with its runner`);
+		ok(await waitProcessGone(tree.descendantPid, 5000), `descendant ${tree.descendantPid} should die with its runner`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('runner SIGHUP reaps the supervised Harper tree and releases its ports', { skip: !isPosix }, async () => {
+	const tree = await startFakeHarperTree();
+	try {
+		tree.runner.kill('SIGHUP');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.harperPid, 5000), `Harper ${tree.harperPid} should die on runner SIGHUP`);
+		ok(await waitProcessGone(tree.descendantPid, 5000), `descendant ${tree.descendantPid} should die on runner SIGHUP`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('unexpected supervisor death falls back to reaping the Harper tree', async () => {
+	const tree = await startFakeHarperTree();
+	try {
+		forceKill(tree.supervisorPid);
+		ok(await waitProcessGone(tree.harperPid, 5000), `Harper ${tree.harperPid} should die with its supervisor`);
+		ok(await waitProcessGone(tree.descendantPid, 5000), `descendant ${tree.descendantPid} should die with its supervisor`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('killHarper waits for supervised Harper shutdown and does not keep the runner alive', { skip: !isPosix }, async () => {
+	const startedAt = Date.now();
+	const tree = await startFakeHarperTree('teardown');
+	try {
+		await waitForMatch(tree.runner, /teardown-complete/);
+		await Promise.race([
+			once(tree.runner, 'exit'),
+			sleep(3000).then(() => {
+				throw new Error('Runner stayed alive after supervised teardown');
+			}),
+		]);
+		ok(Date.now() - startedAt >= 250, 'killHarper should wait for Harper to finish its delayed SIGTERM handler');
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 2000, 50), 'ports should be free when killHarper resolves');
+	} finally {
+		await cleanupFakeHarperTree(tree);
 	}
 });
 
@@ -186,8 +375,6 @@ test('runHarperCommand rejects when the process exits non-zero', async () => {
 // leader), so killHarper's group signal (negative PID) targets the whole tree. Windows has no
 // process groups — killHarper uses `taskkill /T` there — and no real POSIX signals, so the
 // signal-specific assertions below are guarded to POSIX.
-const isPosix = process.platform !== 'win32';
-
 test('killHarper terminates a process that exits on SIGTERM, before the grace deadline', async () => {
 	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: isPosix });
 	await once(child, 'spawn');
