@@ -88,7 +88,7 @@ The lifecycle and utility APIs below are framework-agnostic. They manage Harper 
 
 Allocates a loopback address from the pool, creates a temporary install directory, starts a Harper process, and waits for it to be ready. Populates `ctx.harper` with the instance details. Call in a setup/`before()` hook.
 
-The harness starts Harper behind a small lifecycle supervisor. A private pipe lets the supervisor detect runner death even when JavaScript cleanup cannot run (for example `SIGKILL` or a hard crash), then terminate Harper's detached process tree so it cannot remain orphaned holding ports. `ctx.harper.process` is the supervisor-backed lifecycle handle used by `killHarper`; use `ctx.harper.harperPid` when the Harper runtime's own PID is specifically needed.
+Harper runs as its own detached process group, so a runner that dies without running cleanup would otherwise leave it alive holding the fixed ports. On POSIX the instance is registered with a shared [instance monitor](#orphaned-instance-monitor-posix) that reaps it in that case.
 
 The Harper binary is resolved in the following order:
 
@@ -100,7 +100,7 @@ The Harper binary is resolved in the following order:
 
 ```ts
 interface StartHarperOptions {
-  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks, including supervisor launch before the first chunk. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
+  startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
   startupMaxMs?: number;       // Absolute startup ceiling regardless of output. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
   config?: object;             // Harper config overrides (passed via HARPER_SET_CONFIG)
   env?: object;                // Additional environment variables for the Harper process
@@ -125,7 +125,7 @@ Like `startHarper()`, but copies a component directory into the Harper install b
 
 ### `killHarper(ctx, options?)`
 
-Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. The lifecycle supervisor is the detached POSIX process-group leader, with Harper and its children in that group; on Windows the harness uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
 
 `options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
@@ -167,8 +167,7 @@ interface HarperContext {
   httpURL: string;              // e.g. 'http://127.0.0.2:9926'
   operationsAPIURL: string;     // e.g. 'http://127.0.0.2:9925'
   hostname: string;             // e.g. '127.0.0.2'
-  process: ChildProcess;        // supervisor-backed lifecycle handle; pass to lifecycle APIs
-  harperPid?: number;           // PID of the managed Harper runtime
+  process: ChildProcess;
   logDir?: string;              // set when HARPER_INTEGRATION_TEST_LOG_DIR is configured
   startupOutput?: { stdout: string; stderr: string }; // captured startup output
 }
@@ -206,6 +205,35 @@ suite('my suite', (ctx: ContextWithHarper) => {
 ```
 
 If you are not using `node:test`, use `createHarperContext()` to create a plain `HarperTestContext` instead.
+
+### Orphaned Instance Monitor (POSIX)
+
+A test runner that dies without running its teardown — `SIGKILL`, a hard crash, a cancelled CI job — cannot reap the Harper instances it started, because those are deliberately detached into their own process groups so that whole-tree teardown works. Left alone, they hold their loopback address's fixed ports until the machine is rebooted.
+
+To close that gap, `startHarper()` registers each instance in a small on-disk registry and makes sure a single shared **monitor** process is running. The monitor is not a per-instance sidecar: one is started on demand per registry directory (per machine, by default), every concurrent runner reuses it, and it exits once the registry has been empty for a while. It scans the registry on an interval and terminates — `SIGTERM`, then `SIGKILL` after a grace period — the process group of any instance whose owning runner is gone, or which has outlived its lifetime budget. Instances are matched by PID *and* process start time, so a recycled PID is never mistaken for a live one.
+
+The runner's own `exit`/`SIGINT`/`SIGTERM`/`SIGHUP` handlers still reap instances immediately on any exit it can observe; the monitor only handles the deaths it cannot.
+
+Registry directory layout (`${TMPDIR}/harper-integration-test-monitor` by default):
+
+| File | Contents |
+| --- | --- |
+| `registry.json` | The current monitor and every registered instance (PID, start time, owning runner, loopback address, deadline) |
+| `registry.lock` | Cross-process mutex guarding `registry.json` |
+| `monitor.log` | Append-only record of monitor start/exit and every reap, with the reason |
+
+Each managed Harper process also carries `HARPER_IT_KIND=harper-instance`, `HARPER_IT_INSTANCE_ID`, and `HARPER_IT_OWNER_PID` in its environment, and the monitor's command line contains `--harper-integration-test-monitor`, so both are identifiable from `ps` / `/proc` without consulting the registry.
+
+This is POSIX-only: reaping relies on process groups, which Windows does not have. On Windows, registration is skipped and the runner-side cleanup handlers are the only protection.
+
+**Environment Variables:**
+
+- `HARPER_INTEGRATION_TEST_MONITOR` - Set to `off` to disable registration and the monitor entirely. Default on (POSIX only).
+- `HARPER_INTEGRATION_TEST_MONITOR_DIR` - Registry directory. Default `${TMPDIR}/harper-integration-test-monitor`. Point separate runs at separate directories to give them separate monitors.
+- `HARPER_INTEGRATION_TEST_MONITOR_INTERVAL_MS` - How often the monitor rescans the registry. Default `2000`.
+- `HARPER_INTEGRATION_TEST_MONITOR_REAP_GRACE_MS` - Grace period between the monitor's SIGTERM and SIGKILL. Default `5000`.
+- `HARPER_INTEGRATION_TEST_MONITOR_IDLE_MS` - How long the registry must stay empty before the monitor shuts down. Default `60000`.
+- `HARPER_INTEGRATION_TEST_INSTANCE_MAX_LIFETIME_MS` - Backstop lifetime after which an instance is reaped even if its runner still looks alive. Default `14400000` (4h).
 
 ### Server Log Capture
 
