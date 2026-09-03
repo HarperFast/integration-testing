@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { appendFile } from 'node:fs/promises';
+import { constants, existsSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
 	getMonitorIdleExitMs,
@@ -20,7 +20,7 @@ import {
 /**
  * The singleton Harper instance monitor.
  *
- * One of these runs per registry directory, shared by every concurrent test runner on the machine.
+ * One of these runs per registry directory, shared by every concurrent test runner using it.
  * It periodically scans the registry written by `harperLifecycle.ts` and reaps any instance whose
  * owning runner has died or which has outlived its budget, then shuts itself down once the
  * registry has been empty long enough. See `harperInstanceRegistry.ts` for the shared contract.
@@ -37,9 +37,18 @@ const escalationDeadlines = new Map<string, number>();
 let idleSince: number | undefined;
 let running = true;
 
+// O_NOFOLLOW so a symlink planted at the log path in a shared registry directory cannot redirect
+// these appends into a file the runner can write.
+const LOG_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0);
+
 async function log(message: string): Promise<void> {
 	try {
-		await appendFile(getMonitorLogPath(), `${new Date().toISOString()} [${process.pid}] ${message}\n`);
+		const logFileHandle = await open(getMonitorLogPath(), LOG_FLAGS, 0o600);
+		try {
+			await logFileHandle.writeFile(`${new Date().toISOString()} [${process.pid}] ${message}\n`);
+		} finally {
+			await logFileHandle.close();
+		}
 	} catch {
 		// The registry directory is gone; the next loop iteration notices and shuts us down.
 	}

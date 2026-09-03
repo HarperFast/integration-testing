@@ -211,7 +211,7 @@ async function acquireLock(): Promise<string> {
 			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 			try {
 				const lockFileStat = await stat(lockPath);
-				// A holder that died mid-section would otherwise wedge every runner on the machine.
+				// A holder that died mid-section would otherwise wedge every runner sharing this registry.
 				if (Date.now() - lockFileStat.mtimeMs > LOCK_STALE_TIMEOUT_MS) await unlink(lockPath);
 			} catch {
 				// Another process removed it first; just retry.
@@ -242,7 +242,7 @@ export async function withRegistryLock<T>(callback: () => Promise<T>): Promise<T
 
 /**
  * Reads the registry. Only call while holding the lock. An absent file reads as empty — the first
- * registration on this machine, or a registry directory someone cleared. `writeRegistryFile`
+ * registration by this user, or a registry directory someone cleared. `writeRegistryFile`
  * publishes by rename, so a half-written file is never observable here.
  */
 export async function readRegistryFile(): Promise<InstanceRegistry> {
@@ -280,14 +280,14 @@ let pendingWriteCounter = 0;
  * Publishes by rename so readers see either the old registry or the new one. An in-place write
  * truncates first, and a writer killed in that window — the `SIGKILL` this whole mechanism exists
  * to survive — leaves torn JSON, which used to read as an empty registry and take every reap
- * target on the machine with it. The pending name is unique per write because a fixed one could be
- * truncated by a writer that reclaimed the lock as stale, reintroducing that same tearing; one
- * left behind by a killed writer is inert.
+ * target on the machine with it. The pending name is unpredictable and unique per write: a fixed
+ * one could be truncated by a writer that reclaimed the lock as stale, and one reused after PID
+ * reuse would collide with a leftover file and fail the registration outright.
  */
 export async function writeRegistryFile(registry: InstanceRegistry): Promise<void> {
 	await mkdir(getRegistryDir(), { recursive: true, mode: 0o700 });
 	const registryPath = getRegistryPath();
-	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.pending`;
+	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.${Math.random().toString(36).slice(2)}.pending`;
 	try {
 		// `wx` (O_CREAT|O_EXCL) refuses to follow a symlink planted at the pending name, so a shared
 		// registry directory cannot be turned into an arbitrary-write primitive.

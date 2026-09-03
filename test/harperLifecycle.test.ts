@@ -155,10 +155,13 @@ function fakeCtx(process?: ChildProcess): StartedHarperTestContext {
 function waitForOutput(child: ChildProcess, needle: string): Promise<void> {
 	return new Promise((resolve) => {
 		let buffer = '';
-		child.stdout?.on('data', (chunk: Buffer) => {
+		const onData = (chunk: Buffer) => {
 			buffer += chunk.toString();
-			if (buffer.includes(needle)) resolve();
-		});
+			if (!buffer.includes(needle)) return;
+			child.stdout?.off('data', onData);
+			resolve();
+		};
+		child.stdout?.on('data', onData);
 	});
 }
 
@@ -166,15 +169,19 @@ function waitForOutput(child: ChildProcess, needle: string): Promise<void> {
 function waitForMatch(child: ChildProcess, regex: RegExp, timeoutMs = 5000): Promise<RegExpMatchArray> {
 	return new Promise((resolve, reject) => {
 		let buffer = '';
-		const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${regex}; output: ${buffer}`)), timeoutMs);
-		child.stdout?.on('data', (chunk: Buffer) => {
+		const onData = (chunk: Buffer) => {
 			buffer += chunk.toString();
 			const matched = buffer.match(regex);
-			if (matched) {
-				clearTimeout(timeout);
-				resolve(matched);
-			}
-		});
+			if (!matched) return;
+			clearTimeout(timeout);
+			child.stdout?.off('data', onData);
+			resolve(matched);
+		};
+		const timeout = setTimeout(() => {
+			child.stdout?.off('data', onData);
+			reject(new Error(`Timed out waiting for ${regex}; output: ${buffer}`));
+		}, timeoutMs);
+		child.stdout?.on('data', onData);
 	});
 }
 
