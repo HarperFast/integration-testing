@@ -728,6 +728,10 @@ interface TrackedHarperProcess {
  * These parent-side hooks cover every exit the runner can still run JavaScript for. Death it
  * cannot observe — `SIGKILL`, a hard crash, a cancelled CI job — is covered by the shared instance
  * monitor, which reaps whatever the registry says is orphaned. See `harperInstanceRegistry.ts`.
+ *
+ * On POSIX the group `SIGKILL` is delivered synchronously, so it works even from the 'exit'
+ * handler. On Windows the `taskkill` shell-out may not complete before the runner exits, and there
+ * is no monitor to fall back on.
  */
 const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;

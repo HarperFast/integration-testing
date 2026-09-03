@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
  * test runner dying without running cleanup — `SIGKILL`, a hard crash, a cancelled CI job — leaves
  * Harper alive holding its fixed ports. Instead of pairing every instance with its own sidecar,
  * each instance publishes explicit metadata here and a single shared monitor (one per registry
- * directory, i.e. per machine by default) reaps whatever is orphaned or overdue.
+ * directory, i.e. per user on the machine by default) reaps whatever is orphaned or overdue.
  *
  * The registry is the contract between the two halves: `harperLifecycle.ts` registers and
  * deregisters instances, `harperMonitor.ts` scans and reaps them. Both agree on tunables through
@@ -149,6 +149,7 @@ export function readProcessStartTimes(pids: number[]): Map<number, string> {
 	const result = spawnSync('ps', ['-o', 'pid=,lstart=', '-p', uniquePids.join(',')], {
 		encoding: 'utf8',
 		timeout: PS_TIMEOUT_MS,
+		killSignal: 'SIGKILL',
 	});
 	// A non-zero status just means none of the PIDs exist; only a missing `ps` is worth noticing,
 	// and there the empty map degrades callers to a plain PID check rather than reporting deaths.
@@ -200,8 +201,11 @@ async function acquireLock(): Promise<string> {
 	while (true) {
 		try {
 			const lockFileHandle = await open(lockPath, 'wx');
-			await lockFileHandle.writeFile(token);
-			await lockFileHandle.close();
+			try {
+				await lockFileHandle.writeFile(token);
+			} finally {
+				await lockFileHandle.close();
+			}
 			return token;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -285,7 +289,14 @@ export async function writeRegistryFile(registry: InstanceRegistry): Promise<voi
 	const registryPath = getRegistryPath();
 	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.pending`;
 	try {
-		await writeFile(pendingPath, JSON.stringify(registry));
+		// `wx` (O_CREAT|O_EXCL) refuses to follow a symlink planted at the pending name, so a shared
+		// registry directory cannot be turned into an arbitrary-write primitive.
+		const pendingFileHandle = await open(pendingPath, 'wx');
+		try {
+			await pendingFileHandle.writeFile(JSON.stringify(registry));
+		} finally {
+			await pendingFileHandle.close();
+		}
 		await rename(pendingPath, registryPath);
 	} catch (error) {
 		await unlink(pendingPath).catch(() => {});
