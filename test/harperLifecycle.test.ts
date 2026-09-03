@@ -1,11 +1,13 @@
 import { test, before, after } from 'node:test';
-import { ok, strictEqual, match, rejects } from 'node:assert';
+import { ok, strictEqual, match, doesNotMatch, rejects } from 'node:assert';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { readFile, writeFile as writeFileAsync } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import {
 	killHarper,
 	teardownHarper,
@@ -18,12 +20,22 @@ import {
 	buildHarperChildEnv,
 	type StartedHarperTestContext,
 } from '../src/harperLifecycle.ts';
+import {
+	MONITOR_ARGV_MARKER,
+	readRegistryFile,
+	withRegistryLock,
+	type InstanceRegistry,
+} from '../src/harperInstanceRegistry.ts';
+import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
 // runHarperCommand's startup watchdog through specific timing scenarios without a real Harper.
 const FIXTURE_SOURCES: Record<string, string> = {
 	// Reports ready, then stays alive like a server.
 	'ready.cjs': "process.stdout.write('booting\\n');\nsetTimeout(() => process.stdout.write('successfully started\\n'), 50);\nsetInterval(() => {}, 1000);\n",
+	// Reports ready, then logs once more and goes quiet — what a real Harper does after startup,
+	// and what re-arms a startup watchdog that keys on resolution instead of readiness.
+	'ready-then-log.cjs': "process.stdout.write('booting\\n');\nsetTimeout(() => process.stdout.write('successfully started\\n'), 50);\nsetTimeout(() => process.stdout.write('post-readiness log line\\n'), 150);\nsetInterval(() => {}, 1000);\n",
 	// Emits one line, then goes silent forever (hung during startup).
 	'idle-hang.cjs': "process.stdout.write('booting\\n');\nsetInterval(() => {}, 1000);\n",
 	// Emits output continuously but never reports ready.
@@ -33,7 +45,87 @@ const FIXTURE_SOURCES: Record<string, string> = {
 	'idle-reset.cjs': "let n = 0;\nconst t = setInterval(() => {\n  n++;\n  process.stdout.write('progress ' + n + '\\n');\n  if (n >= 8) { clearInterval(t); process.stdout.write('successfully started\\n'); }\n}, 100);\nsetInterval(() => {}, 1000);\n",
 	// Exits non-zero.
 	'exit-nonzero.cjs': "process.stderr.write('boom\\n');\nprocess.exit(1);\n",
+	'process-tree.cjs': `
+const { spawn } = require('node:child_process');
+const { createServer } = require('node:net');
+const host = '127.0.0.1';
+if (process.env.HARPER_FAKE_DESCENDANT === '1') {
+  const server = createServer();
+  server.listen(0, host, () => {
+    process.stdout.write('descendant-ready:' + process.pid + ':' + server.address().port + '\\n');
+  });
+} else {
+  const descendant = spawn(process.execPath, [__filename], {
+    env: { ...process.env, HARPER_FAKE_DESCENDANT: '1' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  let descendantOutput = '';
+  descendant.stdout.on('data', (chunk) => {
+    descendantOutput += chunk;
+    const descendantMatch = descendantOutput.match(/descendant-ready:(\\d+):(\\d+)/);
+    if (!descendantMatch) return;
+    const server = createServer();
+    server.listen(0, host, () => {
+      process.stdout.write('tree-ready:' + process.pid + ':' + descendant.pid + ':' + server.address().port + ':' + descendantMatch[2] + '\\n');
+      process.stdout.write('successfully started\\n');
+    });
+    const delay = Number(process.env.HARPER_TERM_DELAY_MS || 0);
+    if (delay > 0) process.on('SIGTERM', () => setTimeout(() => server.close(() => process.exit(0)), delay));
+  });
+}
+`,
+	// Rewrites the registry back to back so a reader — or the SIGKILL the test sends — is almost
+	// always looking at a write in flight. The padded shape makes each write big enough to span
+	// several of the reader's polls.
+	'registry-writer.mjs': `
+const { writeRegistryFile } = await import(process.env.HARPER_REGISTRY_URL);
+// Never a real process group: a bogus start time means any monitor that somehow read this private
+// registry would treat the record as gone rather than signalling the PID's group.
+const seeded = {
+  id: 'seeded',
+  pid: process.pid,
+  startTime: 'writer-fixture',
+  owner: { pid: process.pid, startTime: 'writer-fixture' },
+  registeredAt: 0,
+  expiresAt: 0,
 };
+const small = { instances: [seeded] };
+const padded = { instances: [seeded, { ...seeded, id: 'padding', hostname: 'x'.repeat(2_000_000) }] };
+await writeRegistryFile(small);
+process.stdout.write('writer-ready\\n');
+for (;;) {
+  await writeRegistryFile(padded);
+  await writeRegistryFile(small);
+}
+`,
+	'orphan-runner.mjs': `
+const { runHarperCommand, killHarper } = await import(process.env.HARPER_LIFECYCLE_URL);
+const result = await runHarperCommand({
+  args: [],
+  env: {
+    HARPER_TERM_DELAY_MS: process.env.HARPER_TERM_DELAY_MS,
+  },
+  completionMessage: 'successfully started',
+  harperBinPath: process.env.HARPER_FAKE_SCRIPT,
+  timeoutMs: 5000,
+  maxMs: 10000,
+  hostname: '127.0.0.1',
+});
+const match = result.stdout.match(/tree-ready:(\\d+):(\\d+):(\\d+):(\\d+)/);
+if (!match) throw new Error('Missing fake Harper process markers: ' + result.stdout);
+process.stdout.write('runner-ready:' + result.process.pid + ':' + match[1] + ':' + match[2] + ':' + match[3] + ':' + match[4] + '\\n');
+if (process.env.HARPER_RUNNER_MODE === 'teardown') {
+  await killHarper({ harper: { process: result.process } }, { graceMs: 2000 });
+  let harperGone = false;
+  try { process.kill(result.process.pid, 0); } catch { harperGone = true; }
+  process.stdout.write('teardown-complete:' + harperGone + '\\n');
+} else {
+  setInterval(() => {}, 1000);
+}
+`,
+};
+
+const isPosix = process.platform !== 'win32';
 
 let fixtureDir: string;
 const fixtures: Record<string, string> = {};
@@ -45,6 +137,10 @@ before(() => {
 		writeFileSync(path, src);
 		fixtures[name] = path;
 	}
+	// This process starts fake Harper instances directly in several tests; keep them out of the
+	// shared registry so they can never outlive the run or perturb the monitor tests below, each of
+	// which opts back in against its own private registry directory.
+	process.env.HARPER_INTEGRATION_TEST_MONITOR = 'off';
 });
 
 after(() => {
@@ -59,22 +155,33 @@ function fakeCtx(process?: ChildProcess): StartedHarperTestContext {
 function waitForOutput(child: ChildProcess, needle: string): Promise<void> {
 	return new Promise((resolve) => {
 		let buffer = '';
-		child.stdout?.on('data', (chunk: Buffer) => {
+		const onData = (chunk: Buffer) => {
 			buffer += chunk.toString();
-			if (buffer.includes(needle)) resolve();
-		});
+			if (!buffer.includes(needle)) return;
+			child.stdout?.off('data', onData);
+			resolve();
+		};
+		child.stdout?.on('data', onData);
 	});
 }
 
 /** Resolves with the regex match once it appears on the child's stdout. */
-function waitForMatch(child: ChildProcess, regex: RegExp): Promise<RegExpMatchArray> {
-	return new Promise((resolve) => {
+function waitForMatch(child: ChildProcess, regex: RegExp, timeoutMs = 5000): Promise<RegExpMatchArray> {
+	return new Promise((resolve, reject) => {
 		let buffer = '';
-		child.stdout?.on('data', (chunk: Buffer) => {
+		const onData = (chunk: Buffer) => {
 			buffer += chunk.toString();
 			const matched = buffer.match(regex);
-			if (matched) resolve(matched);
-		});
+			if (!matched) return;
+			clearTimeout(timeout);
+			child.stdout?.off('data', onData);
+			resolve(matched);
+		};
+		const timeout = setTimeout(() => {
+			child.stdout?.off('data', onData);
+			reject(new Error(`Timed out waiting for ${regex}; output: ${buffer}`));
+		}, timeoutMs);
+		child.stdout?.on('data', onData);
 	});
 }
 
@@ -90,6 +197,125 @@ async function waitProcessGone(pid: number, timeoutMs: number): Promise<boolean>
 		if (Date.now() >= deadline) return false;
 		await sleep(50);
 	}
+}
+
+const MONITOR_SCRIPT = fileURLToPath(new URL('../src/harperMonitor.ts', import.meta.url));
+
+interface RunningFakeHarperTree {
+	runner: ChildProcess;
+	harperPid: number;
+	descendantPid: number;
+	ports: number[];
+	/** Private registry directory this runner's monitor owns. */
+	monitorDir: string;
+	/** True when this tree created `monitorDir` and is therefore responsible for removing it. */
+	ownsMonitorDir: boolean;
+}
+
+interface FakeHarperTreeOptions {
+	mode?: 'teardown';
+	/** Share an existing registry directory (and therefore an existing monitor) with another tree. */
+	monitorDir?: string;
+	/** `HARPER_INTEGRATION_TEST_MONITOR_IDLE_MS` for the monitor this runner may start. */
+	idleMs?: string;
+	/** `HARPER_INTEGRATION_TEST_INSTANCE_MAX_LIFETIME_MS` for this runner's instance. */
+	maxLifetimeMs?: string;
+}
+
+/** Restores an environment variable, removing it when it was previously unset — assigning `undefined` would set the string `"undefined"`. */
+function restoreEnv(name: string, value: string | undefined): void {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+}
+
+/** Reads a registry directly. Registry writes are atomic, so this only reads empty before the first one. */
+async function readMonitorRegistry(monitorDir: string): Promise<InstanceRegistry> {
+	try {
+		return JSON.parse(await readFile(join(monitorDir, 'registry.json'), 'utf-8')) as InstanceRegistry;
+	} catch {
+		return { instances: [] };
+	}
+}
+
+/** Waits for a monitor to claim `monitorDir` and returns its PID. */
+async function waitForMonitor(monitorDir: string, timeoutMs = 10000): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const monitorPid = (await readMonitorRegistry(monitorDir)).monitor?.pid;
+		if (monitorPid !== undefined) return monitorPid;
+		if (Date.now() >= deadline) throw new Error(`No monitor claimed ${monitorDir} within ${timeoutMs}ms`);
+		await sleep(50);
+	}
+}
+
+/**
+ * Starts a separate runner process that launches a fake Harper tree (a process-group leader plus a
+ * descendant, each holding a TCP port) through `runHarperCommand`, so tests can kill the runner
+ * the way CI does and observe what happens to the tree.
+ */
+async function startFakeHarperTree(options: FakeHarperTreeOptions = {}): Promise<RunningFakeHarperTree> {
+	const monitorDir = options.monitorDir ?? mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const runner = spawn(process.execPath, [fixtures['orphan-runner.mjs']], {
+		env: {
+			...process.env,
+			HARPER_LIFECYCLE_URL: new URL('../src/harperLifecycle.ts', import.meta.url).href,
+			HARPER_FAKE_SCRIPT: fixtures['process-tree.cjs'],
+			HARPER_TERM_DELAY_MS: options.mode === 'teardown' ? '300' : '0',
+			HARPER_RUNNER_MODE: options.mode,
+			// Re-enable monitoring (this test process disables it) against a private registry, with
+			// timings compressed so an orphan is reaped in well under a test timeout.
+			HARPER_INTEGRATION_TEST_MONITOR: 'on',
+			HARPER_INTEGRATION_TEST_MONITOR_DIR: monitorDir,
+			HARPER_INTEGRATION_TEST_MONITOR_INTERVAL_MS: '200',
+			HARPER_INTEGRATION_TEST_MONITOR_REAP_GRACE_MS: '500',
+			HARPER_INTEGRATION_TEST_MONITOR_IDLE_MS: options.idleMs ?? '60000',
+			HARPER_INTEGRATION_TEST_INSTANCE_MAX_LIFETIME_MS: options.maxLifetimeMs ?? '',
+		},
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	const tree: RunningFakeHarperTree = {
+		runner,
+		harperPid: 0,
+		descendantPid: 0,
+		ports: [],
+		monitorDir,
+		ownsMonitorDir: options.monitorDir === undefined,
+	};
+	let match: RegExpMatchArray;
+	try {
+		match = await waitForMatch(runner, /runner-ready:(\d+):(\d+):(\d+):(\d+):(\d+)/);
+	} catch (error) {
+		await cleanupFakeHarperTree(tree);
+		throw error;
+	}
+	strictEqual(Number(match[1]), Number(match[2]), 'the lifecycle handle should be the Harper process itself');
+	tree.harperPid = Number(match[2]);
+	tree.descendantPid = Number(match[3]);
+	tree.ports = [Number(match[4]), Number(match[5])];
+	return tree;
+}
+
+function forceKill(pid: number | undefined): void {
+	if (pid === undefined) return;
+	try {
+		process.kill(pid, 'SIGKILL');
+	} catch {
+		// The process already exited.
+	}
+}
+
+async function cleanupFakeHarperTree(tree: Partial<RunningFakeHarperTree>): Promise<void> {
+	forceKill(tree.runner?.pid);
+	forceKill(tree.harperPid);
+	forceKill(tree.descendantPid);
+	if (tree.monitorDir) {
+		// Monitors outlive their runner by design, so tests must reap their own. Wait for the slot
+		// to be claimed first, otherwise a monitor still starting up survives the cleanup.
+		const monitorPid = await waitForMonitor(tree.monitorDir, 5000).catch(() => undefined);
+		forceKill(monitorPid);
+		if (tree.ownsMonitorDir) rmSync(tree.monitorDir, { recursive: true, force: true });
+	}
+	if (tree.ports?.length) await waitForPortsFree('127.0.0.1', tree.ports, 2000, 50);
 }
 
 // --- Startup watchdog (Race 1) ---
@@ -152,13 +378,247 @@ test('runHarperCommand keeps a slow-but-progressing boot alive past the idle win
 		env: {},
 		completionMessage: 'successfully started',
 		harperBinPath: fixtures['idle-reset.cjs'],
-		timeoutMs: 400,
+		// The idle window has to cover process launch before the fixture's first output.
+		timeoutMs: 700,
 		maxMs: 10000,
 	});
 	try {
 		match(result.stdout, /successfully started/);
 	} finally {
 		result.process.kill('SIGKILL');
+	}
+});
+
+// --- Orphan reaping via the shared instance monitor (POSIX only) ---
+
+test('runner SIGKILL leaves the monitor to reap the orphaned Harper tree and release its ports', { skip: !isPosix }, async () => {
+	const tree = await startFakeHarperTree();
+	try {
+		await waitForMonitor(tree.monitorDir);
+		strictEqual(await isPortFree('127.0.0.1', tree.ports[0]), false);
+		strictEqual(await isPortFree('127.0.0.1', tree.ports[1]), false);
+		// SIGKILL is precisely the death the runner's own cleanup handlers cannot observe, so
+		// everything below is the monitor's doing.
+		tree.runner.kill('SIGKILL');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.harperPid, 10000), `Harper ${tree.harperPid} should be reaped with its runner`);
+		ok(await waitProcessGone(tree.descendantPid, 10000), `descendant ${tree.descendantPid} should be reaped with its runner`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('runner SIGHUP reaps the Harper tree and releases its ports', { skip: !isPosix }, async () => {
+	const tree = await startFakeHarperTree();
+	try {
+		tree.runner.kill('SIGHUP');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.harperPid, 5000), `Harper ${tree.harperPid} should die on runner SIGHUP`);
+		ok(await waitProcessGone(tree.descendantPid, 5000), `descendant ${tree.descendantPid} should die on runner SIGHUP`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('concurrent runners share one monitor', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	let first: RunningFakeHarperTree | undefined;
+	let second: RunningFakeHarperTree | undefined;
+	try {
+		first = await startFakeHarperTree({ monitorDir });
+		const monitorPid = await waitForMonitor(monitorDir);
+		second = await startFakeHarperTree({ monitorDir });
+
+		const registry = await readMonitorRegistry(monitorDir);
+		strictEqual(registry.monitor?.pid, monitorPid, 'the second runner should reuse the running monitor');
+		strictEqual(registry.instances.length, 2, 'both instances should be registered with that one monitor');
+
+		// Two runners registering at the same instant can both decide a monitor is needed; the
+		// loser must stand down rather than become a second reaper.
+		const redundant = spawn(process.execPath, [MONITOR_SCRIPT, MONITOR_ARGV_MARKER], {
+			env: { ...process.env, HARPER_INTEGRATION_TEST_MONITOR_DIR: monitorDir },
+			stdio: 'ignore',
+		});
+		const exited = await Promise.race([
+			once(redundant, 'exit').then(([code]) => code as number | null),
+			sleep(5000).then(() => 'timeout' as const),
+		]);
+		forceKill(redundant.pid);
+		strictEqual(exited, 0, 'a redundant monitor should exit immediately');
+		strictEqual((await readMonitorRegistry(monitorDir)).monitor?.pid, monitorPid, 'it must not take over the registry');
+	} finally {
+		if (first) await cleanupFakeHarperTree(first);
+		if (second) await cleanupFakeHarperTree(second);
+		forceKill((await readMonitorRegistry(monitorDir)).monitor?.pid);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('an instance that outlives its lifetime budget is reaped while its runner is still alive', { skip: !isPosix }, async () => {
+	// Owner death is the sharp signal; this budget is the backstop for a runner PID recycled by
+	// some other long-lived process, which would otherwise look alive forever.
+	const tree = await startFakeHarperTree({ maxLifetimeMs: '250' });
+	try {
+		ok(await waitProcessGone(tree.harperPid, 10000), `overdue Harper ${tree.harperPid} should be reaped`);
+		strictEqual(tree.runner.exitCode, null, 'the owning runner should be untouched');
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('the monitor shuts down once no instances remain', { skip: !isPosix }, async () => {
+	const tree = await startFakeHarperTree({ idleMs: '500' });
+	try {
+		const monitorPid = await waitForMonitor(tree.monitorDir);
+		tree.runner.kill('SIGKILL');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.harperPid, 10000), `Harper ${tree.harperPid} should be reaped`);
+		ok(await waitProcessGone(monitorPid, 10000), `monitor ${monitorPid} should exit once the registry empties`);
+		strictEqual((await readMonitorRegistry(tree.monitorDir)).monitor, undefined, 'it should release its slot on the way out');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('a registry write survives the abrupt death of its writer', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const registryPath = join(monitorDir, 'registry.json');
+	const writer = spawn(process.execPath, [fixtures['registry-writer.mjs']], {
+		env: {
+			...process.env,
+			HARPER_REGISTRY_URL: new URL('../src/harperInstanceRegistry.ts', import.meta.url).href,
+			HARPER_INTEGRATION_TEST_MONITOR_DIR: monitorDir,
+		},
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	/** Parses the registry the way a monitor would, failing loudly instead of reading torn JSON as empty. */
+	async function readCompleteRegistry(context: string): Promise<InstanceRegistry> {
+		const raw = await readFile(registryPath, 'utf-8');
+		try {
+			return JSON.parse(raw) as InstanceRegistry;
+		} catch {
+			throw new Error(`Torn registry ${context}: ${raw.length} bytes, ending ${JSON.stringify(raw.slice(-40))}`);
+		}
+	}
+	try {
+		await waitForMatch(writer, /writer-ready/);
+		// Read while the writer rewrites the file back to back. A truncate-in-place write is visible
+		// here as an empty or half-written file, which `readRegistryFile` maps to an empty registry —
+		// after which the next writer persists that emptiness, dropping every runner's reap targets.
+		let reads = 0;
+		for (const deadline = Date.now() + 500; Date.now() < deadline; reads++) {
+			const observed = await readCompleteRegistry(`while the writer was running (read ${reads})`);
+			strictEqual(observed.instances[0]?.id, 'seeded', 'a visible registry must never lose its instances');
+		}
+		ok(reads > 20, `expected to catch many writes in flight, only managed ${reads} reads`);
+
+		// SIGKILL mid-write: whatever is on disk afterwards must still be one of the two complete
+		// shapes the writer alternates between, never a partial one.
+		writer.kill('SIGKILL');
+		await once(writer, 'exit');
+		const survivor = await readCompleteRegistry('after the writer was killed');
+		strictEqual(survivor.instances[0]?.id, 'seeded', 'a killed writer must leave the reap target behind');
+		ok(
+			survivor.instances.length === 1 || survivor.instances.length === 2,
+			`expected one of the writer's two complete shapes, got ${survivor.instances.length} instances`
+		);
+	} finally {
+		forceKill(writer.pid);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('a superseded lock holder does not release the lock that replaced it', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	try {
+		await withRegistryLock(async () => {
+			// What a critical section that overran the stale timeout comes back to: another process
+			// reclaimed the lock and is now inside the section itself.
+			await writeFileAsync(join(monitorDir, 'registry.lock'), 'another-holder');
+		});
+		strictEqual(
+			await readFile(join(monitorDir, 'registry.lock'), 'utf-8'),
+			'another-holder',
+			'releasing must not evict the holder that superseded us — that admits a third process alongside it'
+		);
+	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('an unreadable registry is reported rather than silently read as empty', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	try {
+		// An empty registry is the one answer that must never be invented: the caller writes it back,
+		// and every live instance on the machine loses the record that would have got it reaped.
+		await writeFileAsync(join(monitorDir, 'registry.json'), '{"instances":[{"id":"trunc');
+		await rejects(readRegistryFile(), /is not valid JSON/);
+		await writeFileAsync(join(monitorDir, 'registry.json'), '{"instances":null}');
+		await rejects(readRegistryFile(), /has no instance list/);
+	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('neither startup watchdog can time out a Harper that already reported ready', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	const previousEnabled = process.env.HARPER_INTEGRATION_TEST_MONITOR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR = 'on';
+	// Held for longer than maxMs but well inside the stale timeout, so registration blocks on a lock
+	// that is legitimately someone else's — what a machine full of concurrent runners looks like.
+	const lockPath = join(monitorDir, 'registry.lock');
+	await writeFileAsync(lockPath, 'other-runner');
+	let started: Awaited<ReturnType<typeof runHarperCommand>> | undefined;
+	try {
+		const starting = runHarperCommand({
+			args: [],
+			env: {},
+			completionMessage: 'successfully started',
+			// Both windows expire while registration is still blocked on the lock: the absolute one
+			// counting from launch, the idle one if the post-readiness log line re-arms it.
+			harperBinPath: fixtures['ready-then-log.cjs'],
+			timeoutMs: 2000,
+			maxMs: 2000,
+			hostname: '127.0.0.1',
+		});
+		await sleep(3000);
+		rmSync(lockPath, { force: true });
+		started = await starting;
+		match(started.stdout, /successfully started/);
+		doesNotMatch(started.stdout, /post-readiness log line/, 'startupOutput is a snapshot taken at readiness');
+	} finally {
+		if (started) started.process.kill('SIGKILL');
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR', previousEnabled);
+		forceKill(await waitForMonitor(monitorDir, 5000).catch(() => undefined));
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('killHarper waits for Harper shutdown and does not keep the runner alive', { skip: !isPosix }, async () => {
+	const tree = await startFakeHarperTree({ mode: 'teardown' });
+	try {
+		await waitForMatch(tree.runner, /teardown-complete:true/);
+		await Promise.race([
+			once(tree.runner, 'exit'),
+			sleep(3000).then(() => {
+				throw new Error('Runner stayed alive after supervised teardown');
+			}),
+		]);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 2000, 50), 'ports should be free when killHarper resolves');
+	} finally {
+		await cleanupFakeHarperTree(tree);
 	}
 });
 
@@ -186,8 +646,6 @@ test('runHarperCommand rejects when the process exits non-zero', async () => {
 // leader), so killHarper's group signal (negative PID) targets the whole tree. Windows has no
 // process groups — killHarper uses `taskkill /T` there — and no real POSIX signals, so the
 // signal-specific assertions below are guarded to POSIX.
-const isPosix = process.platform !== 'win32';
-
 test('killHarper terminates a process that exits on SIGTERM, before the grace deadline', async () => {
 	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: isPosix });
 	await once(child, 'spawn');

@@ -88,6 +88,8 @@ The lifecycle and utility APIs below are framework-agnostic. They manage Harper 
 
 Allocates a loopback address from the pool, creates a temporary install directory, starts a Harper process, and waits for it to be ready. Populates `ctx.harper` with the instance details. Call in a setup/`before()` hook.
 
+Harper runs as its own detached process group, so a runner that dies without running cleanup would otherwise leave it alive holding the fixed ports. On POSIX the instance is registered with a shared [instance monitor](#orphaned-instance-monitor-posix) that reaps it in that case.
+
 The Harper binary is resolved in the following order:
 
 1. `harperBinPath` option passed directly to `startHarper()`
@@ -203,6 +205,36 @@ suite('my suite', (ctx: ContextWithHarper) => {
 ```
 
 If you are not using `node:test`, use `createHarperContext()` to create a plain `HarperTestContext` instead.
+
+### Orphaned Instance Monitor (POSIX)
+
+A test runner that dies without running its teardown — `SIGKILL`, a hard crash, a cancelled CI job — cannot reap the Harper instances it started, because those are deliberately detached into their own process groups so that whole-tree teardown works. Left alone, they hold their loopback address's fixed ports until the machine is rebooted.
+
+To close that gap, `startHarper()` registers each instance in a small on-disk registry and makes sure a single shared **monitor** process is running. The monitor is not a per-instance sidecar: one is started on demand per registry directory (per user on the machine, by default), every concurrent runner reuses it, and it exits once the registry has been empty for a while. Registry updates are published by renaming a complete file into place, so a runner killed mid-write leaves the previous registry — and therefore every other runner's reap targets — intact. It scans the registry on an interval and terminates — `SIGTERM`, then `SIGKILL` after a grace period — the process group of any instance whose owning runner is gone, or which has outlived its lifetime budget. Instances are matched by PID *and* process start time, so a recycled PID is never mistaken for a live one — on a host whose `ps` cannot report a start time (busybox/Alpine) this degrades to a PID-only check, which the monitor logs on startup.
+
+The runner's own `exit`/`SIGINT`/`SIGTERM`/`SIGHUP` handlers still reap instances immediately on any exit it can observe; the monitor only handles the deaths it cannot.
+
+Registry directory layout (`${TMPDIR}/harper-integration-test-monitor-${uid}` by default — per-user, because signalling another user's process group fails with `EPERM` and could never have reaped it):
+
+| File | Contents |
+| --- | --- |
+| `registry.json` | The current monitor and every registered instance (PID, start time, owning runner, loopback address, deadline) |
+| `registry.lock` | Cross-process mutex guarding `registry.json` |
+| `monitor.log` | Append-only record of monitor start/exit and every reap, with the reason |
+| `registry.json.*.pending` | A registry update being written, renamed over `registry.json` once complete so no reader ever sees a partial one. Only present transiently, or left behind by a writer that was killed mid-update |
+
+Each managed Harper process also carries `HARPER_IT_KIND=harper-instance`, `HARPER_IT_INSTANCE_ID`, and `HARPER_IT_OWNER_PID` in its environment, and the monitor's command line contains `--harper-integration-test-monitor`, so both are identifiable from `ps` / `/proc` without consulting the registry.
+
+This is POSIX-only: reaping relies on process groups, which Windows does not have. On Windows, registration is skipped and the runner-side cleanup handlers are the only protection.
+
+**Environment Variables:**
+
+- `HARPER_INTEGRATION_TEST_MONITOR` - Set to `off` to disable registration and the monitor entirely. Default on (POSIX only).
+- `HARPER_INTEGRATION_TEST_MONITOR_DIR` - Registry directory. Default `${TMPDIR}/harper-integration-test-monitor-${uid}`. Point separate runs at separate directories to give them separate monitors.
+- `HARPER_INTEGRATION_TEST_MONITOR_INTERVAL_MS` - How often the monitor rescans the registry. Default `2000`.
+- `HARPER_INTEGRATION_TEST_MONITOR_REAP_GRACE_MS` - Grace period between the monitor's SIGTERM and SIGKILL. Default `5000`.
+- `HARPER_INTEGRATION_TEST_MONITOR_IDLE_MS` - How long the registry must stay empty before the monitor shuts down. Default `60000`.
+- `HARPER_INTEGRATION_TEST_INSTANCE_MAX_LIFETIME_MS` - Backstop lifetime after which an instance is reaped even if its runner still looks alive. Default `14400000` (4h).
 
 ### Server Log Capture
 

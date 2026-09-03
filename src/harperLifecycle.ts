@@ -8,6 +8,12 @@ import { getNextAvailableLoopbackAddress, releaseLoopbackAddress } from './loopb
 import { waitForPortsFree } from './portUtils.ts';
 import { ok, equal } from 'node:assert';
 import { createRequire } from 'node:module';
+import {
+	buildInstanceEnv,
+	deregisterHarperInstance,
+	nextInstanceId,
+	registerHarperInstance,
+} from './harperInstanceRegistry.ts';
 
 /**
  * Minimal context interface required by startHarper/teardownHarper.
@@ -120,7 +126,7 @@ export const LOG_DIR_MARKER_PREFIX = '[Harper] Logs for this instance will be st
 export interface StartHarperOptions {
 	/**
 	 * Maximum time (ms) to wait between chunks of startup output before treating Harper as hung.
-	 * Resets on every chunk of output, so it bounds silence, not total boot time.
+	 * Resets on every chunk of output, so it bounds silence rather than total boot time.
 	 * Falls back to {@link DEFAULT_STARTUP_TIMEOUT_MS} (60s locally, 150s under CI).
 	 */
 	startupTimeoutMs?: number;
@@ -185,7 +191,7 @@ export interface HarperContext {
 	operationsAPIURL: string;
 	/** Assigned loopback IP address (e.g., '127.0.0.2') */
 	hostname: string;
-	/** Child process for the Harper instance */
+	/** Child process handle for the Harper instance */
 	process: ChildProcess;
 	/** Absolute path to the log directory for this suite (only set when HARPER_INTEGRATION_TEST_LOG_DIR is configured) */
 	logDir?: string;
@@ -358,6 +364,8 @@ interface RunHarperCommandOptions {
 	timeoutMs?: number;
 	/** Absolute timeout (ms): ceiling on total time regardless of output. Falls back to DEFAULT_STARTUP_MAX_MS. */
 	maxMs?: number;
+	/** Loopback address this instance is bound to; recorded with the instance monitor for diagnostics. */
+	hostname?: string;
 }
 
 interface RunHarperCommandResult {
@@ -386,6 +394,7 @@ export function runHarperCommand({
 	harperBinPath,
 	timeoutMs,
 	maxMs,
+	hostname,
 }: RunHarperCommandOptions): Promise<RunHarperCommandResult> {
 	const harperScript = getHarperScript(harperBinPath);
 	const runtime = HARPER_RUNTIME;
@@ -393,18 +402,20 @@ export function runHarperCommand({
 		runtime === 'bun'
 			? [harperScript, ...args]
 			: ['--trace-warnings', '--force-node-api-uncaught-exceptions-policy=true', harperScript, ...args];
+	const instanceId = nextInstanceId();
 	const proc = spawn(runtime, runtimeArgs, {
-		env: { ...process.env, ...env },
-		// On POSIX, run Harper as its own process-group leader so teardown can signal the whole
-		// group (parent + any worker children), not just the direct child. Windows has no process
-		// groups; killHarper uses `taskkill /T` there instead. stdio stays piped (not detached),
-		// and we never unref, so output capture and lifetime management are unchanged.
+		env: { ...process.env, ...env, ...buildInstanceEnv(instanceId) },
+		// On POSIX, run Harper as its own process-group leader so both teardown and the shared
+		// instance monitor can signal the whole group (parent + any worker children), not just the
+		// direct child. Windows has no process groups; killHarper uses `taskkill /T` there instead.
+		// stdio stays piped (not detached), and we never unref, so output capture and lifetime
+		// management are unchanged.
 		detached: process.platform !== 'win32',
 	});
 
-	// Reap this process's tree if the runner exits/is interrupted before teardown (it's detached,
-	// so it would otherwise survive signals sent to the runner's group).
-	trackHarperProcess(proc);
+	// Publishes the instance to the shared monitor, which reaps it if this runner dies without
+	// running cleanup, and installs the runner-side handlers covering cooperative exits.
+	const trackedProcess = trackHarperProcess(proc, instanceId, hostname);
 
 	let stdoutStream: WriteStream | undefined;
 	let stderrStream: WriteStream | undefined;
@@ -420,6 +431,7 @@ export function runHarperCommand({
 		let stdout = '';
 		let stderr = '';
 		let settled = false;
+		let readinessDetected = false;
 		let idleTimer: NodeJS.Timeout;
 		let maxTimer: NodeJS.Timeout;
 
@@ -433,22 +445,34 @@ export function runHarperCommand({
 			settled = true;
 			clearTimers();
 			reject(new HarperStartupError(message, stdout, stderr));
-			// Harper is spawned detached (its own process group), so `proc.kill()` would only hit the
-			// direct child and orphan any worker children still holding ports. Reap the whole tree.
+			// Harper is the detached group leader, so reap the whole group rather than only it.
 			signalHarperTree(proc, 'SIGKILL');
 		};
 
 		const succeed = () => {
-			if (settled) return;
-			settled = true;
+			if (settled || readinessDetected) return;
+			readinessDetected = true;
+			// Left armed across registration, these would let registry-lock contention time out — and
+			// kill — an instance that already booted successfully.
 			clearTimers();
-			resolve({ process: proc, stdout, stderr });
+			// Resolve only once the instance is durably registered, so a runner killed the moment
+			// startHarper returns still leaves the monitor a record to act on. Registration always
+			// settles: `acquireLock` is bounded and `trackHarperProcess` absorbs its failures.
+			void trackedProcess.registered.then(() => {
+				if (settled) return;
+				settled = true;
+				resolve({ process: proc, stdout, stderr });
+			});
 		};
+
+		// Startup ends at readiness, not at resolution: the watchdog and the `startupOutput` snapshot
+		// both stop here, while resolution waits on registration for a little longer.
+		const startupFinished = () => settled || readinessDetected;
 
 		// Reset on every chunk of output so the limit is time-since-last-progress, not total boot
 		// time: a slow-but-healthy boot that keeps logging never trips it, only true silence does.
 		const resetIdleTimer = () => {
-			if (settled) return;
+			if (startupFinished()) return;
 			clearTimeout(idleTimer);
 			idleTimer = setTimeout(
 				() => failStartup(`Harper produced no startup output for ${idleTimeoutMs}ms before reporting ready (likely hung)`),
@@ -469,7 +493,7 @@ export function runHarperCommand({
 			// Once ready, keep streaming logs to disk but stop the watchdog and capture: the
 			// returned startupOutput is a snapshot taken at readiness, and the server may run
 			// (and log) for the rest of the suite.
-			if (settled) return;
+			if (startupFinished()) return;
 			resetIdleTimer();
 			stdout += dataString;
 			// Match against the accumulated output, not just this chunk, so a marker split across
@@ -482,7 +506,7 @@ export function runHarperCommand({
 		proc.stderr?.on('data', (data: Buffer) => {
 			const dataString = stripAnsi(data.toString());
 			stderrStream?.write(dataString);
-			if (settled) return;
+			if (startupFinished()) return;
 			resetIdleTimer();
 			stderr += dataString;
 		});
@@ -497,9 +521,9 @@ export function runHarperCommand({
 			reject(error);
 		});
 		proc.on('exit', (statusCode, signal) => {
-			clearTimers();
 			if (!settled) {
 				settled = true;
+				clearTimers();
 				if (statusCode === 0) {
 					resolve({ process: proc, stdout, stderr });
 				} else {
@@ -629,6 +653,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		harperBinPath: options?.harperBinPath,
 		timeoutMs: options?.startupTimeoutMs,
 		maxMs: options?.startupMaxMs,
+		hostname: loopbackAddress,
 	});
 
 	publishHarperNode(ctx, {
@@ -648,27 +673,25 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	return ctx as StartedHarperTestContext;
 }
 
+function signalWindowsProcessTree(pid: number, signal: 'SIGTERM' | 'SIGKILL'): void {
+	const args = ['/pid', String(pid), '/T'];
+	if (signal === 'SIGKILL') args.push('/F');
+	spawn('taskkill', args, { stdio: 'ignore' }).on('error', () => {});
+}
+
 /**
  * Signals Harper's entire process tree, not just the direct child.
  *
- * Harper runs its listeners in worker threads (in-process), but components can also spawn
- * child processes, so we target the whole tree to be safe:
- * - POSIX: Harper is spawned as its own process-group leader (`detached`), so a negative PID
- *   signals the group (parent + descendants).
- * - Windows: there are no process groups, so we shell out to `taskkill /T` (tree). `/F` (force)
- *   is required to actually terminate console processes, so it is used for the SIGKILL step.
- *
- * Best-effort: errors (e.g. the process already exited) are swallowed; teardown's port assertion
- * and the wait-for-exit are the safety nets.
+ * Harper is the detached POSIX process-group leader, with anything it spawns in that group, so a
+ * negative PID reaches the whole tree. Windows has no process groups, so `taskkill /T` is used
+ * there. Errors are best-effort because the target may already have exited.
  */
 function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
 	const pid = proc.pid;
 	if (pid === undefined) return;
 	if (process.platform === 'win32') {
-		const args = ['/pid', String(pid), '/T'];
-		if (signal === 'SIGKILL') args.push('/F');
 		try {
-			spawn('taskkill', args, { stdio: 'ignore' }).on('error', () => {});
+			signalWindowsProcessTree(pid, signal);
 		} catch {
 			try {
 				proc.kill(signal);
@@ -691,36 +714,63 @@ function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): vo
 	}
 }
 
+interface TrackedHarperProcess {
+	/** Settles once the instance is recorded with the shared monitor (or registration was skipped). */
+	registered: Promise<void>;
+}
+
 /**
  * Tracks live Harper processes so that if the test runner exits or is interrupted before teardown
  * runs (Ctrl+C, or a CI job killing the runner), their process trees are reaped instead of left
- * orphaned holding the fixed ports. This matters specifically because Harper is spawned `detached`
- * (its own process group), so it would otherwise survive signals delivered to the runner's group.
+ * orphaned holding the fixed ports. Harper is spawned detached (its own process group), so it
+ * would otherwise survive signals delivered to the runner's group.
  *
- * Best-effort: on POSIX the group SIGKILL is delivered synchronously (works even from the 'exit'
- * handler); on Windows the `taskkill` shell-out may not complete before the runner exits.
+ * These parent-side hooks cover every exit the runner can still run JavaScript for. Death it
+ * cannot observe — `SIGKILL`, a hard crash, a cancelled CI job — is covered by the shared instance
+ * monitor, which reaps whatever the registry says is orphaned. See `harperInstanceRegistry.ts`.
+ *
+ * On POSIX the group `SIGKILL` is delivered synchronously, so it works even from the 'exit'
+ * handler. On Windows the `taskkill` shell-out may not complete before the runner exits, and there
+ * is no monitor to fall back on.
  */
 const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
-function trackHarperProcess(proc: ChildProcess): void {
+function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: string): TrackedHarperProcess {
 	liveHarperProcesses.add(proc);
-	proc.once('exit', () => liveHarperProcesses.delete(proc));
+	// A failed spawn leaves no PID and nothing to reap; the caller rejects on the 'error' event.
+	const registered =
+		proc.pid === undefined
+			? Promise.resolve()
+			: registerHarperInstance({ id: instanceId, pid: proc.pid, hostname }).catch((error: Error) => {
+					console.warn(`[harper-monitor] Failed to register Harper instance ${instanceId}: ${error.message}`);
+				});
+	const trackedProcess: TrackedHarperProcess = { registered };
 
-	if (runnerCleanupRegistered) return;
+	proc.once('exit', () => {
+		liveHarperProcesses.delete(proc);
+		// Chained on registration so a fast exit cannot deregister before the record exists. Best
+		// effort either way: the monitor prunes records whose process is gone.
+		void registered.then(() => deregisterHarperInstance(instanceId));
+	});
+
+	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
 
 	const reapAll = () => {
 		for (const child of liveHarperProcesses) signalHarperTree(child, 'SIGKILL');
 	};
 	process.once('exit', reapAll);
-	// SIGINT/SIGTERM don't fire 'exit'; reap, then re-raise so the runner still terminates normally.
-	for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+	// These signals don't fire 'exit'; reap, then re-raise so the runner still terminates normally.
+	const cleanupSignals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+	if (process.platform !== 'win32') cleanupSignals.push('SIGHUP');
+	for (const signal of cleanupSignals) {
 		process.once(signal, () => {
 			reapAll();
 			process.kill(process.pid, signal);
 		});
 	}
+	return trackedProcess;
 }
 
 /** Identifies the objects published as `ctx.harper`; a shallow copy of a node does not carry it. */
