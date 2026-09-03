@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -193,7 +194,7 @@ function pidExists(pid: number): boolean {
  */
 async function acquireLock(): Promise<string> {
 	const lockPath = getLockPath();
-	const token = `${process.pid}-${++lockTokenCounter}-${Math.random().toString(36).slice(2)}`;
+	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
 	await mkdir(getRegistryDir(), { recursive: true, mode: 0o700 });
 	// Bounded so a pathological holder — one refreshing the lock faster than it goes stale — surfaces
 	// as a failed registration the caller can warn about, rather than a caller that never settles.
@@ -287,7 +288,7 @@ let pendingWriteCounter = 0;
 export async function writeRegistryFile(registry: InstanceRegistry): Promise<void> {
 	await mkdir(getRegistryDir(), { recursive: true, mode: 0o700 });
 	const registryPath = getRegistryPath();
-	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.${Math.random().toString(36).slice(2)}.pending`;
+	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.${randomBytes(8).toString('hex')}.pending`;
 	try {
 		// `wx` (O_CREAT|O_EXCL) refuses to follow a symlink planted at the pending name, so a shared
 		// registry directory cannot be turned into an arbitrary-write primitive.
