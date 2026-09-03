@@ -35,6 +35,10 @@ export const INSTANCE_ENV_OWNER_PID = 'HARPER_IT_OWNER_PID';
 
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const LOCK_RETRY_DELAY_MS = 50;
+/** Ceiling on waiting for the lock, well past a stale reclaim so only a pathological holder hits it. */
+const LOCK_ACQUIRE_TIMEOUT_MS = 30000;
+/** Ceiling on the `ps` lookup, so a call wedged in D-state cannot stall a caller indefinitely. */
+const PS_TIMEOUT_MS = 5000;
 
 let lockTokenCounter = 0;
 
@@ -48,10 +52,17 @@ function envInt(name: string, fallback: number): number {
  * than at module load so a test (or a caller isolating a run) can point it somewhere private
  * after import, and so the value the monitor inherits always matches its parent's.
  *
+ * Per-user, because reaping across users cannot work anyway: signalling another user's process
+ * group fails with `EPERM`, which reads as "still alive", so a foreign record would never be
+ * pruned and would keep the monitor running forever. It also keeps the shared-`/tmp` path from
+ * being one another account can plant records in.
+ *
  * Override with `HARPER_INTEGRATION_TEST_MONITOR_DIR`.
  */
 export function getRegistryDir(): string {
-	return process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR || join(tmpdir(), 'harper-integration-test-monitor');
+	if (process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR) return process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	const uid = process.getuid?.();
+	return join(tmpdir(), uid === undefined ? 'harper-integration-test-monitor' : `harper-integration-test-monitor-${uid}`);
 }
 
 export function getRegistryPath(): string {
@@ -135,7 +146,10 @@ export function readProcessStartTimes(pids: number[]): Map<number, string> {
 	const startTimes = new Map<number, string>();
 	const uniquePids = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
 	if (uniquePids.length === 0) return startTimes;
-	const result = spawnSync('ps', ['-o', 'pid=,lstart=', '-p', uniquePids.join(',')], { encoding: 'utf8' });
+	const result = spawnSync('ps', ['-o', 'pid=,lstart=', '-p', uniquePids.join(',')], {
+		encoding: 'utf8',
+		timeout: PS_TIMEOUT_MS,
+	});
 	// A non-zero status just means none of the PIDs exist; only a missing `ps` is worth noticing,
 	// and there the empty map degrades callers to a plain PID check rather than reporting deaths.
 	if (result.error || typeof result.stdout !== 'string') return startTimes;
@@ -179,7 +193,10 @@ function pidExists(pid: number): boolean {
 async function acquireLock(): Promise<string> {
 	const lockPath = getLockPath();
 	const token = `${process.pid}-${++lockTokenCounter}-${Math.random().toString(36).slice(2)}`;
-	await mkdir(getRegistryDir(), { recursive: true });
+	await mkdir(getRegistryDir(), { recursive: true, mode: 0o700 });
+	// Bounded so a pathological holder — one refreshing the lock faster than it goes stale — surfaces
+	// as a failed registration the caller can warn about, rather than a caller that never settles.
+	const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
 	while (true) {
 		try {
 			const lockFileHandle = await open(lockPath, 'wx');
@@ -194,6 +211,9 @@ async function acquireLock(): Promise<string> {
 				if (Date.now() - lockFileStat.mtimeMs > LOCK_STALE_TIMEOUT_MS) await unlink(lockPath);
 			} catch {
 				// Another process removed it first; just retry.
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(`Timed out after ${LOCK_ACQUIRE_TIMEOUT_MS}ms waiting for the Harper instance registry lock at ${lockPath}`);
 			}
 			await sleep(LOCK_RETRY_DELAY_MS);
 		}
@@ -240,7 +260,12 @@ export async function readRegistryFile(): Promise<InstanceRegistry> {
 			`Harper instance registry at ${getRegistryPath()} is not valid JSON (delete it to reset monitoring): ${(error as Error).message}`
 		);
 	}
-	return { monitor: parsed.monitor, instances: Array.isArray(parsed.instances) ? parsed.instances : [] };
+	if (!Array.isArray(parsed.instances)) {
+		// Same erasure the parse failure above guards against: reporting this as empty would have the
+		// caller write that emptiness back over whatever the file really described.
+		throw new Error(`Harper instance registry at ${getRegistryPath()} has no instance list (delete it to reset monitoring)`);
+	}
+	return { monitor: parsed.monitor, instances: parsed.instances };
 }
 
 let pendingWriteCounter = 0;
@@ -248,19 +273,15 @@ let pendingWriteCounter = 0;
 /**
  * Writes the registry. Only call while holding the lock.
  *
- * Publishes by writing a complete file alongside the registry and renaming it into place, so
- * readers only ever see the old registry or the new one. Writing the live file in place would
- * truncate it first, and a writer that died in that window — the `SIGKILL` this whole mechanism
- * exists to survive — would leave torn JSON that `readRegistryFile` reads as an empty registry,
- * discarding every reap target on the machine including other runners'.
- *
- * The pending file's name is unique per write, because a fixed one could be truncated underneath
- * us by a second writer that reclaimed the lock as stale — reintroducing exactly the tearing the
- * rename removes. A writer killed between the two steps leaves its pending file behind; it is
- * inert, and lives in a directory that is already per-machine scratch.
+ * Publishes by rename so readers see either the old registry or the new one. An in-place write
+ * truncates first, and a writer killed in that window — the `SIGKILL` this whole mechanism exists
+ * to survive — leaves torn JSON, which used to read as an empty registry and take every reap
+ * target on the machine with it. The pending name is unique per write because a fixed one could be
+ * truncated by a writer that reclaimed the lock as stale, reintroducing that same tearing; one
+ * left behind by a killed writer is inert.
  */
 export async function writeRegistryFile(registry: InstanceRegistry): Promise<void> {
-	await mkdir(getRegistryDir(), { recursive: true });
+	await mkdir(getRegistryDir(), { recursive: true, mode: 0o700 });
 	const registryPath = getRegistryPath();
 	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.pending`;
 	try {

@@ -165,6 +165,12 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 
 if (!(await claimMonitorSlot())) process.exit(0);
 await log(`Monitor started (scan ${scanIntervalMs}ms, idle exit ${idleExitMs}ms, reap grace ${reapGraceMs}ms).`);
+// `ps -o lstart=` is absent on busybox, so identity checks silently degrade to a bare PID test and
+// a recycled PID can be mistaken for its predecessor. Say so once rather than reaping on a
+// guarantee this host cannot provide.
+if (readProcessStartTimes([process.pid]).size === 0) {
+	await log('WARNING: `ps -o pid=,lstart=` returned nothing; falling back to PID-only liveness checks (PID reuse is undetectable).');
+}
 
 while (running) {
 	// Someone removed the registry out from under us (a cleaned-up run, or a developer clearing

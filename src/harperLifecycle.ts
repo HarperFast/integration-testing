@@ -452,13 +452,12 @@ export function runHarperCommand({
 		const succeed = () => {
 			if (settled || readinessDetected) return;
 			readinessDetected = true;
-			// Harper has reported ready, so the startup watchdog has nothing left to guard. Leaving the
-			// absolute deadline armed across registration would let contention on the shared registry
-			// lock time out — and kill — an instance that already booted successfully.
+			// Left armed across registration, these would let registry-lock contention time out — and
+			// kill — an instance that already booted successfully.
 			clearTimers();
 			// Resolve only once the instance is durably registered, so a runner killed the moment
 			// startHarper returns still leaves the monitor a record to act on. Registration always
-			// settles: it self-heals a stale lock, and `trackHarperProcess` absorbs its failures.
+			// settles: `acquireLock` is bounded and `trackHarperProcess` absorbs its failures.
 			void trackedProcess.registered.then(() => {
 				if (settled) return;
 				settled = true;
@@ -466,10 +465,14 @@ export function runHarperCommand({
 			});
 		};
 
+		// Startup ends at readiness, not at resolution: the watchdog and the `startupOutput` snapshot
+		// both stop here, while resolution waits on registration for a little longer.
+		const startupFinished = () => settled || readinessDetected;
+
 		// Reset on every chunk of output so the limit is time-since-last-progress, not total boot
 		// time: a slow-but-healthy boot that keeps logging never trips it, only true silence does.
 		const resetIdleTimer = () => {
-			if (settled) return;
+			if (startupFinished()) return;
 			clearTimeout(idleTimer);
 			idleTimer = setTimeout(
 				() => failStartup(`Harper produced no startup output for ${idleTimeoutMs}ms before reporting ready (likely hung)`),
@@ -490,7 +493,7 @@ export function runHarperCommand({
 			// Once ready, keep streaming logs to disk but stop the watchdog and capture: the
 			// returned startupOutput is a snapshot taken at readiness, and the server may run
 			// (and log) for the rest of the suite.
-			if (settled) return;
+			if (startupFinished()) return;
 			resetIdleTimer();
 			stdout += dataString;
 			// Match against the accumulated output, not just this chunk, so a marker split across
@@ -503,7 +506,7 @@ export function runHarperCommand({
 		proc.stderr?.on('data', (data: Buffer) => {
 			const dataString = stripAnsi(data.toString());
 			stderrStream?.write(dataString);
-			if (settled) return;
+			if (startupFinished()) return;
 			resetIdleTimer();
 			stderr += dataString;
 		});

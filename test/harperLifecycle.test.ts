@@ -1,5 +1,5 @@
 import { test, before, after } from 'node:test';
-import { ok, strictEqual, match, rejects } from 'node:assert';
+import { ok, strictEqual, match, doesNotMatch, rejects } from 'node:assert';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
@@ -33,6 +33,9 @@ import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 const FIXTURE_SOURCES: Record<string, string> = {
 	// Reports ready, then stays alive like a server.
 	'ready.cjs': "process.stdout.write('booting\\n');\nsetTimeout(() => process.stdout.write('successfully started\\n'), 50);\nsetInterval(() => {}, 1000);\n",
+	// Reports ready, then logs once more and goes quiet — what a real Harper does after startup,
+	// and what re-arms a startup watchdog that keys on resolution instead of readiness.
+	'ready-then-log.cjs': "process.stdout.write('booting\\n');\nsetTimeout(() => process.stdout.write('successfully started\\n'), 50);\nsetTimeout(() => process.stdout.write('post-readiness log line\\n'), 150);\nsetInterval(() => {}, 1000);\n",
 	// Emits one line, then goes silent forever (hung during startup).
 	'idle-hang.cjs': "process.stdout.write('booting\\n');\nsetInterval(() => {}, 1000);\n",
 	// Emits output continuously but never reports ready.
@@ -212,6 +215,12 @@ interface FakeHarperTreeOptions {
 	maxLifetimeMs?: string;
 }
 
+/** Restores an environment variable, removing it when it was previously unset — assigning `undefined` would set the string `"undefined"`. */
+function restoreEnv(name: string, value: string | undefined): void {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+}
+
 /** Reads a registry directly. Registry writes are atomic, so this only reads empty before the first one. */
 async function readMonitorRegistry(monitorDir: string): Promise<InstanceRegistry> {
 	try {
@@ -362,7 +371,7 @@ test('runHarperCommand keeps a slow-but-progressing boot alive past the idle win
 		env: {},
 		completionMessage: 'successfully started',
 		harperBinPath: fixtures['idle-reset.cjs'],
-		// The idle window includes launching both the supervisor and fake Harper before first output.
+		// The idle window has to cover process launch before the fixture's first output.
 		timeoutMs: 700,
 		maxMs: 10000,
 	});
@@ -531,7 +540,7 @@ test('a superseded lock holder does not release the lock that replaced it', { sk
 			'releasing must not evict the holder that superseded us — that admits a third process alongside it'
 		);
 	} finally {
-		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
 		rmSync(monitorDir, { recursive: true, force: true });
 	}
 });
@@ -545,13 +554,15 @@ test('an unreadable registry is reported rather than silently read as empty', { 
 		// and every live instance on the machine loses the record that would have got it reaped.
 		await writeFileAsync(join(monitorDir, 'registry.json'), '{"instances":[{"id":"trunc');
 		await rejects(readRegistryFile(), /is not valid JSON/);
+		await writeFileAsync(join(monitorDir, 'registry.json'), '{"instances":null}');
+		await rejects(readRegistryFile(), /has no instance list/);
 	} finally {
-		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
 		rmSync(monitorDir, { recursive: true, force: true });
 	}
 });
 
-test('a contended registry lock cannot time out a Harper that already started', { skip: !isPosix }, async () => {
+test('neither startup watchdog can time out a Harper that already reported ready', { skip: !isPosix }, async () => {
 	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
 	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
 	const previousEnabled = process.env.HARPER_INTEGRATION_TEST_MONITOR;
@@ -567,20 +578,22 @@ test('a contended registry lock cannot time out a Harper that already started', 
 			args: [],
 			env: {},
 			completionMessage: 'successfully started',
-			harperBinPath: fixtures['ready.cjs'],
+			// Both windows expire while registration is still blocked on the lock: the absolute one
+			// counting from launch, the idle one if the post-readiness log line re-arms it.
+			harperBinPath: fixtures['ready-then-log.cjs'],
 			timeoutMs: 2000,
 			maxMs: 2000,
 			hostname: '127.0.0.1',
 		});
-		// Past the point where the startup deadline used to fire on a Harper that was already up.
 		await sleep(3000);
 		rmSync(lockPath, { force: true });
 		started = await starting;
 		match(started.stdout, /successfully started/);
+		doesNotMatch(started.stdout, /post-readiness log line/, 'startupOutput is a snapshot taken at readiness');
 	} finally {
 		if (started) started.process.kill('SIGKILL');
-		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
-		process.env.HARPER_INTEGRATION_TEST_MONITOR = previousEnabled;
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR_DIR', previousDir);
+		restoreEnv('HARPER_INTEGRATION_TEST_MONITOR', previousEnabled);
 		forceKill(await waitForMonitor(monitorDir, 5000).catch(() => undefined));
 		rmSync(monitorDir, { recursive: true, force: true });
 	}
