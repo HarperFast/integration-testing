@@ -210,7 +210,7 @@ If you are not using `node:test`, use `createHarperContext()` to create a plain 
 
 A test runner that dies without running its teardown — `SIGKILL`, a hard crash, a cancelled CI job — cannot reap the Harper instances it started, because those are deliberately detached into their own process groups so that whole-tree teardown works. Left alone, they hold their loopback address's fixed ports until the machine is rebooted.
 
-To close that gap, `startHarper()` registers each instance in a small on-disk registry and makes sure a single shared **monitor** process is running. The monitor is not a per-instance sidecar: one is started on demand per registry directory (per machine, by default), every concurrent runner reuses it, and it exits once the registry has been empty for a while. It scans the registry on an interval and terminates — `SIGTERM`, then `SIGKILL` after a grace period — the process group of any instance whose owning runner is gone, or which has outlived its lifetime budget. Instances are matched by PID *and* process start time, so a recycled PID is never mistaken for a live one.
+To close that gap, `startHarper()` registers each instance in a small on-disk registry and makes sure a single shared **monitor** process is running. The monitor is not a per-instance sidecar: one is started on demand per registry directory (per machine, by default), every concurrent runner reuses it, and it exits once the registry has been empty for a while. Registry updates are published by renaming a complete file into place, so a runner killed mid-write leaves the previous registry — and therefore every other runner's reap targets — intact. It scans the registry on an interval and terminates — `SIGTERM`, then `SIGKILL` after a grace period — the process group of any instance whose owning runner is gone, or which has outlived its lifetime budget. Instances are matched by PID *and* process start time, so a recycled PID is never mistaken for a live one.
 
 The runner's own `exit`/`SIGINT`/`SIGTERM`/`SIGHUP` handlers still reap instances immediately on any exit it can observe; the monitor only handles the deaths it cannot.
 
@@ -221,6 +221,7 @@ Registry directory layout (`${TMPDIR}/harper-integration-test-monitor` by defaul
 | `registry.json` | The current monitor and every registered instance (PID, start time, owning runner, loopback address, deadline) |
 | `registry.lock` | Cross-process mutex guarding `registry.json` |
 | `monitor.log` | Append-only record of monitor start/exit and every reap, with the reason |
+| `registry.json.*.pending` | A registry update being written, renamed over `registry.json` once complete so no reader ever sees a partial one. Only present transiently, or left behind by a writer that was killed mid-update |
 
 Each managed Harper process also carries `HARPER_IT_KIND=harper-instance`, `HARPER_IT_INSTANCE_ID`, and `HARPER_IT_OWNER_PID` in its environment, and the monitor's command line contains `--harper-integration-test-monitor`, so both are identifiable from `ps` / `/proc` without consulting the registry.
 

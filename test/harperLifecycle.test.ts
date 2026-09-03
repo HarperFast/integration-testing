@@ -66,6 +66,30 @@ if (process.env.HARPER_FAKE_DESCENDANT === '1') {
   });
 }
 `,
+	// Rewrites the registry back to back so a reader — or the SIGKILL the test sends — is almost
+	// always looking at a write in flight. The padded shape makes each write big enough to span
+	// several of the reader's polls.
+	'registry-writer.mjs': `
+const { writeRegistryFile } = await import(process.env.HARPER_REGISTRY_URL);
+// Never a real process group: a bogus start time means any monitor that somehow read this private
+// registry would treat the record as gone rather than signalling the PID's group.
+const seeded = {
+  id: 'seeded',
+  pid: process.pid,
+  startTime: 'writer-fixture',
+  owner: { pid: process.pid, startTime: 'writer-fixture' },
+  registeredAt: 0,
+  expiresAt: 0,
+};
+const small = { instances: [seeded] };
+const padded = { instances: [seeded, { ...seeded, id: 'padding', hostname: 'x'.repeat(2_000_000) }] };
+await writeRegistryFile(small);
+process.stdout.write('writer-ready\\n');
+for (;;) {
+  await writeRegistryFile(padded);
+  await writeRegistryFile(small);
+}
+`,
 	'orphan-runner.mjs': `
 const { runHarperCommand, killHarper } = await import(process.env.HARPER_LIFECYCLE_URL);
 const result = await runHarperCommand({
@@ -183,7 +207,7 @@ interface FakeHarperTreeOptions {
 	maxLifetimeMs?: string;
 }
 
-/** Reads a registry directly. Poll-and-retry callers tolerate the rare read of a partial write. */
+/** Reads a registry directly. Registry writes are atomic, so this only reads empty before the first one. */
 async function readMonitorRegistry(monitorDir: string): Promise<InstanceRegistry> {
 	try {
 		return JSON.parse(await readFile(join(monitorDir, 'registry.json'), 'utf-8')) as InstanceRegistry;
@@ -435,6 +459,54 @@ test('the monitor shuts down once no instances remain', { skip: !isPosix }, asyn
 		strictEqual((await readMonitorRegistry(tree.monitorDir)).monitor, undefined, 'it should release its slot on the way out');
 	} finally {
 		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('a registry write survives the abrupt death of its writer', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const registryPath = join(monitorDir, 'registry.json');
+	const writer = spawn(process.execPath, [fixtures['registry-writer.mjs']], {
+		env: {
+			...process.env,
+			HARPER_REGISTRY_URL: new URL('../src/harperInstanceRegistry.ts', import.meta.url).href,
+			HARPER_INTEGRATION_TEST_MONITOR_DIR: monitorDir,
+		},
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	/** Parses the registry the way a monitor would, failing loudly instead of reading torn JSON as empty. */
+	async function readCompleteRegistry(context: string): Promise<InstanceRegistry> {
+		const raw = await readFile(registryPath, 'utf-8');
+		try {
+			return JSON.parse(raw) as InstanceRegistry;
+		} catch {
+			throw new Error(`Torn registry ${context}: ${raw.length} bytes, ending ${JSON.stringify(raw.slice(-40))}`);
+		}
+	}
+	try {
+		await waitForMatch(writer, /writer-ready/);
+		// Read while the writer rewrites the file back to back. A truncate-in-place write is visible
+		// here as an empty or half-written file, which `readRegistryFile` maps to an empty registry —
+		// after which the next writer persists that emptiness, dropping every runner's reap targets.
+		let reads = 0;
+		for (const deadline = Date.now() + 500; Date.now() < deadline; reads++) {
+			const observed = await readCompleteRegistry(`while the writer was running (read ${reads})`);
+			strictEqual(observed.instances[0]?.id, 'seeded', 'a visible registry must never lose its instances');
+		}
+		ok(reads > 20, `expected to catch many writes in flight, only managed ${reads} reads`);
+
+		// SIGKILL mid-write: whatever is on disk afterwards must still be one of the two complete
+		// shapes the writer alternates between, never a partial one.
+		writer.kill('SIGKILL');
+		await once(writer, 'exit');
+		const survivor = await readCompleteRegistry('after the writer was killed');
+		strictEqual(survivor.instances[0]?.id, 'seeded', 'a killed writer must leave the reap target behind');
+		ok(
+			survivor.instances.length === 1 || survivor.instances.length === 2,
+			`expected one of the writer's two complete shapes, got ${survivor.instances.length} instances`
+		);
+	} finally {
+		forceKill(writer.pid);
+		rmSync(monitorDir, { recursive: true, force: true });
 	}
 });
 

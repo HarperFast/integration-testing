@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -209,7 +209,11 @@ export async function withRegistryLock<T>(callback: () => Promise<T>): Promise<T
 	}
 }
 
-/** Reads the registry. Only call while holding the lock; a torn or absent file reads as empty. */
+/**
+ * Reads the registry. Only call while holding the lock. An absent file reads as empty — the first
+ * registration on this machine, or a registry directory someone cleared. `writeRegistryFile`
+ * publishes by rename, so a half-written file is never observable here.
+ */
 export async function readRegistryFile(): Promise<InstanceRegistry> {
 	try {
 		const parsed = JSON.parse(await readFile(getRegistryPath(), 'utf-8')) as InstanceRegistry;
@@ -219,10 +223,33 @@ export async function readRegistryFile(): Promise<InstanceRegistry> {
 	}
 }
 
-/** Writes the registry. Only call while holding the lock. */
+let pendingWriteCounter = 0;
+
+/**
+ * Writes the registry. Only call while holding the lock.
+ *
+ * Publishes by writing a complete file alongside the registry and renaming it into place, so
+ * readers only ever see the old registry or the new one. Writing the live file in place would
+ * truncate it first, and a writer that died in that window — the `SIGKILL` this whole mechanism
+ * exists to survive — would leave torn JSON that `readRegistryFile` reads as an empty registry,
+ * discarding every reap target on the machine including other runners'.
+ *
+ * The pending file's name is unique per write, because a fixed one could be truncated underneath
+ * us by a second writer that reclaimed the lock as stale — reintroducing exactly the tearing the
+ * rename removes. A writer killed between the two steps leaves its pending file behind; it is
+ * inert, and lives in a directory that is already per-machine scratch.
+ */
 export async function writeRegistryFile(registry: InstanceRegistry): Promise<void> {
 	await mkdir(getRegistryDir(), { recursive: true });
-	await writeFile(getRegistryPath(), JSON.stringify(registry));
+	const registryPath = getRegistryPath();
+	const pendingPath = `${registryPath}.${process.pid}.${++pendingWriteCounter}.pending`;
+	try {
+		await writeFile(pendingPath, JSON.stringify(registry));
+		await rename(pendingPath, registryPath);
+	} catch (error) {
+		await unlink(pendingPath).catch(() => {});
+		throw error;
+	}
 }
 
 function getMonitorScript(): string {
