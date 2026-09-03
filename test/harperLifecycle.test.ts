@@ -2,12 +2,17 @@ import { test, before, after } from 'node:test';
 import { ok, strictEqual, match, rejects } from 'node:assert';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
 	killHarper,
+	teardownHarper,
+	markHarperNode,
+	publishHarperNode,
+	setupHarperWithFixture,
+	startHarper,
 	runHarperCommand,
 	HarperStartupError,
 	buildHarperChildEnv,
@@ -238,6 +243,106 @@ test('killHarper kills the whole process tree, not just the direct child', { ski
 test('killHarper returns immediately when there is no process', async () => {
 	await killHarper(fakeCtx(undefined));
 	await killHarper({} as unknown as StartedHarperTestContext);
+});
+
+test('teardownHarper rejects the node it published, and killHarper does too', async () => {
+	const node = markHarperNode({ hostname: '127.0.0.2', operationsAPIURL: 'http://127.0.0.2:9925' });
+	await rejects(
+		() => teardownHarper(node as unknown as StartedHarperTestContext),
+		(error: Error) => {
+			ok(error instanceof TypeError, `expected a TypeError, got ${error.constructor.name}`);
+			match(error.message, /expects the test context, but received the Harper node it holds/);
+			match(error.message, /teardownHarper\(\{ harper: node \}\)/);
+			return true;
+		}
+	);
+	await rejects(() => killHarper(node as unknown as StartedHarperTestContext), /killHarper\(ctx\) expects the test context/);
+});
+
+// `startHarper(ctx.harper)` type-checks; unguarded it claimed a second install and loopback address.
+test('the entry points reject the node too, before allocating anything', async () => {
+	const node = markHarperNode({ hostname: '127.0.0.2', dataRootDir: '/tmp/already-installed' });
+	// The remedy must NOT be "wrap it" here: doing that publishes a fresh node over the live one.
+	for (const start of [
+		() => startHarper(node as unknown as StartedHarperTestContext),
+		() => setupHarperWithFixture(node as unknown as StartedHarperTestContext, fixtureDir),
+	]) {
+		await rejects(start, (error: Error) => {
+			match(error.message, /expects the test context, but received the Harper node it holds/);
+			match(error.message, /Pass the context the node came from/);
+			ok(!/Wrap it:/.test(error.message), 'a start function must not advise wrapping a live node');
+			return true;
+		});
+	}
+});
+
+test('teardownHarper still tears down a correctly wrapped context', async () => {
+	const dataRootDir = mkdtempSync(join(tmpdir(), 'guard-teardown-'));
+	await teardownHarper({ harper: markHarperNode({ dataRootDir }) } as unknown as StartedHarperTestContext);
+	strictEqual(existsSync(dataRootDir), false, 'teardown should have removed the install directory');
+});
+
+test('the brand is not enumerable', () => {
+	const node = markHarperNode({ hostname: '127.0.0.2' });
+	strictEqual(Object.keys(node).length, 1);
+	strictEqual(JSON.stringify(node), '{"hostname":"127.0.0.2"}');
+});
+
+test('killHarper rejects a live node unwrapped before signaling it, and reaps it once wrapped', async () => {
+	const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+	const node = markHarperNode({ hostname: '127.0.0.2', process: child });
+	try {
+		await rejects(() => killHarper(node as unknown as StartedHarperTestContext), TypeError);
+		strictEqual(child.exitCode, null, 'the guard must reject before any signal is sent');
+
+		await killHarper({ harper: node } as unknown as StartedHarperTestContext, { graceMs: 200 });
+		ok(child.exitCode !== null || child.signalCode !== null, 'the wrapped call must reap the child');
+	} finally {
+		child.kill('SIGKILL');
+	}
+});
+
+test('an unbranded context is a no-op even when it carries node-like field names', async () => {
+	await teardownHarper({} as unknown as StartedHarperTestContext);
+	await teardownHarper({ name: 'suite-that-threw-in-before' } as unknown as StartedHarperTestContext);
+	await teardownHarper({
+		httpURL: 'http://127.0.0.2:3000',
+		operationsAPIURL: 'http://127.0.0.2:9925',
+		dataRootDir: '/tmp/a-caller-owned-path',
+		admin: { username: 'admin' },
+	} as unknown as StartedHarperTestContext);
+});
+
+// Every node reaches `ctx.harper` through publishHarperNode, so branding it there is what makes the
+// guard apply to real nodes. Exercised directly: reaching the two call sites needs a loopback slot
+// and a real install, which this suite deliberately never takes.
+test('publishHarperNode brands what it assigns', async () => {
+	const dataRootDir = mkdtempSync(join(tmpdir(), 'guard-publish-'));
+	const ctx: { harper?: Partial<{ dataRootDir: string }> } = {};
+	publishHarperNode(ctx, { dataRootDir });
+	strictEqual(ctx.harper?.dataRootDir, dataRootDir);
+	await rejects(
+		() => teardownHarper(ctx.harper as unknown as StartedHarperTestContext),
+		/received the Harper node it holds/
+	);
+	await teardownHarper(ctx as unknown as StartedHarperTestContext);
+	strictEqual(existsSync(dataRootDir), false, 'the wrapped context must still tear down');
+});
+
+test('the shape guard rejects a non-object argument', async () => {
+	await rejects(
+		() => teardownHarper(undefined as unknown as StartedHarperTestContext),
+		/requires a test context object, received undefined/
+	);
+	await rejects(
+		() => teardownHarper(null as unknown as StartedHarperTestContext),
+		/requires a test context object, received null/
+	);
+	// A suite that keeps its nodes in an array reaches the no-op this way: `[a, b].harper` is undefined.
+	await rejects(
+		() => teardownHarper([{ harper: markHarperNode({}) }] as unknown as StartedHarperTestContext),
+		/requires a test context object, received an array\. Pass each context separately\./
+	);
 });
 
 test('killHarper returns immediately for an already-exited process', async () => {

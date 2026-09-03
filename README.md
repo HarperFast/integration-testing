@@ -82,6 +82,8 @@ Edit the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` value in the installed pl
 
 The lifecycle and utility APIs below are framework-agnostic. They manage Harper child processes and a cross-process loopback address pool. Use them in the setup/teardown hooks of whichever test framework you prefer.
 
+`startHarper`, `setupHarperWithFixture`, `killHarper` and `teardownHarper` all take the **context** — the object with a `harper` property — not the node held in `ctx.harper`. Passing the node throws a `TypeError`: the teardown pair tells you to wrap it (`teardownHarper({ harper: node })`), while the start pair tells you to pass the context the node came from, since starting from the node would publish a fresh one over it and abandon the instance already running. It used to be accepted silently, which left the node running until the runner exited. A context whose `harper` was never populated is still a no-op, so teardown after a `before` hook that threw stays safe.
+
 ### `startHarper(ctx, options?)`
 
 Allocates a loopback address from the pool, creates a temporary install directory, starts a Harper process, and waits for it to be ready. Populates `ctx.harper` with the instance details. Call in a setup/`before()` hook.

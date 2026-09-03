@@ -530,13 +530,14 @@ export async function setupHarperWithFixture(
 	fixturePath: string,
 	options?: StartHarperOptions
 ): Promise<StartedHarperTestContext> {
+	assertHarperTestContext(ctx, 'setupHarperWithFixture', START_FROM_THE_CONTEXT);
 	const dataRootDirPrefix = join(
 		process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(),
 		'harper-integration-test-'
 	);
 	const dataRootDir = await mkdtemp(dataRootDirPrefix);
 	await cp(fixturePath, join(dataRootDir, 'components', basename(fixturePath)), { recursive: true, dereference: true });
-	ctx.harper = { dataRootDir };
+	publishHarperNode(ctx, { dataRootDir });
 	return startHarper(ctx, options);
 }
 
@@ -566,6 +567,7 @@ export async function setupHarperWithFixture(
  * ```
  */
 export async function startHarper(ctx: HarperTestContext, options?: StartHarperOptions): Promise<StartedHarperTestContext> {
+	assertHarperTestContext(ctx, 'startHarper', START_FROM_THE_CONTEXT);
 	const dataRootDirPrefix = join(
 		process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(),
 		`harper-integration-test-`
@@ -629,7 +631,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		maxMs: options?.startupMaxMs,
 	});
 
-	ctx.harper = {
+	publishHarperNode(ctx, {
 		dataRootDir,
 		admin: {
 			username: DEFAULT_ADMIN_USERNAME,
@@ -641,7 +643,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 		process: result.process,
 		logDir,
 		startupOutput: { stdout: result.stdout, stderr: result.stderr },
-	};
+	});
 
 	return ctx as StartedHarperTestContext;
 }
@@ -721,6 +723,50 @@ function trackHarperProcess(proc: ChildProcess): void {
 	}
 }
 
+/** Identifies the objects published as `ctx.harper`; a shallow copy of a node does not carry it. */
+const HARPER_NODE = Symbol('harperNode');
+
+/**
+ * The one place a node becomes `ctx.harper`, so every published node carries the brand.
+ * Exported for tests, not from `index.ts`.
+ */
+export function publishHarperNode(ctx: HarperTestContext, node: Partial<HarperContext>): void {
+	ctx.harper = markHarperNode(node);
+}
+
+/** Exported for tests, not from `index.ts`. */
+export function markHarperNode<T extends object>(node: T): T {
+	return Object.defineProperty(node, HARPER_NODE, { value: true, enumerable: false });
+}
+
+/**
+ * Rejects the node where the context belongs. Brand rather than field names: this runs when
+ * `ctx.harper` is falsy, the same path a failed `before` hook takes, so rejecting on a name a
+ * caller's own context might use (`hostname`, `httpURL`, `process`) would bury the real error.
+ */
+function assertHarperTestContext(ctx: unknown, fnName: string, remedy: string): void {
+	if (ctx === null || typeof ctx !== 'object' || Array.isArray(ctx)) {
+		// An array reaches the no-op the same way a node does: `[a, b].harper` is undefined.
+		const isArray = Array.isArray(ctx);
+		const received = ctx === null ? 'null' : isArray ? 'an array' : typeof ctx;
+		const advice = isArray ? ' Pass each context separately.' : '';
+		throw new TypeError(`${fnName}(ctx) requires a test context object, received ${received}.${advice}`);
+	}
+	if (HARPER_NODE in ctx) {
+		throw new TypeError(`${fnName}(ctx) expects the test context, but received the Harper node it holds. ${remedy}`);
+	}
+}
+
+/**
+ * Remedies are per-direction, not generated from the function name: telling a caller who reached a
+ * *start* function with a live node to wrap it would have them overwrite `ctx.harper` and abandon the
+ * instance already running on it.
+ */
+const WRAP_THE_NODE = (fnName: string) =>
+	`Wrap it: ${fnName}({ harper: node }) — otherwise the node keeps running until the runner exits.`;
+const START_FROM_THE_CONTEXT =
+	'Pass the context the node came from. Starting from the node itself would publish a fresh one over it and abandon the instance already running.';
+
 /**
  * Kill harper process (can be used for teardown, or killing it before a restart).
  *
@@ -734,6 +780,7 @@ function trackHarperProcess(proc: ChildProcess): void {
  *   {@link DEFAULT_TEARDOWN_GRACE_MS}.
  */
 export async function killHarper(ctx: StartedHarperTestContext, options?: { graceMs?: number }): Promise<void> {
+	assertHarperTestContext(ctx, 'killHarper', WRAP_THE_NODE('killHarper'));
 	const proc = ctx.harper?.process;
 	if (!proc) return;
 	// Already exited — nothing to do.
@@ -790,6 +837,7 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
  * ```
  */
 export async function teardownHarper(ctx: StartedHarperTestContext): Promise<void> {
+	assertHarperTestContext(ctx, 'teardownHarper', WRAP_THE_NODE('teardownHarper'));
 	if (!ctx.harper) return;
 	await killHarper(ctx);
 
