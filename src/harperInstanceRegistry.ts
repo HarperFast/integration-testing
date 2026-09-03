@@ -36,6 +36,8 @@ export const INSTANCE_ENV_OWNER_PID = 'HARPER_IT_OWNER_PID';
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const LOCK_RETRY_DELAY_MS = 50;
 
+let lockTokenCounter = 0;
+
 function envInt(name: string, fallback: number): number {
 	const parsed = parseInt(process.env[name] || '', 10);
 	return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
@@ -174,14 +176,16 @@ function pidExists(pid: number): boolean {
  * Critical sections here are a read/modify/write of one small file, so the retry delay is much
  * shorter than the pool's.
  */
-async function acquireLock(): Promise<void> {
+async function acquireLock(): Promise<string> {
 	const lockPath = getLockPath();
+	const token = `${process.pid}-${++lockTokenCounter}-${Math.random().toString(36).slice(2)}`;
 	await mkdir(getRegistryDir(), { recursive: true });
 	while (true) {
 		try {
 			const lockFileHandle = await open(lockPath, 'wx');
+			await lockFileHandle.writeFile(token);
 			await lockFileHandle.close();
-			return;
+			return token;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 			try {
@@ -197,12 +201,15 @@ async function acquireLock(): Promise<void> {
 }
 
 export async function withRegistryLock<T>(callback: () => Promise<T>): Promise<T> {
-	await acquireLock();
+	const token = await acquireLock();
 	try {
 		return await callback();
 	} finally {
 		try {
-			await unlink(getLockPath());
+			// Release only a lock we still hold. A critical section that overran the stale timeout has
+			// already been superseded, and unlinking then would remove the *new* holder's lock and let
+			// a third process into the section alongside it.
+			if ((await readFile(getLockPath(), 'utf-8')) === token) await unlink(getLockPath());
 		} catch {
 			// Already released (e.g. reclaimed as stale).
 		}
@@ -215,12 +222,25 @@ export async function withRegistryLock<T>(callback: () => Promise<T>): Promise<T
  * publishes by rename, so a half-written file is never observable here.
  */
 export async function readRegistryFile(): Promise<InstanceRegistry> {
+	let contents: string;
 	try {
-		const parsed = JSON.parse(await readFile(getRegistryPath(), 'utf-8')) as InstanceRegistry;
-		return { monitor: parsed.monitor, instances: Array.isArray(parsed.instances) ? parsed.instances : [] };
-	} catch {
-		return { instances: [] };
+		contents = await readFile(getRegistryPath(), 'utf-8');
+	} catch (error) {
+		// Only a missing file means an empty registry. Every other read failure has to propagate:
+		// reporting one as empty is what turns a transient problem into the caller writing that
+		// emptiness back, erasing live instances other runners are relying on us to reap.
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { instances: [] };
+		throw error;
 	}
+	let parsed: InstanceRegistry;
+	try {
+		parsed = JSON.parse(contents) as InstanceRegistry;
+	} catch (error) {
+		throw new Error(
+			`Harper instance registry at ${getRegistryPath()} is not valid JSON (delete it to reset monitoring): ${(error as Error).message}`
+		);
+	}
+	return { monitor: parsed.monitor, instances: Array.isArray(parsed.instances) ? parsed.instances : [] };
 }
 
 let pendingWriteCounter = 0;

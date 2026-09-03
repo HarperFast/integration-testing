@@ -452,13 +452,16 @@ export function runHarperCommand({
 		const succeed = () => {
 			if (settled || readinessDetected) return;
 			readinessDetected = true;
-			clearTimeout(idleTimer);
+			// Harper has reported ready, so the startup watchdog has nothing left to guard. Leaving the
+			// absolute deadline armed across registration would let contention on the shared registry
+			// lock time out — and kill — an instance that already booted successfully.
+			clearTimers();
 			// Resolve only once the instance is durably registered, so a runner killed the moment
-			// startHarper returns still leaves the monitor a record to act on.
+			// startHarper returns still leaves the monitor a record to act on. Registration always
+			// settles: it self-heals a stale lock, and `trackHarperProcess` absorbs its failures.
 			void trackedProcess.registered.then(() => {
 				if (settled) return;
 				settled = true;
-				clearTimers();
 				resolve({ process: proc, stdout, stderr });
 			});
 		};

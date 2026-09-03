@@ -3,7 +3,7 @@ import { ok, strictEqual, match, rejects } from 'node:assert';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile as writeFileAsync } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -20,7 +20,12 @@ import {
 	buildHarperChildEnv,
 	type StartedHarperTestContext,
 } from '../src/harperLifecycle.ts';
-import { MONITOR_ARGV_MARKER, type InstanceRegistry } from '../src/harperInstanceRegistry.ts';
+import {
+	MONITOR_ARGV_MARKER,
+	readRegistryFile,
+	withRegistryLock,
+	type InstanceRegistry,
+} from '../src/harperInstanceRegistry.ts';
 import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 
 // Standalone scripts used as a fake "Harper binary" (passed via harperBinPath) to drive
@@ -506,6 +511,77 @@ test('a registry write survives the abrupt death of its writer', { skip: !isPosi
 		);
 	} finally {
 		forceKill(writer.pid);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('a superseded lock holder does not release the lock that replaced it', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	try {
+		await withRegistryLock(async () => {
+			// What a critical section that overran the stale timeout comes back to: another process
+			// reclaimed the lock and is now inside the section itself.
+			await writeFileAsync(join(monitorDir, 'registry.lock'), 'another-holder');
+		});
+		strictEqual(
+			await readFile(join(monitorDir, 'registry.lock'), 'utf-8'),
+			'another-holder',
+			'releasing must not evict the holder that superseded us — that admits a third process alongside it'
+		);
+	} finally {
+		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('an unreadable registry is reported rather than silently read as empty', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	try {
+		// An empty registry is the one answer that must never be invented: the caller writes it back,
+		// and every live instance on the machine loses the record that would have got it reaped.
+		await writeFileAsync(join(monitorDir, 'registry.json'), '{"instances":[{"id":"trunc');
+		await rejects(readRegistryFile(), /is not valid JSON/);
+	} finally {
+		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
+test('a contended registry lock cannot time out a Harper that already started', { skip: !isPosix }, async () => {
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const previousDir = process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR;
+	const previousEnabled = process.env.HARPER_INTEGRATION_TEST_MONITOR;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = monitorDir;
+	process.env.HARPER_INTEGRATION_TEST_MONITOR = 'on';
+	// Held for longer than maxMs but well inside the stale timeout, so registration blocks on a lock
+	// that is legitimately someone else's — what a machine full of concurrent runners looks like.
+	const lockPath = join(monitorDir, 'registry.lock');
+	await writeFileAsync(lockPath, 'other-runner');
+	let started: Awaited<ReturnType<typeof runHarperCommand>> | undefined;
+	try {
+		const starting = runHarperCommand({
+			args: [],
+			env: {},
+			completionMessage: 'successfully started',
+			harperBinPath: fixtures['ready.cjs'],
+			timeoutMs: 2000,
+			maxMs: 2000,
+			hostname: '127.0.0.1',
+		});
+		// Past the point where the startup deadline used to fire on a Harper that was already up.
+		await sleep(3000);
+		rmSync(lockPath, { force: true });
+		started = await starting;
+		match(started.stdout, /successfully started/);
+	} finally {
+		if (started) started.process.kill('SIGKILL');
+		process.env.HARPER_INTEGRATION_TEST_MONITOR_DIR = previousDir;
+		process.env.HARPER_INTEGRATION_TEST_MONITOR = previousEnabled;
+		forceKill(await waitForMonitor(monitorDir, 5000).catch(() => undefined));
 		rmSync(monitorDir, { recursive: true, force: true });
 	}
 });
