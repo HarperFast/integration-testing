@@ -349,9 +349,17 @@ export function buildInstanceEnv(instanceId: string): Record<string, string> {
 	};
 }
 
-/** Allocates the id used for both the instance's environment markers and its registry record. */
+/**
+ * Allocates the id used for both the instance's environment markers and its registry record.
+ *
+ * The random suffix is what makes it unique, not the counter: worker threads share `process.pid`
+ * but each gets its own copy of this module, so two workers' first starts would otherwise both
+ * claim `<pid>-1` and `registerHarperInstance` would drop the earlier record — leaving a live
+ * instance with nothing in the registry to reap it. The PID and counter stay for legibility in
+ * `ps`, the monitor log, and `/proc/<pid>/environ`.
+ */
 export function nextInstanceId(): string {
-	return `${process.pid}-${++instanceCounter}`;
+	return `${process.pid}-${++instanceCounter}-${randomBytes(6).toString('hex')}`;
 }
 
 /**
@@ -411,6 +419,26 @@ export async function deregisterHarperInstance(id: string): Promise<void> {
 		});
 	} catch (error) {
 		console.warn(`[harper-monitor] Failed to deregister Harper instance ${id}: ${(error as Error).message}`);
+	}
+}
+
+/**
+ * Whether a process group still has members, used to decide when an instance's cleanup is
+ * finished. A group outlives its leader: Harper exiting on `SIGTERM` leaves any child that
+ * ignored the signal running in the same group, still holding the ports.
+ *
+ * Safe to act on for a group we recorded, because POSIX reserves a process-group id for as long
+ * as the group has members — so a group that answers here is still ours, not a recycled id.
+ */
+export function processGroupExists(pgid: number): boolean {
+	// Group 0 is "the caller's own group" and 1 is init's; neither can be an instance we recorded.
+	if (!Number.isInteger(pgid) || pgid <= 1) return false;
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means members exist that we may not signal — still a live group.
+		return (error as NodeJS.ErrnoException).code === 'EPERM';
 	}
 }
 

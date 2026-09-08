@@ -8,6 +8,7 @@ import {
 	getReapGraceMs,
 	getRegistryPath,
 	isSameProcessAlive,
+	processGroupExists,
 	readProcessIdentity,
 	readProcessStartTimes,
 	readRegistryFile,
@@ -94,10 +95,19 @@ interface ReapTarget {
 	reason: string;
 }
 
+/** Why an instance should be reaped, or undefined while it is still legitimately running. */
+function reapReason(instance: HarperInstanceRecord, startTimes: Map<number, string>, now: number): string | undefined {
+	if (!isSameProcessAlive(instance.owner, startTimes)) return `owning runner ${instance.owner.pid} is gone`;
+	if (now > instance.expiresAt) {
+		return `exceeded its ${Math.round((instance.expiresAt - instance.registeredAt) / 1000)}s lifetime budget`;
+	}
+	return undefined;
+}
+
 /**
- * Prunes records whose process is gone and returns the ones that should be reaped.
+ * Prunes records whose process group is gone and returns the ones that should be reaped.
  *
- * Reaped instances stay in the registry until their process actually disappears, so a monitor
+ * Reaped instances stay in the registry until their processes actually disappear, so a monitor
  * killed mid-grace leaves a target its successor picks straight back up.
  */
 async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: ReapTarget[] }> {
@@ -110,16 +120,19 @@ async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: 
 		const targets: ReapTarget[] = [];
 		const now = Date.now();
 		for (const instance of registry.instances) {
-			if (!isSameProcessAlive(instance, startTimes)) continue;
-			live.push(instance);
-			if (!isSameProcessAlive(instance.owner, startTimes)) {
-				targets.push({ instance, reason: `owning runner ${instance.owner.pid} is gone` });
-			} else if (now > instance.expiresAt) {
-				targets.push({
-					instance,
-					reason: `exceeded its ${Math.round((instance.expiresAt - instance.registeredAt) / 1000)}s lifetime budget`,
-				});
+			const reason = reapReason(instance, startTimes, now);
+			if (!isSameProcessAlive(instance, startTimes)) {
+				// The record has to outlive its leader while the group is still running and still
+				// orphaned: our own `SIGTERM` exits Harper, and a child that ignored it stays in the
+				// group holding the ports, so dropping the record here would cancel the `SIGKILL`
+				// escalation and strand exactly what this monitor exists to reap. POSIX reserves the
+				// group id for as long as the group has members, so it is still ours to signal. With
+				// the owner alive there is nothing to escalate, and nothing to hold either: the runner
+				// deregisters the record by id as soon as it observes the exit.
+				if (reason === undefined || !processGroupExists(instance.pid)) continue;
 			}
+			live.push(instance);
+			if (reason !== undefined) targets.push({ instance, reason });
 		}
 		if (live.length !== registry.instances.length) {
 			registry.instances = live;
@@ -133,7 +146,8 @@ async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: 
  * Terminates an instance's process group: `SIGTERM` first so Harper can flush and release its
  * ports cleanly, escalating to `SIGKILL` on a later scan if it is still alive after the grace
  * period. Killing by group id is safe here because the record's start time already proved the
- * group leader is the process we registered, not a recycled PID.
+ * group leader is the process we registered, not a recycled PID — and once that leader is gone,
+ * because the id stays reserved while the group it led still has members.
  */
 async function reap({ instance, reason }: ReapTarget): Promise<void> {
 	const escalateAt = escalationDeadlines.get(instance.id);
