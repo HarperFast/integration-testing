@@ -7,6 +7,7 @@ import {
 	getMonitorScanIntervalMs,
 	getReapGraceMs,
 	getRegistryPath,
+	isProcessIdentityReused,
 	isSameProcessAlive,
 	processGroupExists,
 	readProcessIdentity,
@@ -95,6 +96,21 @@ interface ReapTarget {
 	reason: string;
 }
 
+/**
+ * Whether the instance's group still has members now that its leader is gone — our own `SIGTERM`
+ * exits Harper, and a child that ignored it stays in that group holding the ports.
+ *
+ * A PID reporting a *different* start time is not that case but a reused id, and its group belongs
+ * to something unrelated. Absence is the best evidence available, not proof: a group id is reserved
+ * only for the lifetime of the group that held it, so a group that ended between two scans, had its
+ * id reused, and then lost its own leader is indistinguishable from ours here. That is the same
+ * best-effort bar as every other identity check in this registry (`ps` start times narrow PID reuse
+ * rather than eliminating it), and the scan interval is what bounds it.
+ */
+function groupOutlivedLeader(instance: HarperInstanceRecord, startTimes: Map<number, string>): boolean {
+	return !isProcessIdentityReused(instance, startTimes) && processGroupExists(instance.pid);
+}
+
 /** Why an instance should be reaped, or undefined while it is still legitimately running. */
 function reapReason(instance: HarperInstanceRecord, startTimes: Map<number, string>, now: number): string | undefined {
 	if (!isSameProcessAlive(instance.owner, startTimes)) return `owning runner ${instance.owner.pid} is gone`;
@@ -120,18 +136,16 @@ async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: 
 		const targets: ReapTarget[] = [];
 		const now = Date.now();
 		for (const instance of registry.instances) {
-			const reason = reapReason(instance, startTimes, now);
-			if (!isSameProcessAlive(instance, startTimes)) {
-				// The record has to outlive its leader while the group is still running and still
-				// orphaned: our own `SIGTERM` exits Harper, and a child that ignored it stays in the
-				// group holding the ports, so dropping the record here would cancel the `SIGKILL`
-				// escalation and strand exactly what this monitor exists to reap. POSIX reserves the
-				// group id for as long as the group has members, so it is still ours to signal. With
-				// the owner alive there is nothing to escalate, and nothing to hold either: the runner
-				// deregisters the record by id as soon as it observes the exit.
-				if (reason === undefined || !processGroupExists(instance.pid)) continue;
-			}
+			// A record is the cleanup state of a process group, so it lives as long as that group and
+			// not as long as its leader — the two differ precisely when it matters. Our own SIGTERM
+			// exits Harper first, and a child that ignored it stays in the group holding the ports;
+			// dropping the record there would cancel the SIGKILL escalation. A leader that exits on
+			// its own is the same picture without the signal: whether the survivors are reaped now,
+			// later when their runner dies, or at the lifetime budget, this record is what remembers
+			// them, so retention cannot depend on the reap being due yet.
+			if (!isSameProcessAlive(instance, startTimes) && !groupOutlivedLeader(instance, startTimes)) continue;
 			live.push(instance);
+			const reason = reapReason(instance, startTimes, now);
 			if (reason !== undefined) targets.push({ instance, reason });
 		}
 		if (live.length !== registry.instances.length) {
@@ -146,8 +160,8 @@ async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: 
  * Terminates an instance's process group: `SIGTERM` first so Harper can flush and release its
  * ports cleanly, escalating to `SIGKILL` on a later scan if it is still alive after the grace
  * period. Killing by group id is safe here because the record's start time already proved the
- * group leader is the process we registered, not a recycled PID — and once that leader is gone,
- * because the id stays reserved while the group it led still has members.
+ * group leader is the process we registered, not a recycled PID — or, once that leader is gone, on
+ * the narrower evidence `groupOutlivedLeader` describes.
  */
 async function reap({ instance, reason }: ReapTarget): Promise<void> {
 	const escalateAt = escalationDeadlines.get(instance.id);

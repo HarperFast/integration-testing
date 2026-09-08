@@ -16,9 +16,11 @@ import { fileURLToPath } from 'node:url';
  * each instance publishes explicit metadata here and a single shared monitor (one per registry
  * directory, i.e. per user on the machine by default) reaps whatever is orphaned or overdue.
  *
- * The registry is the contract between the two halves: `harperLifecycle.ts` registers and
- * deregisters instances, `harperMonitor.ts` scans and reaps them. Both agree on tunables through
- * the environment, which the monitor inherits from whichever runner first spawned it.
+ * The registry is the contract between the two halves: `harperLifecycle.ts` registers instances,
+ * `harperMonitor.ts` scans, reaps, and removes them. Removal belongs to the monitor alone: a record
+ * describes a process *group*, and a runner watching only its direct child cannot tell when that
+ * group is finished. Both agree on tunables through the environment, which the monitor inherits
+ * from whichever runner first spawned it.
  *
  * POSIX only. Reaping is `kill(-pgid)`, which Windows has no equivalent for; on Windows
  * registration is skipped and the runner-side cleanup handlers in `harperLifecycle.ts` remain the
@@ -175,6 +177,15 @@ export function isSameProcessAlive(identity: ProcessIdentity, startTimes: Map<nu
 	const currentStartTime = startTimes.get(identity.pid);
 	if (currentStartTime === undefined) return startTimes.size === 0 && pidExists(identity.pid);
 	return identity.startTime === undefined || identity.startTime === currentStartTime;
+}
+
+/**
+ * Whether the PID now belongs to a *different* process than the one recorded — distinct from a PID
+ * that has simply gone, and the difference matters wherever a record outlives its own process.
+ */
+export function isProcessIdentityReused(identity: ProcessIdentity, startTimes: Map<number, string>): boolean {
+	const currentStartTime = startTimes.get(identity.pid);
+	return currentStartTime !== undefined && identity.startTime !== undefined && currentStartTime !== identity.startTime;
 }
 
 function pidExists(pid: number): boolean {
@@ -352,11 +363,10 @@ export function buildInstanceEnv(instanceId: string): Record<string, string> {
 /**
  * Allocates the id used for both the instance's environment markers and its registry record.
  *
- * The random suffix is what makes it unique, not the counter: worker threads share `process.pid`
- * but each gets its own copy of this module, so two workers' first starts would otherwise both
- * claim `<pid>-1` and `registerHarperInstance` would drop the earlier record — leaving a live
- * instance with nothing in the registry to reap it. The PID and counter stay for legibility in
- * `ps`, the monitor log, and `/proc/<pid>/environ`.
+ * Uniqueness comes from the random suffix, not the counter: worker threads share `process.pid` and
+ * each holds its own copy of this module, so both first starts would claim `<pid>-1` and
+ * registration — which replaces same-id records — would leave one live instance unreapable. The
+ * PID and counter stay for legibility in `ps` and the monitor log.
  */
 export function nextInstanceId(): string {
 	return `${process.pid}-${++instanceCounter}-${randomBytes(6).toString('hex')}`;
@@ -399,27 +409,6 @@ export async function registerHarperInstance(instance: {
 	// Outside the lock: the monitor claims its slot under the same lock and would otherwise wait
 	// out our critical section before it could start.
 	if (monitorNeeded) spawnMonitor();
-}
-
-/**
- * Removes an instance from the registry after normal teardown.
- *
- * Best-effort — a record left behind by an abrupt exit is pruned by the monitor as soon as the
- * Harper PID is gone, so a missed deregistration costs a log line, not a stale reap target.
- */
-export async function deregisterHarperInstance(id: string): Promise<void> {
-	if (!isInstanceMonitorEnabled()) return;
-	try {
-		await withRegistryLock(async () => {
-			const registry = await readRegistryFile();
-			const remaining = registry.instances.filter((instance) => instance.id !== id);
-			if (remaining.length === registry.instances.length) return;
-			registry.instances = remaining;
-			await writeRegistryFile(registry);
-		});
-	} catch (error) {
-		console.warn(`[harper-monitor] Failed to deregister Harper instance ${id}: ${(error as Error).message}`);
-	}
 }
 
 /**

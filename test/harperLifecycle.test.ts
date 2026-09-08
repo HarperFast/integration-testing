@@ -594,6 +594,99 @@ test('an instance that outlives its lifetime budget is reaped while its runner i
 	}
 });
 
+test('a reap in flight is finished even though its runner is alive to see the leader exit', { skip: !isPosix }, async () => {
+	// The leader's exit ends this reap as far as the still-live runner can see, and the runner used
+	// to remove the record on it — dropping the escalation just as surely as the monitor's own
+	// pruning did, while the TERM-ignoring descendant kept the port.
+	const tree = await startFakeHarperTree({ maxLifetimeMs: '250', descendantIgnoresTerm: true });
+	try {
+		ok(await waitProcessGone(tree.harperPid, 10000), `overdue Harper ${tree.harperPid} should be reaped`);
+		ok(
+			await waitProcessGone(tree.descendantPid, 15000),
+			`its TERM-ignoring descendant ${tree.descendantPid} should still be escalated to SIGKILL`
+		);
+		strictEqual(tree.runner.exitCode, null, 'the owning runner should be untouched');
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'Harper tree ports should be reusable');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('a group that outlives its leader stays reapable until its runner dies', { skip: !isPosix }, async () => {
+	// Nothing is due to be reaped here — the runner is alive and the budget is unexpired — so this
+	// is the case that says retention cannot be conditional on a reap being due. The record is the
+	// only description of the surviving group; the runner's own exit handler cannot cover it,
+	// having dropped the leader from its live set the moment it exited.
+	const tree = await startFakeHarperTree();
+	try {
+		await waitForMonitor(tree.monitorDir);
+		process.kill(tree.harperPid, 'SIGKILL');
+		ok(await waitProcessGone(tree.harperPid, 5000), `leader ${tree.harperPid} should be gone`);
+		await sleep(1000); // several scan intervals
+		strictEqual(
+			(await readMonitorRegistry(tree.monitorDir)).instances.length,
+			1,
+			'the record should survive the leader while the group still holds a port'
+		);
+		strictEqual(await isPortFree('127.0.0.1', tree.ports[1]), false);
+
+		tree.runner.kill('SIGKILL');
+		await once(tree.runner, 'exit');
+		ok(await waitProcessGone(tree.descendantPid, 15000), `descendant ${tree.descendantPid} should be reaped with its runner`);
+		ok(await waitForPortsFree('127.0.0.1', tree.ports, 5000, 50), 'its port should come back');
+	} finally {
+		await cleanupFakeHarperTree(tree);
+	}
+});
+
+test('a record whose leader PID has been reused is dropped, not signalled', { skip: !isPosix }, async () => {
+	// Holding a record past its leader's death is only safe while that PID is *absent*: a group id
+	// stays reserved for the lifetime of its group, so a PID running something else means the group
+	// ended and its id was handed out again.
+	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
+	const bystander = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+	const exitedOwner = spawn(process.execPath, ['-e', '']);
+	await once(exitedOwner, 'exit');
+	let monitor: ChildProcess | undefined;
+	try {
+		await writeFileAsync(
+			join(monitorDir, 'registry.json'),
+			JSON.stringify({
+				instances: [
+					{
+						id: 'stale',
+						pid: bystander.pid,
+						// Not the bystander's start time: this record describes whatever held the PID before it.
+						startTime: 'Mon Jan  1 00:00:00 2001',
+						owner: { pid: exitedOwner.pid, startTime: 'Mon Jan  1 00:00:00 2001' },
+						registeredAt: Date.now(),
+						expiresAt: Date.now() + 3600000,
+					},
+				],
+			})
+		);
+		monitor = spawn(process.execPath, [MONITOR_SCRIPT, MONITOR_ARGV_MARKER], {
+			env: {
+				...process.env,
+				HARPER_INTEGRATION_TEST_MONITOR_DIR: monitorDir,
+				HARPER_INTEGRATION_TEST_MONITOR_INTERVAL_MS: '200',
+				HARPER_INTEGRATION_TEST_MONITOR_REAP_GRACE_MS: '200',
+				HARPER_INTEGRATION_TEST_MONITOR_IDLE_MS: '60000',
+			},
+			stdio: 'ignore',
+		});
+		await waitForMonitor(monitorDir);
+		await sleep(1500);
+		strictEqual(bystander.signalCode, null, 'an unrelated process group must not be signalled for a recycled PID');
+		strictEqual(bystander.exitCode, null, 'the bystander should still be running');
+		strictEqual((await readMonitorRegistry(monitorDir)).instances.length, 0, 'the stale record should be pruned instead');
+	} finally {
+		forceKill(monitor?.pid);
+		forceKill(bystander.pid);
+		rmSync(monitorDir, { recursive: true, force: true });
+	}
+});
+
 test('the monitor shuts down once no instances remain', { skip: !isPosix }, async () => {
 	const tree = await startFakeHarperTree({ idleMs: '500' });
 	try {
