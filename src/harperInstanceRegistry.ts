@@ -153,6 +153,10 @@ export function readProcessStartTimes(pids: number[]): Map<number, string> {
 		encoding: 'utf8',
 		timeout: PS_TIMEOUT_MS,
 		killSignal: 'SIGKILL',
+		// `lstart` is rendered in the caller's timezone and locale, so runners configured differently
+		// would record different strings for one process and read each other's records as PID reuse —
+		// discarding live instances. Pin both so the string is a property of the process alone.
+		env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' },
 	});
 	// A non-zero status just means none of the PIDs exist; only a missing `ps` is worth noticing,
 	// and there the empty map degrades callers to a plain PID check rather than reporting deaths.
@@ -412,12 +416,11 @@ export async function registerHarperInstance(instance: {
 }
 
 /**
- * Whether a process group still has members, used to decide when an instance's cleanup is
- * finished. A group outlives its leader: Harper exiting on `SIGTERM` leaves any child that
- * ignored the signal running in the same group, still holding the ports.
- *
- * Safe to act on for a group we recorded, because POSIX reserves a process-group id for as long
- * as the group has members — so a group that answers here is still ours, not a recycled id.
+ * Whether a process group still has members. A group outlives its leader: Harper exiting on
+ * `SIGTERM` leaves any child that ignored the signal running in the same group, still holding the
+ * ports. POSIX reserves a group id for the lifetime of the group that holds it, so this answers for
+ * one continuous group — see `groupOutlivedLeader` for what that does and does not establish about
+ * whose group it is.
  */
 export function processGroupExists(pgid: number): boolean {
 	// Group 0 is "the caller's own group" and 1 is init's; neither can be an instance we recorded.
@@ -436,6 +439,10 @@ export function processGroupExists(pgid: number): boolean {
  * process-group id and this reaches Harper plus anything it spawned.
  */
 export function signalProcessGroup(pgid: number, signal: 'SIGTERM' | 'SIGKILL'): void {
+	// The registry is on-disk state a corrupt or hostile writer can reach, and `kill(-1)` broadcasts
+	// to every process this user may signal while `kill(-0)` hits our own group. No instance we
+	// registered is ever either, so refuse rather than translate a bad record into a wide signal.
+	if (!Number.isInteger(pgid) || pgid <= 1) return;
 	try {
 		process.kill(-pgid, signal);
 	} catch {

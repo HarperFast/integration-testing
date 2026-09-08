@@ -97,15 +97,15 @@ interface ReapTarget {
 }
 
 /**
- * Whether the instance's group still has members now that its leader is gone — our own `SIGTERM`
- * exits Harper, and a child that ignored it stays in that group holding the ports.
+ * Whether the instance's group is still running, now that the process we recorded as its leader is
+ * not. A leader PID `ps` still describes, with a different start time, is a reused id whose group
+ * is somebody else's.
  *
- * A PID reporting a *different* start time is not that case but a reused id, and its group belongs
- * to something unrelated. Absence is the best evidence available, not proof: a group id is reserved
- * only for the lifetime of the group that held it, so a group that ended between two scans, had its
- * id reused, and then lost its own leader is indistinguishable from ours here. That is the same
- * best-effort bar as every other identity check in this registry (`ps` start times narrow PID reuse
- * rather than eliminating it), and the scan interval is what bounds it.
+ * PID *absence* is the best evidence available here, not proof of ownership: a group id is reserved
+ * only for the lifetime of one group, so a group of ours that ended while nothing was watching, had
+ * its id reused, and then lost its own leader is indistinguishable from ours. Reaping is best-effort
+ * against PID reuse throughout this registry, and this is that same bar, widened by however long the
+ * monitor was not looking.
  */
 function groupOutlivedLeader(instance: HarperInstanceRecord, startTimes: Map<number, string>): boolean {
 	return !isProcessIdentityReused(instance, startTimes) && processGroupExists(instance.pid);
@@ -121,10 +121,9 @@ function reapReason(instance: HarperInstanceRecord, startTimes: Map<number, stri
 }
 
 /**
- * Prunes records whose process group is gone and returns the ones that should be reaped.
- *
- * Reaped instances stay in the registry until their processes actually disappear, so a monitor
- * killed mid-grace leaves a target its successor picks straight back up.
+ * Prunes records whose process group is gone — the monitor is the only writer that removes one —
+ * and returns the ones that should be reaped. A monitor killed mid-grace therefore leaves a target
+ * its successor picks straight back up.
  */
 async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: ReapTarget[] }> {
 	return withRegistryLock(async () => {
@@ -136,13 +135,10 @@ async function scanRegistry(): Promise<{ live: HarperInstanceRecord[]; targets: 
 		const targets: ReapTarget[] = [];
 		const now = Date.now();
 		for (const instance of registry.instances) {
-			// A record is the cleanup state of a process group, so it lives as long as that group and
-			// not as long as its leader — the two differ precisely when it matters. Our own SIGTERM
-			// exits Harper first, and a child that ignored it stays in the group holding the ports;
-			// dropping the record there would cancel the SIGKILL escalation. A leader that exits on
-			// its own is the same picture without the signal: whether the survivors are reaped now,
-			// later when their runner dies, or at the lifetime budget, this record is what remembers
-			// them, so retention cannot depend on the reap being due yet.
+			// Retention is the group's lifetime, deliberately not the leader's and not whether a reap
+			// is due: the survivors of a leader that exited — on our SIGTERM or on its own — still
+			// hold the ports, and this record is the only thing that remembers them, whether they are
+			// reaped now, when their runner dies, or at the lifetime budget.
 			if (!isSameProcessAlive(instance, startTimes) && !groupOutlivedLeader(instance, startTimes)) continue;
 			live.push(instance);
 			const reason = reapReason(instance, startTimes, now);

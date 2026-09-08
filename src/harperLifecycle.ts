@@ -742,9 +742,8 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 				});
 	const trackedProcess: TrackedHarperProcess = { registered };
 
-	// Only the direct child is untracked here. Its registry record describes the whole process
-	// group, which can outlive it, so removing that record is the monitor's call — it is the half
-	// that can see when the group is actually finished.
+	// Only the direct child is untracked here; its registry record covers the group, which can
+	// outlive it, and the monitor owns removing that.
 	proc.once('exit', () => liveHarperProcesses.delete(proc));
 
 	if (runnerCleanupRegistered) return trackedProcess;

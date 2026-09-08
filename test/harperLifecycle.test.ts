@@ -22,7 +22,9 @@ import {
 } from '../src/harperLifecycle.ts';
 import {
 	MONITOR_ARGV_MARKER,
+	readProcessStartTimes,
 	readRegistryFile,
+	signalProcessGroup,
 	withRegistryLock,
 	type InstanceRegistry,
 } from '../src/harperInstanceRegistry.ts';
@@ -354,7 +356,9 @@ async function startFakeHarperTree(options: FakeHarperTreeOptions = {}): Promise
 }
 
 function forceKill(pid: number | undefined): void {
-	if (pid === undefined) return;
+	// A tree whose readiness timed out still carries its initial 0s, and `process.kill(0, ...)`
+	// signals the test runner's own process group.
+	if (pid === undefined || pid <= 0) return;
 	try {
 		process.kill(pid, 'SIGKILL');
 	} catch {
@@ -595,9 +599,8 @@ test('an instance that outlives its lifetime budget is reaped while its runner i
 });
 
 test('a reap in flight is finished even though its runner is alive to see the leader exit', { skip: !isPosix }, async () => {
-	// The leader's exit ends this reap as far as the still-live runner can see, and the runner used
-	// to remove the record on it — dropping the escalation just as surely as the monitor's own
-	// pruning did, while the TERM-ignoring descendant kept the port.
+	// The leader's exit is all the live runner can see of this reap, and removing the record on it
+	// dropped the escalation while the TERM-ignoring descendant kept the port.
 	const tree = await startFakeHarperTree({ maxLifetimeMs: '250', descendantIgnoresTerm: true });
 	try {
 		ok(await waitProcessGone(tree.harperPid, 10000), `overdue Harper ${tree.harperPid} should be reaped`);
@@ -613,10 +616,8 @@ test('a reap in flight is finished even though its runner is alive to see the le
 });
 
 test('a group that outlives its leader stays reapable until its runner dies', { skip: !isPosix }, async () => {
-	// Nothing is due to be reaped here — the runner is alive and the budget is unexpired — so this
-	// is the case that says retention cannot be conditional on a reap being due. The record is the
-	// only description of the surviving group; the runner's own exit handler cannot cover it,
-	// having dropped the leader from its live set the moment it exited.
+	// Nothing is due to be reaped yet, and the runner's own handlers dropped the leader from their
+	// live set the moment it exited, so the record is all that is left to remember the survivors.
 	const tree = await startFakeHarperTree();
 	try {
 		await waitForMonitor(tree.monitorDir);
@@ -640,9 +641,7 @@ test('a group that outlives its leader stays reapable until its runner dies', { 
 });
 
 test('a record whose leader PID has been reused is dropped, not signalled', { skip: !isPosix }, async () => {
-	// Holding a record past its leader's death is only safe while that PID is *absent*: a group id
-	// stays reserved for the lifetime of its group, so a PID running something else means the group
-	// ended and its id was handed out again.
+	// A PID running something else means our group ended and its id was handed out again.
 	const monitorDir = mkdtempSync(join(tmpdir(), 'harper-it-monitor-'));
 	const bystander = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
 	const exitedOwner = spawn(process.execPath, ['-e', '']);
@@ -685,6 +684,41 @@ test('a record whose leader PID has been reused is dropped, not signalled', { sk
 		forceKill(bystander.pid);
 		rmSync(monitorDir, { recursive: true, force: true });
 	}
+});
+
+test('a process identity does not depend on the environment that read it', { skip: !isPosix }, () => {
+	// `ps -o lstart=` renders in the caller's timezone and locale. Two runners configured differently
+	// would record different strings for one process and read each other's live records as PID reuse.
+	const previousTz = process.env.TZ;
+	try {
+		process.env.TZ = 'UTC';
+		const asUtc = readProcessStartTimes([process.pid]).get(process.pid);
+		process.env.TZ = 'America/Denver';
+		const asDenver = readProcessStartTimes([process.pid]).get(process.pid);
+		ok(asUtc, 'this host should report a start time');
+		strictEqual(asUtc, asDenver);
+	} finally {
+		restoreEnv('TZ', previousTz);
+	}
+});
+
+test('a reap cannot be widened into a broadcast by a bad record', { skip: !isPosix }, () => {
+	// The registry is on-disk state outside this process, so a corrupt or planted record can name
+	// PID 1 — and `kill(-1)` reaches every process the monitor may signal.
+	const realKill = process.kill;
+	const attempted: number[] = [];
+	process.kill = ((pid: number) => {
+		attempted.push(pid);
+		return true;
+	}) as typeof process.kill;
+	try {
+		signalProcessGroup(1, 'SIGKILL');
+		signalProcessGroup(0, 'SIGTERM');
+		signalProcessGroup(-1, 'SIGKILL');
+	} finally {
+		process.kill = realKill;
+	}
+	strictEqual(attempted.length, 0, `no signal should be sent for these group ids, got ${attempted.join()}`);
 });
 
 test('the monitor shuts down once no instances remain', { skip: !isPosix }, async () => {
