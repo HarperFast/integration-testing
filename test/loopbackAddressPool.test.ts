@@ -83,7 +83,7 @@ async function refusal(): Promise<any> {
 }
 
 let freshImportCounter = 0;
-/** A cache-busting suffix that's monotonic, unlike Date.now() (can collide within a millisecond). */
+/** Monotonic cache-busting suffix — millisecond-resolution timestamps can collide. */
 function freshModuleUrl(): string {
 	return `../src/loopbackAddressPool.ts?fresh=${++freshImportCounter}`;
 }
