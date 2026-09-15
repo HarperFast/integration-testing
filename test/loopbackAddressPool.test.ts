@@ -40,6 +40,18 @@ test('readPoolFile reinitializes on valid JSON that is not a pool array', async 
 	});
 });
 
+test('readPoolFile reinitializes on an empty pool array instead of leaving no free slots', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		await writeFile(poolPath, '[]');
+
+		const pool = await readPoolFile(poolPath);
+
+		ok(pool.length > 0);
+		ok(pool.every((slot) => slot === null));
+	});
+});
+
 test('readPoolFile still rethrows errors unrelated to a missing/corrupt file', async () => {
 	await withTempDir(async (dir) => {
 		const poolPath = join(dir, 'pool.json');
@@ -81,10 +93,8 @@ test('writePoolFile never leaves a partially-written file visible at the pool pa
 		const original = [null, null, null];
 		await writeFile(poolPath, JSON.stringify(original));
 
-		// Faults the publish step after the pending write already completed, proving poolPath
-		// itself is untouched. This exercises the catchable-error branch of cleanup, not immunity
-		// to an actual SIGKILL — a hard kill in this window bypasses catch/finally and does orphan
-		// the pending file (accepted gap: the pool has no reaper, unlike the instance registry).
+		// A hard kill in this same window (vs. this mocked rejection) bypasses catch/finally and
+		// orphans the pending file — the pool has no reaper for that, unlike the instance registry.
 		const m = mock.module('node:fs/promises', {
 			namedExports: {
 				...fsPromises,

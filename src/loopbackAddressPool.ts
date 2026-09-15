@@ -180,8 +180,13 @@ export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH)
 	try {
 		const content = await readFile(poolPath, 'utf-8');
 		const parsed: unknown = JSON.parse(content);
-		if (!Array.isArray(parsed)) {
-			throw new SyntaxError(`pool file did not contain a JSON array (got ${typeof parsed})`);
+		// An empty array has no free slots to find, so the caller would spin forever with no
+		// diagnostic instead of reinitializing; anything longer is left alone even if it doesn't
+		// match this process's configured count (see writePoolFile: a differently-configured
+		// concurrent process legitimately produces one, and treating that as corrupt too makes
+		// the two processes reinitialize each other's file back and forth).
+		if (!Array.isArray(parsed) || parsed.length === 0) {
+			throw new SyntaxError(`pool file did not contain a non-empty JSON array (got ${typeof parsed})`);
 		}
 		return parsed as LoopbackPool;
 	} catch (error) {
