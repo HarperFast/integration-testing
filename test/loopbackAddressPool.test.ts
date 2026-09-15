@@ -1,7 +1,9 @@
-import { test, after } from 'node:test';
+import { test, after, mock } from 'node:test';
 import { deepStrictEqual, match, ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -41,7 +43,7 @@ process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
 process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort);
 process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = String(httpPort);
 delete process.env[ALLOW_ENV];
-const { getNextAvailableLoopbackAddress, releaseLoopbackAddress } = await import('../src/loopbackAddressPool.ts');
+const { getNextAvailableLoopbackAddress, releaseLoopbackAddress, readPoolFile, writePoolFile } = await import('../src/loopbackAddressPool.ts');
 const { startHarper, setupHarperWithFixture, publishHarperNode, createHarperContext } = await import(
 	'../src/harperLifecycle.ts'
 );
@@ -78,6 +80,15 @@ async function refusal(): Promise<any> {
 	}
 	await releaseLoopbackAddress(address);
 	throw new Error(`expected getNextAvailableLoopbackAddress to reject, but it handed out ${address}`);
+}
+
+async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
+	const dir = await mkdtemp(join(tmpdir(), 'loopback-pool-test-'));
+	try {
+		await body(dir);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
 }
 
 test('hands out an address when no other process listens on its ports', async () => {
@@ -207,4 +218,94 @@ test('startHarper and setupHarperWithFixture remove the install directory they c
 		delete process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT;
 		await close(listener);
 	}
+});
+
+test('readPoolFile reinitializes instead of throwing on a truncated/corrupt pool file', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		await writeFile(poolPath, '[1,2,nul');
+
+		const pool = await readPoolFile(poolPath);
+
+		ok(Array.isArray(pool));
+		ok(pool.length > 0);
+		ok(pool.every((slot) => slot === null));
+	});
+});
+
+test('readPoolFile reinitializes on valid JSON that is not a pool array', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		await writeFile(poolPath, 'null');
+
+		const pool = await readPoolFile(poolPath);
+
+		ok(Array.isArray(pool));
+		ok(pool.every((slot) => slot === null));
+	});
+});
+
+test('readPoolFile still rethrows errors unrelated to a missing/corrupt file', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		const m = mock.module('node:fs/promises', {
+			// @types/node 22.0.0 only knows `namedExports`; `exports` isn't in its types yet.
+			namedExports: {
+				...fsPromises,
+				readFile: async () => {
+					const error = new Error('simulated EACCES') as NodeJS.ErrnoException;
+					error.code = 'EACCES';
+					throw error;
+				},
+			},
+		});
+		try {
+			const { readPoolFile: freshReadPoolFile } = await import(`../src/loopbackAddressPool.ts?fresh=${Date.now()}`);
+			await rejects(() => freshReadPoolFile(poolPath), /simulated EACCES/);
+		} finally {
+			m.restore();
+		}
+	});
+});
+
+test('writePoolFile round-trips through readPoolFile and leaves no leftover pending file', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		const pool = [null, 123, null, 456];
+
+		await writePoolFile(pool, poolPath);
+
+		deepStrictEqual(await readPoolFile(poolPath), pool);
+		deepStrictEqual(await readdir(dir), ['pool.json']);
+	});
+});
+
+test('writePoolFile never leaves a partially-written file visible at the pool path', async () => {
+	await withTempDir(async (dir) => {
+		const poolPath = join(dir, 'pool.json');
+		const original = [null, null, null];
+		await writeFile(poolPath, JSON.stringify(original));
+
+		// Faults the publish step after the pending write already completed, proving poolPath
+		// itself is untouched. This exercises the catchable-error branch of cleanup, not immunity
+		// to an actual SIGKILL — a hard kill in this window bypasses catch/finally and does orphan
+		// the pending file (accepted gap: the pool has no reaper, unlike the instance registry).
+		const m = mock.module('node:fs/promises', {
+			namedExports: {
+				...fsPromises,
+				rename: async () => {
+					throw new Error('simulated rename failure');
+				},
+			},
+		});
+		try {
+			const { writePoolFile: freshWritePoolFile } = await import(`../src/loopbackAddressPool.ts?fresh=${Date.now()}`);
+			await rejects(() => freshWritePoolFile([1, 2, 3], poolPath), /simulated rename failure/);
+		} finally {
+			m.restore();
+		}
+
+		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), original);
+		deepStrictEqual(await readdir(dir), ['pool.json']);
+	});
 });
