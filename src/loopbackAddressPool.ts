@@ -170,8 +170,10 @@ async function withLock<T>(callback: () => Promise<T>): Promise<T> {
  * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
- * A missing, unparseable, or wrong-shaped file all reinitialize to an empty pool rather
- * than throw.
+ * A missing, unparseable, non-array, or empty file all reinitialize to an empty pool rather
+ * than throw. A non-empty array of any other length is trusted as-is, even if it doesn't
+ * match this process's configured count: two processes configured with different counts
+ * sharing this file would otherwise perpetually reinitialize each other's out of it.
  *
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
  * @returns The loopback pool array
@@ -180,11 +182,6 @@ export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH)
 	try {
 		const content = await readFile(poolPath, 'utf-8');
 		const parsed: unknown = JSON.parse(content);
-		// An empty array has no free slots to find, so the caller would spin forever with no
-		// diagnostic instead of reinitializing; anything longer is left alone even if it doesn't
-		// match this process's configured count (see writePoolFile: a differently-configured
-		// concurrent process legitimately produces one, and treating that as corrupt too makes
-		// the two processes reinitialize each other's file back and forth).
 		if (!Array.isArray(parsed) || parsed.length === 0) {
 			throw new SyntaxError(`pool file did not contain a non-empty JSON array (got ${typeof parsed})`);
 		}

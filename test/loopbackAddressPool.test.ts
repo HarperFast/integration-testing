@@ -6,6 +6,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readPoolFile, writePoolFile } from '../src/loopbackAddressPool.ts';
 
+let freshImportCounter = 0;
+/** A cache-busting suffix that's monotonic, unlike Date.now() (can collide within a millisecond). */
+function freshModuleUrl(): string {
+	return `../src/loopbackAddressPool.ts?fresh=${++freshImportCounter}`;
+}
+
 async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
 	const dir = await mkdtemp(join(tmpdir(), 'loopback-pool-test-'));
 	try {
@@ -67,7 +73,7 @@ test('readPoolFile still rethrows errors unrelated to a missing/corrupt file', a
 			},
 		});
 		try {
-			const { readPoolFile: freshReadPoolFile } = await import(`../src/loopbackAddressPool.ts?fresh=${Date.now()}`);
+			const { readPoolFile: freshReadPoolFile } = await import(freshModuleUrl());
 			await rejects(() => freshReadPoolFile(poolPath), /simulated EACCES/);
 		} finally {
 			m.restore();
@@ -104,7 +110,7 @@ test('writePoolFile never leaves a partially-written file visible at the pool pa
 			},
 		});
 		try {
-			const { writePoolFile: freshWritePoolFile } = await import(`../src/loopbackAddressPool.ts?fresh=${Date.now()}`);
+			const { writePoolFile: freshWritePoolFile } = await import(freshModuleUrl());
 			await rejects(() => freshWritePoolFile([1, 2, 3], poolPath), /simulated rename failure/);
 		} finally {
 			m.restore();
