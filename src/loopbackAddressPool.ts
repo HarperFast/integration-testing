@@ -1,7 +1,8 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 
 // Configuration constants
@@ -169,31 +170,56 @@ async function withLock<T>(callback: () => Promise<T>): Promise<T> {
  * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
- * If the file doesn't exist, creates and returns a new empty pool with all addresses
- * marked as available (null).
+ * A missing, unparseable, or wrong-shaped file all reinitialize to an empty pool rather
+ * than throw.
  *
+ * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
  * @returns The loopback pool array
  */
-async function readPoolFile(): Promise<LoopbackPool> {
+export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH): Promise<LoopbackPool> {
 	try {
-		const content = await readFile(HARPER_LOOPBACK_POOL_PATH, 'utf-8');
-		return JSON.parse(content) as LoopbackPool;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-			// If the pool file doesn't exist yet, create it with null entries
-			return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
+		const content = await readFile(poolPath, 'utf-8');
+		const parsed: unknown = JSON.parse(content);
+		if (!Array.isArray(parsed)) {
+			throw new SyntaxError(`pool file did not contain a JSON array (got ${typeof parsed})`);
 		}
-		throw error;
+		return parsed as LoopbackPool;
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			console.warn(`[loopback-pool] ${poolPath} is corrupt; reinitializing. ${error.message}`);
+		} else if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw error;
+		}
+		return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
 	}
 }
+
+let pendingWriteCounter = 0;
 
 /**
  * Writes the loopback pool to the pool file as JSON.
  *
+ * Publishes by write-to-temp-then-rename, so readers only ever see the old complete file or
+ * the new complete file. The pending name must be unpredictable, not just unique — a fixed
+ * or guessable one could be pre-planted as a symlink.
+ *
  * @param pool The loopback pool array to persist
+ * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
  */
-async function writePoolFile(pool: LoopbackPool): Promise<void> {
-	await writeFile(HARPER_LOOPBACK_POOL_PATH, JSON.stringify(pool));
+export async function writePoolFile(pool: LoopbackPool, poolPath: string = HARPER_LOOPBACK_POOL_PATH): Promise<void> {
+	const pendingPath = `${poolPath}.${process.pid}.${++pendingWriteCounter}.${randomBytes(8).toString('hex')}.pending`;
+	try {
+		const pendingFileHandle = await open(pendingPath, 'wx');
+		try {
+			await pendingFileHandle.writeFile(JSON.stringify(pool));
+		} finally {
+			await pendingFileHandle.close();
+		}
+		await rename(pendingPath, poolPath);
+	} catch (error) {
+		await unlink(pendingPath).catch(() => {});
+		throw error;
+	}
 }
 
 /**
