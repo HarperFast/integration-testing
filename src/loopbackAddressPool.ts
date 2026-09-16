@@ -161,9 +161,7 @@ async function releaseLock(token: string): Promise<void> {
 		if ((await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8')) === token) {
 			await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
 		}
-	} catch {
-		// Ignore errors if lock file is already gone
-	}
+	} catch {}
 }
 
 async function assertLockHeld(token: string): Promise<void> {
@@ -195,16 +193,14 @@ export async function sweepStalePendingPoolFiles(
 		try {
 			const pendingStat = await lstat(pendingPath);
 			if (now - pendingStat.mtimeMs > PENDING_FILE_STALE_TIMEOUT_MS) await unlink(pendingPath);
-		} catch {
-			// Cleanup is best-effort; a concurrent removal or foreign file must not fail allocation.
-		}
+		} catch {}
 	}
 }
 
 /**
- * Executes a callback function while holding the lock. Automatically acquires
- * and releases the lock, ensuring the lock is always released even if the callback
- * throws an error.
+ * Executes a callback while holding the lock and releases only the lock this call acquired.
+ * A section superseded before publication is rerun from fresh pool state so teardown callers
+ * do not inherit a transient lost-lock failure.
  *
  * @param callback The async function to execute while holding the lock
  * @returns The result of the callback function
