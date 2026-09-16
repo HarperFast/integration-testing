@@ -157,6 +157,37 @@ test('a superseded holder does not unlink the replacement lock', async () => {
 	}
 });
 
+test('a failed token write does not leave an empty lock file', async () => {
+	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-write-failure-'));
+	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
+	const previousTmpEnv = new Map(['TMPDIR', 'TMP', 'TEMP'].map((name) => [name, process.env[name]]));
+	for (const name of previousTmpEnv.keys()) process.env[name] = isolatedTmpDir;
+	const fsMock = mock.module('node:fs/promises', {
+		namedExports: {
+			...fsPromises,
+			open: async (path: string, flags: string) => {
+				const fileHandle = await fsPromises.open(path, flags);
+				if (path !== lockPath) return fileHandle;
+				return {
+					close: () => fileHandle.close(),
+					writeFile: async () => {
+						throw new Error('simulated token write failure');
+					},
+				};
+			},
+		},
+	});
+	try {
+		const { withLock } = await import(freshModuleUrl());
+		await rejects(withLock(async () => {}), /simulated token write failure/);
+		await rejects(readFile(lockPath), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+	} finally {
+		fsMock.restore();
+		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
+		await rm(isolatedTmpDir, { recursive: true, force: true });
+	}
+});
+
 test('pending-file cleanup removes only old pool pending files', async () => {
 	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-pending-sweep-'));
 	const poolPath = join(isolatedTmpDir, 'pool.json');

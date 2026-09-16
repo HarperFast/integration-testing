@@ -125,9 +125,12 @@ async function acquireLock(): Promise<{ token: string; reclaimedStaleLock: boole
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
 			try {
 				await lockFileHandle.writeFile(token);
-			} finally {
-				await lockFileHandle.close();
+			} catch (error) {
+				await lockFileHandle.close().catch(() => {});
+				await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH).catch(() => {});
+				throw error;
 			}
+			await lockFileHandle.close();
 			return { token, reclaimedStaleLock };
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
