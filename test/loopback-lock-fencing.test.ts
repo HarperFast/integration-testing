@@ -2,7 +2,7 @@ import test, { mock } from 'node:test';
 import { deepStrictEqual, notStrictEqual, rejects, strictEqual } from 'node:assert';
 import { EventEmitter } from 'node:events';
 import * as fsPromises from 'node:fs/promises';
-import { mkdtemp, readdir, readFile, rm, unlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -114,6 +114,8 @@ test('a writer superseded after reading cannot erase the successor claim', async
 		const successorAddress = await getNextAvailableLoopbackAddress();
 		strictEqual(successorAddress, '127.0.0.3');
 		await rejects(readFile(orphanedPendingPath), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+		await writeFile(lockPath, 'replacement-holder');
+		await utimes(lockPath, staleTime, staleTime);
 		resumeStaleWriter.resolve();
 
 		const staleWriterAddress = await staleWriter;
@@ -179,7 +181,6 @@ test('pending-file cleanup removes only old pool pending files', async () => {
 			[freshPending, unrelatedPending].map((path) => basename(path)).sort()
 		);
 	} finally {
-		await unlink(oldPending).catch(() => {});
 		await rm(isolatedTmpDir, { recursive: true, force: true });
 	}
 });
