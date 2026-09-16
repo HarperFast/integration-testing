@@ -1,7 +1,8 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { lstat, open, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { findAcceptingPort } from './portUtils.ts';
 
@@ -28,6 +29,9 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
+const PENDING_FILE_STALE_TIMEOUT_MS = LOCK_STALE_TIMEOUT_MS;
+
+let lockTokenCounter = 0;
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
 // Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
@@ -133,6 +137,13 @@ async function releaseRefusedAddress(address: string): Promise<void> {
 	}
 }
 
+class LockOwnershipLostError extends Error {
+	constructor(cause?: unknown) {
+		super('Loopback address pool lock ownership was lost before publishing', { cause });
+		this.name = 'LockOwnershipLostError';
+	}
+}
+
 /**
  * Acquires a file-based lock by creating the lock file. This enables safe concurrent
  * access to the loopback pool across multiple test processes.
@@ -141,16 +152,21 @@ async function releaseRefusedAddress(address: string): Promise<void> {
  * a simple but effective cross-process mutex. Handles stale locks by removing lock files
  * older than LOCK_STALE_TIMEOUT_MS (10 seconds).
  *
- * @returns A promise that resolves when the lock is acquired
+ * @returns The token that identifies this lock acquisition and whether it reclaimed a stale lock
  */
-async function acquireLock(): Promise<void> {
+async function acquireLock(): Promise<{ token: string; reclaimedStaleLock: boolean }> {
+	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
+	let reclaimedStaleLock = false;
 	while (true) {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
-			// We have the lock - close the handle as we don't intend to write to it
-			await lockFileHandle.close();
-			return;
+			try {
+				await lockFileHandle.writeFile(token);
+			} finally {
+				await lockFileHandle.close();
+			}
+			return { token, reclaimedStaleLock };
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
 			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -159,6 +175,7 @@ async function acquireLock(): Promise<void> {
 					// If the lock file is older than the timeout, consider it stale and remove it
 					if (Date.now() - lockFileStat.mtimeMs > LOCK_STALE_TIMEOUT_MS) {
 						await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
+						reclaimedStaleLock = true;
 					}
 				} catch {
 					// Lock file may have been removed by another process, continue
@@ -175,13 +192,50 @@ async function acquireLock(): Promise<void> {
 }
 
 /**
- * Releases the file-based lock by deleting the lock file.
+ * Releases the file-based lock if it still belongs to this acquisition.
  */
-async function releaseLock(): Promise<void> {
+async function releaseLock(token: string): Promise<void> {
 	try {
-		await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
+		if ((await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8')) === token) {
+			await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
+		}
 	} catch {
 		// Ignore errors if lock file is already gone
+	}
+}
+
+async function assertLockHeld(token: string): Promise<void> {
+	let currentToken: string;
+	try {
+		currentToken = await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new LockOwnershipLostError(error);
+		throw error;
+	}
+	if (currentToken !== token) throw new LockOwnershipLostError();
+}
+
+export async function sweepStalePendingPoolFiles(
+	poolPath: string = HARPER_LOOPBACK_POOL_PATH,
+	now: number = Date.now()
+): Promise<void> {
+	let fileNames: string[];
+	try {
+		fileNames = await readdir(dirname(poolPath));
+	} catch {
+		return;
+	}
+	const pendingPrefix = `${basename(poolPath)}.`;
+	for (const fileName of fileNames) {
+		if (!fileName.startsWith(pendingPrefix)) continue;
+		if (!/^\d+\.\d+\.[0-9a-f]+\.pending$/.test(fileName.slice(pendingPrefix.length))) continue;
+		const pendingPath = join(dirname(poolPath), fileName);
+		try {
+			const pendingStat = await lstat(pendingPath);
+			if (now - pendingStat.mtimeMs > PENDING_FILE_STALE_TIMEOUT_MS) await unlink(pendingPath);
+		} catch {
+			// Cleanup is best-effort; a concurrent removal or foreign file must not fail allocation.
+		}
 	}
 }
 
@@ -193,12 +247,17 @@ async function releaseLock(): Promise<void> {
  * @param callback The async function to execute while holding the lock
  * @returns The result of the callback function
  */
-async function withLock<T>(callback: () => Promise<T>): Promise<T> {
-	await acquireLock();
-	try {
-		return await callback();
-	} finally {
-		await releaseLock();
+export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
+	while (true) {
+		const { token, reclaimedStaleLock } = await acquireLock();
+		try {
+			if (reclaimedStaleLock) await sweepStalePendingPoolFiles();
+			return await callback(token);
+		} catch (error) {
+			if (!(error instanceof LockOwnershipLostError)) throw error;
+		} finally {
+			await releaseLock(token);
+		}
 	}
 }
 
@@ -230,7 +289,8 @@ async function readPoolFile(): Promise<LoopbackPool> {
  *
  * @param pool The loopback pool array to persist
  */
-async function writePoolFile(pool: LoopbackPool): Promise<void> {
+async function writePoolFile(pool: LoopbackPool, lockToken: string): Promise<void> {
+	await assertLockHeld(lockToken);
 	await writeFile(HARPER_LOOPBACK_POOL_PATH, JSON.stringify(pool));
 }
 
@@ -427,7 +487,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
 	while (true) {
-		const assignedIndex = await withLock(async () => {
+		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile();
 
@@ -448,7 +508,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				loopbackPool[index] = process.pid;
 			}
 			// Write the updated pool back to the file
-			await writePoolFile(loopbackPool);
+			await writePoolFile(loopbackPool, lockToken);
 
 			return index;
 		});
@@ -555,7 +615,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);
 
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 
@@ -563,7 +623,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 		loopbackPool[index] = null;
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		await writePoolFile(loopbackPool, lockToken);
 	});
 }
 
@@ -572,7 +632,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
  * Useful for cleanup during graceful shutdown.
  */
 export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<void> {
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 
@@ -584,6 +644,6 @@ export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<vo
 		}
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		await writePoolFile(loopbackPool, lockToken);
 	});
 }
