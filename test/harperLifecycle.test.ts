@@ -141,19 +141,22 @@ if (replacedPid) {
   serve();
   process.stdin.on('data', (chunk) => {
     if (!String(chunk).includes('restart')) return;
-    rmSync(pidFile, { force: true });
-    process.stdout.write('successfully started\\n');
-    spawn(process.execPath, [__filename], {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
-    }).unref();
-    // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
-    setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
+    // Harper's restart, too, waits 50ms before it begins.
+    setTimeout(() => {
+      rmSync(pidFile, { force: true });
+      process.stdout.write('successfully started\\n');
+      spawn(process.execPath, [__filename], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
+      }).unref();
+      // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
+      setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
+    }, 50);
   });
   process.stdout.write('successfully started\\n');
   // What Harper's logger adds right after readiness when \`logging.stdStreams\` is on.
-  if (process.env.HARPER_FAKE_BOOT_NOTIFY === '1') setTimeout(() => process.stdout.write('Harper successfully started.\\n'), 50);
+  if (process.env.HARPER_FAKE_BOOT_NOTIFY === '1') setTimeout(() => process.stdout.write('Harper successfully started.\\n'), 10);
 }
 `,
 	'orphan-runner.mjs': `
@@ -1207,7 +1210,8 @@ test('killHarper waits for a replacement that has not yet recorded its pid', asy
 		await restartFakeHarper(node);
 		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'the test must run inside the handoff gap');
 
-		// An un-awaited killHarper followed by teardown's: neither may return before the replacement is gone.
+		// Two overlapping calls, as from an un-awaited killHarper and a teardown hook: neither may
+		// return before the replacement is gone.
 		const firstCall = killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
 		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
 
@@ -1232,7 +1236,7 @@ test('killHarper escalates to SIGKILL on a relaunched Harper and clears the pid 
 		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone after SIGKILL`);
 		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'SIGKILL leaves hdb.pid behind; killHarper must remove it');
 
-		// teardownHarper after killHarper: must neither signal anything nor wait out the handoff window again.
+		// A second call, as teardownHarper makes after killHarper, must neither signal anything nor wait again.
 		const secondStart = Date.now();
 		await killHarper(node.ctx, { graceMs: 200 });
 		ok(Date.now() - secondStart < 1000, 'a second call should return immediately');
@@ -1290,14 +1294,26 @@ test('killHarper does not wait for a relaunch after a clean stop that announced 
 	}
 });
 
+test('a readiness line Harper logs at boot is not taken for a restart', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY: '1' });
+		await sleep(200);
+
+		const start = Date.now();
+		await teardownHarper(node.ctx);
+		ok(Date.now() - start < 1000, 'teardown must not wait for a relaunch that never happened');
+		strictEqual(existsSync(node.dataRootDir), false, 'teardown should have removed the install directory');
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
 test('a readiness line logged at boot does not hide a later restart', async () => {
-	const previousWait = process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS;
-	process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS = '1000';
 	let node: FakeHarperNode | undefined;
 	try {
 		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY: '1', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
-		// Let the boot-time report's own relaunch window lapse before the real restart.
-		await sleep(1200);
+		await sleep(200);
 		await restartFakeHarper(node);
 
 		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
@@ -1305,7 +1321,6 @@ test('a readiness line logged at boot does not hide a later restart', async () =
 		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
 		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
 	} finally {
-		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
 		await cleanupFakeHarperNode(node);
 	}
 });
@@ -1318,6 +1333,7 @@ test('teardownHarper keeps the data root when an announced replacement never rec
 		node = await startRestartableFakeHarper({ HARPER_FAKE_RELAUNCH_DELAY_MS: '3000' });
 		await restartFakeHarper(node);
 
+		await killHarper(node.ctx);
 		await teardownHarper(node.ctx);
 
 		ok(existsSync(node.dataRootDir), 'teardown must not delete the root under a replacement that may still come up');
