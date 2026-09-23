@@ -98,8 +98,8 @@ export const DEFAULT_TEARDOWN_GRACE_MS = parseInt(process.env.HARPER_INTEGRATION
  * Time teardown's safety assertion waits for Harper's fixed ports to be free before recycling the
  * loopback address. Killing Harper's process tree (and waiting for exit) should free them
  * immediately, so this normally returns on the first check; it only matters if a child process
- * escaped the kill. If the ports are still in use at the deadline, the address is recycled anyway
- * (no worse than not waiting) and a warning is logged.
+ * escaped the kill. If the ports are still in use at the deadline, a warning is logged and the address
+ * is not recycled.
  *
  * Override with `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS`. Default 5s.
  */
@@ -108,19 +108,16 @@ export const DEFAULT_PORT_RELEASE_TIMEOUT_MS = parseInt(process.env.HARPER_INTEG
 /** Short backstop wait for the process 'exit' event after sending SIGKILL during teardown. */
 const SIGKILL_EXIT_WAIT_MS = 1000;
 
-/** Where Harper's main process records its pid, relative to its root path — the identity `harper stop` uses. */
+/** Harper's own record of which process runs the node, relative to its root path; `harper stop` reads it too. */
 const HARPER_PID_FILE = 'hdb.pid';
 
 /**
- * How long after Harper exits cleanly on its own teardown still watches for the process a `restart`
- * relaunched it as. The replacement records its pid only after its predecessor has exited and it has
- * finished loading (~0.5s measured on an idle machine), so a teardown inside that window would
- * otherwise find no pid file and leave it running. Not scaled for CI: a node that exited without
- * relaunching, or whose replacement was already stopped, pays this on teardown.
+ * How long after Harper announces a relaunch teardown waits for the replacement to record its pid. The
+ * replacement does that only once its predecessor has exited and it has finished loading (~0.5s on an
+ * idle machine), so a teardown inside that window would otherwise find no pid file.
  */
-const RELAUNCH_PID_WAIT_MS = 5000;
+const RELAUNCH_PID_WAIT_MS = IS_CI ? 15000 : 5000;
 
-/** Poll interval while waiting on a process that is not our child, which emits no 'exit' event. */
 const PROCESS_POLL_MS = 50;
 
 /**
@@ -447,6 +444,7 @@ export function runHarperCommand({
 	return new Promise((resolve, reject) => {
 		let stdout = '';
 		let stderr = '';
+		let postReadinessTail = '';
 		let settled = false;
 		let readinessDetected = false;
 		let idleTimer: NodeJS.Timeout;
@@ -510,7 +508,16 @@ export function runHarperCommand({
 			// Once ready, keep streaming logs to disk but stop the watchdog and capture: the
 			// returned startupOutput is a snapshot taken at readiness, and the server may run
 			// (and log) for the rest of the suite.
-			if (startupFinished()) return;
+			if (startupFinished()) {
+				// Harper's `restart` goes back through its startup path, reporting ready again just
+				// before it hands the node to a detached replacement and exits.
+				if (completionMessage && readinessDetected && !relaunchAnnouncements.has(proc)) {
+					const recentOutput = postReadinessTail + dataString;
+					if (recentOutput.includes(completionMessage)) relaunchAnnouncements.set(proc, Date.now());
+					else postReadinessTail = recentOutput.slice(-(completionMessage.length - 1));
+				}
+				return;
+			}
 			resetIdleTimer();
 			stdout += dataString;
 			// Match against the accumulated output, not just this chunk, so a marker split across
@@ -753,11 +760,11 @@ interface TrackedHarperProcess {
 const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
-/**
- * Deadline until which `killHarper` looks for a relaunched replacement, per spawned process that exited
- * cleanly on its own. A clean exit is what Harper's `restart` looks like from here.
- */
-const relaunchDeadlines = new WeakMap<ChildProcess, number>();
+/** When each spawned Harper announced it was relaunching itself as a new process. */
+const relaunchAnnouncements = new WeakMap<ChildProcess, number>();
+
+/** Shared so that a concurrent `killHarper` on the same node cannot return before the first finishes. */
+const relaunchKills = new WeakMap<ChildProcess, Promise<void>>();
 
 function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: string): TrackedHarperProcess {
 	liveHarperProcesses.add(proc);
@@ -772,10 +779,7 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 
 	// Only the direct child is untracked here; its registry record covers the group, which can
 	// outlive it, and the monitor owns removing that.
-	proc.once('exit', (code) => {
-		liveHarperProcesses.delete(proc);
-		if (code === 0) relaunchDeadlines.set(proc, Date.now() + RELAUNCH_PID_WAIT_MS);
-	});
+	proc.once('exit', () => liveHarperProcesses.delete(proc));
 
 	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
@@ -860,11 +864,17 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 	const proc = ctx.harper?.process;
 	if (!proc) return;
 	const graceMs = options?.graceMs ?? DEFAULT_TEARDOWN_GRACE_MS;
-	if (proc.exitCode !== null || proc.signalCode !== null) {
-		if (ctx.harper.dataRootDir) await killRelaunchedHarper(proc, ctx.harper.dataRootDir, graceMs);
-		return;
+	if (proc.exitCode === null && proc.signalCode === null) await killSpawnedHarper(proc, graceMs);
+	if (!ctx.harper.dataRootDir) return;
+	let relaunchKill = relaunchKills.get(proc);
+	if (!relaunchKill) {
+		relaunchKill = killRelaunchedHarper(proc, ctx.harper.dataRootDir, graceMs).finally(() => relaunchKills.delete(proc));
+		relaunchKills.set(proc, relaunchKill);
 	}
+	await relaunchKill;
+}
 
+async function killSpawnedHarper(proc: ChildProcess, graceMs: number): Promise<void> {
 	await new Promise<void>((resolve) => {
 		let done = false;
 		let sigkillTimer: NodeJS.Timeout;
@@ -873,8 +883,6 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 		const finish = () => {
 			if (done) return;
 			done = true;
-			// Our SIGTERM caused this exit, not a `restart`, so there is no relaunch to look for.
-			relaunchDeadlines.delete(proc);
 			proc.off('exit', finish);
 			clearTimeout(sigkillTimer);
 			clearTimeout(backstopTimer);
@@ -900,17 +908,19 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
  *
  * Harper's `restart` forks a detached replacement and exits 0; the replacement writes its pid to
  * `hdb.pid` only once its predecessor is gone. So the node now runs as whatever that file names, and
- * shortly after a clean exit the file may not exist yet.
+ * shortly after the relaunch the file may not exist yet.
  */
 async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, graceMs: number): Promise<void> {
-	const relaunchDeadline = relaunchDeadlines.get(proc) ?? 0;
-	// Only the first call after the exit waits for the relaunch; a later teardown must not wait again.
-	relaunchDeadlines.delete(proc);
 	let pid = await readHarperPid(dataRootDir);
+	// Read after the await above, which lets stdout that arrived alongside the exit be processed first.
+	const announcedAt = relaunchAnnouncements.get(proc);
+	const relaunchDeadline = announcedAt === undefined ? 0 : announcedAt + RELAUNCH_PID_WAIT_MS;
 	while (pid === undefined && Date.now() < relaunchDeadline) {
 		await sleep(PROCESS_POLL_MS);
 		pid = await readHarperPid(dataRootDir);
 	}
+	// Once one call has waited, a later teardown must not wait again.
+	relaunchAnnouncements.delete(proc);
 	// A stale file can still name the spawned process, whose pid may since have been reused.
 	if (pid === undefined || pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) return;
 
@@ -1001,8 +1011,7 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 	// listening sockets, so the fixed ports should already be free here. We still verify before
 	// recycling the address (the pool only guarantees the *address* is bindable, not that these
 	// specific ports are free) and warn if anything is somehow still holding them — that warning
-	// is a signal that a Harper child process escaped the tree kill, not normal operation. The
-	// address is recycled regardless.
+	// is a signal that a Harper child process escaped the tree kill, not normal operation.
 	if (ctx.harper.hostname) {
 		const portsFreed = await waitForPortsFree(ctx.harper.hostname, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS);
 		if (portsFreed) {
