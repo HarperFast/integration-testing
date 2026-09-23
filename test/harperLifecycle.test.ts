@@ -13,6 +13,7 @@ import {
 	teardownHarper,
 	markHarperNode,
 	publishHarperNode,
+	readHarperPid,
 	setupHarperWithFixture,
 	startHarper,
 	runHarperCommand,
@@ -101,6 +102,53 @@ process.stdout.write('writer-ready\\n');
 for (;;) {
   await writeRegistryFile(padded);
   await writeRegistryFile(small);
+}
+`,
+	// Mirrors the handoff of Harper's `restart`: on a 'restart' line it removes hdb.pid, launches a detached
+	// replacement and exits 0; the replacement waits for its predecessor to exit, then records its pid.
+	'restartable.cjs': `
+const { spawn } = require('node:child_process');
+const { writeFileSync, rmSync } = require('node:fs');
+const { join } = require('node:path');
+const root = process.env.HARPER_FAKE_ROOT;
+const pidFile = join(root, 'hdb.pid');
+const replacedPid = Number(process.env.HARPER_PARENT_PROCESS_PID || 0);
+function serve() {
+  if (replacedPid && process.env.HARPER_FAKE_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
+  else process.on('SIGTERM', () => { rmSync(pidFile, { force: true }); process.exit(0); });
+  if (replacedPid && process.env.HARPER_FAKE_DESCENDANT) {
+    const script = process.env.HARPER_FAKE_DESCENDANT === 'ignore-term'
+      ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
+      : 'setInterval(() => {}, 1000)';
+    const descendant = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+    writeFileSync(join(root, 'descendant.pid'), String(descendant.pid));
+  }
+  writeFileSync(pidFile, String(process.pid));
+  setInterval(() => {}, 1000);
+}
+if (replacedPid) {
+  writeFileSync(join(root, 'replacement.pid'), String(process.pid));
+  const waitForReplaced = setInterval(() => {
+    try {
+      process.kill(replacedPid, 0);
+    } catch {
+      clearInterval(waitForReplaced);
+      setTimeout(serve, Number(process.env.HARPER_FAKE_RELAUNCH_DELAY_MS || 0));
+    }
+  }, 20);
+} else {
+  serve();
+  process.stdin.on('data', (chunk) => {
+    if (!String(chunk).includes('restart')) return;
+    rmSync(pidFile, { force: true });
+    spawn(process.execPath, [__filename], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
+    }).unref();
+    process.exit(0);
+  });
+  process.stdout.write('successfully started\\n');
 }
 `,
 	'orphan-runner.mjs': `
@@ -1063,6 +1111,181 @@ test('killHarper returns immediately for an already-exited process', async () =>
 	// Generous ceiling, far under the 5s grace: proves it took the already-exited fast path rather
 	// than waiting out the grace, while leaving plenty of headroom for a contended-CI stall.
 	ok(Date.now() - start < 1000, 'should not wait the grace period for an already-dead process');
+});
+
+// --- Teardown after Harper's own `restart` ---
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function readPidFile(path: string, timeoutMs = 5000): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			const pid = Number((await readFile(path, 'utf-8')).trim());
+			if (pid > 0) return pid;
+		} catch {
+			// Not written yet.
+		}
+		if (Date.now() >= deadline) throw new Error(`${path} was not written within ${timeoutMs}ms`);
+		await sleep(20);
+	}
+}
+
+interface FakeHarperNode {
+	ctx: StartedHarperTestContext;
+	dataRootDir: string;
+	spawnedPid: number;
+}
+
+/** Starts the restartable fake the way startHarper does (through runHarperCommand), with a data root of its own. */
+async function startRestartableFakeHarper(env: Record<string, string> = {}): Promise<FakeHarperNode> {
+	const dataRootDir = mkdtempSync(join(tmpdir(), 'harper-it-relaunch-'));
+	const result = await runHarperCommand({
+		args: [],
+		env: { HARPER_FAKE_ROOT: dataRootDir, ...env },
+		completionMessage: 'successfully started',
+		harperBinPath: fixtures['restartable.cjs'],
+		timeoutMs: 5000,
+		maxMs: 10000,
+	});
+	const ctx = { harper: markHarperNode({ process: result.process, dataRootDir }) } as unknown as StartedHarperTestContext;
+	return { ctx, dataRootDir, spawnedPid: result.process.pid! };
+}
+
+/** Sends the fake its `restart` and resolves once the spawned process has exited, as Harper's does. */
+async function restartFakeHarper(node: FakeHarperNode): Promise<void> {
+	const exited = once(node.ctx.harper.process, 'exit');
+	node.ctx.harper.process.stdin!.write('restart\n');
+	await exited;
+}
+
+async function cleanupFakeHarperNode(node: FakeHarperNode | undefined): Promise<void> {
+	if (!node) return;
+	for (const name of ['replacement.pid', 'descendant.pid']) {
+		const pid = Number(await readFile(join(node.dataRootDir, name), 'utf-8').catch(() => ''));
+		if (pid > 0) forceKill(pid);
+	}
+	rmSync(node.dataRootDir, { recursive: true, force: true });
+}
+
+test('killHarper terminates the process Harper relaunched itself as, with its tree', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_DESCENDANT: '1' });
+		await restartFakeHarper(node);
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		strictEqual(await readPidFile(join(node.dataRootDir, 'hdb.pid')), replacementPid, 'the replacement should own hdb.pid');
+		const descendantPid = await readPidFile(join(node.dataRootDir, 'descendant.pid'));
+		ok(isAlive(replacementPid), 'the replacement should be running before killHarper');
+
+		// Windows gets a short grace: its SIGTERM-equivalent does not stop a background node process.
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+		ok(await waitProcessGone(descendantPid, 2000), `its descendant ${descendantPid} should have been killed with it`);
+		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'no pid file should name the dead replacement');
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper waits for a replacement that has not yet recorded its pid', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		// Harper's replacement writes hdb.pid ~0.5s after its predecessor exits; tear down inside that gap.
+		node = await startRestartableFakeHarper({ HARPER_FAKE_RELAUNCH_DELAY_MS: '500' });
+		await restartFakeHarper(node);
+		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'the test must run inside the handoff gap');
+
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper escalates to SIGKILL on a relaunched Harper and clears the pid file it leaves', { skip: !isPosix }, async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_IGNORE_TERM: '1' });
+		await restartFakeHarper(node);
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'hdb.pid'));
+
+		const start = Date.now();
+		await killHarper(node.ctx, { graceMs: 200 });
+		ok(Date.now() - start >= 150, 'should wait the grace period before escalating to SIGKILL');
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone after SIGKILL`);
+		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'SIGKILL leaves hdb.pid behind; killHarper must remove it');
+
+		// teardownHarper after killHarper: must neither signal anything nor wait out the handoff window again.
+		const secondStart = Date.now();
+		await killHarper(node.ctx, { graceMs: 200 });
+		ok(Date.now() - secondStart < 1000, 'a second call should return immediately');
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper waits for the relaunched process group, not just its leader', { skip: !isPosix }, async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_DESCENDANT: 'ignore-term' });
+		await restartFakeHarper(node);
+		await readPidFile(join(node.dataRootDir, 'hdb.pid'));
+		const descendantPid = await readPidFile(join(node.dataRootDir, 'descendant.pid'));
+
+		// The leader exits on SIGTERM; its descendant ignores it and keeps the group alive.
+		await killHarper(node.ctx, { graceMs: 200 });
+		ok(!isAlive(descendantPid), `descendant ${descendantPid} should be SIGKILLed with the group before killHarper resolves`);
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper does not wait for a relaunch after a shutdown it caused itself', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper();
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+		// On POSIX the fake exits 0 from its SIGTERM handler, which is what a restart looks like too.
+		const start = Date.now();
+		await killHarper(node.ctx, { graceMs: 200 });
+		ok(Date.now() - start < 1000, 'the second call must not wait out the relaunch window');
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('readHarperPid accepts only a plain pid a group signal cannot widen', async () => {
+	const dataRootDir = mkdtempSync(join(tmpdir(), 'harper-it-pidfile-'));
+	try {
+		strictEqual(await readHarperPid(dataRootDir), undefined, 'a missing pid file means no process');
+		for (const [contents, expected] of [
+			['4242', 4242],
+			[' 4242\n', 4242],
+			['', undefined],
+			['0', undefined],
+			['1', undefined],
+			['-4242', undefined],
+			['4242abc', undefined],
+			['42.5', undefined],
+			['99999999999999999999', undefined],
+		] as const) {
+			await writeFileAsync(join(dataRootDir, 'hdb.pid'), contents);
+			strictEqual(await readHarperPid(dataRootDir), expected, `hdb.pid containing ${JSON.stringify(contents)}`);
+		}
+	} finally {
+		rmSync(dataRootDir, { recursive: true, force: true });
+	}
 });
 
 // Regression guard: the dataRootDir HOME isolation must take precedence over any caller-supplied env (or a
