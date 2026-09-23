@@ -145,14 +145,26 @@ if (replacedPid) {
     // Harper's restart, too, waits 50ms before it begins.
     setTimeout(() => {
       rmSync(pidFile, { force: true });
-      process.stdout.write(readinessLine);
-      spawn(process.execPath, [__filename], {
-        detached: true,
-        stdio: 'ignore',
-        env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
-      }).unref();
-      // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
-      setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
+      const relaunch = () => {
+        spawn(process.execPath, [__filename], {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
+        }).unref();
+        // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
+        setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
+      };
+      if (process.env.HARPER_FAKE_SPLIT_READINESS !== '1') {
+        process.stdout.write(readinessLine);
+        relaunch();
+        return;
+      }
+      // Two reads on the runner's side, so detection has to carry the line across chunks.
+      process.stdout.write(readinessLine.slice(0, 22));
+      setTimeout(() => {
+        process.stdout.write(readinessLine.slice(22));
+        relaunch();
+      }, 100);
     }, 50);
   });
   process.stdout.write(readinessLine);
@@ -1221,6 +1233,21 @@ test('killHarper waits for a replacement that has not yet recorded its pid', asy
 		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
 		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
 		await firstCall;
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('a relaunch readiness line split across reads is still recognized', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_SPLIT_READINESS: '1', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		await restartFakeHarper(node);
+
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
 	} finally {
 		await cleanupFakeHarperNode(node);
 	}
