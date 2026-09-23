@@ -127,7 +127,7 @@ Like `startHarper()`, but copies a component directory into the Harper install b
 
 Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
 
-It also stops a node that restarted itself. Harper's `restart` operation relaunches the node as a new, detached process and lets the one `startHarper` spawned exit, so once that process has exited `killHarper` terminates whichever process `<dataRootDir>/hdb.pid` names — the pid file `harper stop` uses — in the same SIGTERM, grace, SIGKILL sequence (on POSIX, waiting for its whole process group), and removes the pid file if the SIGKILL left it behind. The replacement records its pid only after its predecessor has exited, about half a second later on an idle machine. The spawned process reports ready on stdout a second time just before it relaunches, so after that report `killHarper` waits up to 5 seconds (15 under CI) from it for the pid file to appear. A node that stopped without relaunching reports nothing and pays no wait. Only the first relaunch is followed this way: when a replacement restarts again, wait for that restart to finish before tearing down.
+It also stops a node that restarted itself. Harper's `restart` operation relaunches the node as a new, detached process and lets the one `startHarper` spawned exit, so once that process has exited `killHarper` terminates whichever process `<dataRootDir>/hdb.pid` names — the pid file `harper stop` uses — in the same SIGTERM, grace, SIGKILL sequence (on POSIX, waiting for its whole process group), and removes the pid file if the SIGKILL left it behind. The replacement records its pid only after its predecessor has exited, about half a second later on an idle machine. The spawned process reports ready on stdout a second time just before it relaunches, so after that report `killHarper` waits up to 5 seconds (15 under CI, or `HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS`) from it for the pid file to appear. A node that stopped without relaunching reports nothing and pays no wait. Only the first relaunch is followed this way: when a replacement restarts again, wait for that restart to finish before tearing down.
 
 `options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
@@ -137,10 +137,13 @@ Kills Harper's process tree, releases the loopback address back to the pool, and
 
 Since `killHarper` waits for the process tree to exit, its fixed ports (Operations API, HTTP/S, MQTT/S) are already released by the time the address is recycled. As a safety assertion, teardown still verifies those ports are free before recycling — the pool only guarantees the *address* is bindable, not that these specific ports are free — and if any are still held (a sign a Harper process escaped the kill) it logs a warning and does not recycle the address: the slot stays parked until this process exits, so a later suite cannot co-bind the ports.
 
+If the kill itself could not be confirmed — Harper announced a relaunch but the replacement never recorded its pid, or a process outlived SIGKILL — teardown logs a warning and leaves both the install directory and the address in place rather than deleting the directory under a process that may still be running.
+
 **Environment Variables:**
 
 - `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS` - Grace period after SIGTERM before escalating to SIGKILL. Default `5000`.
 - `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS` - Max time teardown's safety assertion waits for Harper's ports to be free before recycling the loopback address (normally instant, since the process tree is already dead). Default `5000`.
+- `HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS` - After Harper announces a `restart` relaunch, how long `killHarper` waits for the replacement to record its pid. Default `5000` (`15000` under CI).
 
 ### `sendOperation(context, operation)`
 

@@ -152,6 +152,8 @@ if (replacedPid) {
     setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
   });
   process.stdout.write('successfully started\\n');
+  // What Harper's logger adds right after readiness when \`logging.stdStreams\` is on.
+  if (process.env.HARPER_FAKE_BOOT_NOTIFY === '1') setTimeout(() => process.stdout.write('Harper successfully started.\\n'), 50);
 }
 `,
 	'orphan-runner.mjs': `
@@ -1284,6 +1286,43 @@ test('killHarper does not wait for a relaunch after a clean stop that announced 
 		await killHarper(node.ctx, { graceMs: 200 });
 		ok(Date.now() - start < 1000, 'killHarper must not wait out the relaunch window');
 	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('a readiness line logged at boot does not hide a later restart', async () => {
+	const previousWait = process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS;
+	process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS = '1000';
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY: '1', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		// Let the boot-time report's own relaunch window lapse before the real restart.
+		await sleep(1200);
+		await restartFakeHarper(node);
+
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('teardownHarper keeps the data root when an announced replacement never records its pid', async () => {
+	const previousWait = process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS;
+	process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS = '300';
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_RELAUNCH_DELAY_MS: '3000' });
+		await restartFakeHarper(node);
+
+		await teardownHarper(node.ctx);
+
+		ok(existsSync(node.dataRootDir), 'teardown must not delete the root under a replacement that may still come up');
+	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
 		await cleanupFakeHarperNode(node);
 	}
 });
