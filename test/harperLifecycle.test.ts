@@ -114,6 +114,7 @@ const { join } = require('node:path');
 const root = process.env.HARPER_FAKE_ROOT;
 const pidFile = join(root, 'hdb.pid');
 const replacedPid = Number(process.env.HARPER_PARENT_PROCESS_PID || 0);
+const readinessLine = 'Harper 0.0.0-fake successfully started\\n';
 function serve() {
   if (replacedPid && process.env.HARPER_FAKE_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
   else process.on('SIGTERM', () => { rmSync(pidFile, { force: true }); process.exit(0); });
@@ -144,7 +145,7 @@ if (replacedPid) {
     // Harper's restart, too, waits 50ms before it begins.
     setTimeout(() => {
       rmSync(pidFile, { force: true });
-      process.stdout.write('successfully started\\n');
+      process.stdout.write(readinessLine);
       spawn(process.execPath, [__filename], {
         detached: true,
         stdio: 'ignore',
@@ -154,10 +155,10 @@ if (replacedPid) {
       setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
     }, 50);
   });
-  process.stdout.write('successfully started\\n');
-  // What Harper's logger adds right after readiness when \`logging.stdStreams\` is on.
+  process.stdout.write(readinessLine);
+  // What Harper's logger adds after readiness when \`logging.stdStreams\` is on.
   if (process.env.HARPER_FAKE_BOOT_NOTIFY_MS) {
-    setTimeout(() => process.stdout.write('Harper successfully started.\\n'), Number(process.env.HARPER_FAKE_BOOT_NOTIFY_MS));
+    setTimeout(() => process.stdout.write('[main/0] [notify]: Harper successfully started.\\n'), Number(process.env.HARPER_FAKE_BOOT_NOTIFY_MS));
   }
 }
 `,
@@ -1279,6 +1280,22 @@ test('killHarper follows a relaunch the spawned process announced before it was 
 	}
 });
 
+test('killHarper follows a relaunch whose predecessor is slow to exit', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		// Harper's replacement allows its predecessor 15s to exit, for RocksDB to finish closing.
+		node = await startRestartableFakeHarper({ HARPER_FAKE_LINGER_MS: '1500', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		await restartFakeHarper(node);
+
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
 test('killHarper does not wait for a relaunch after a clean stop that announced none', { skip: !isPosix }, async () => {
 	let node: FakeHarperNode | undefined;
 	try {
@@ -1296,33 +1313,27 @@ test('killHarper does not wait for a relaunch after a clean stop that announced 
 	}
 });
 
-for (const [label, notifyMs, stopAfterMs] of [
-	['right after boot', '10', 200],
-	// Past the boot settle window, as when a stalled runner reads the line late.
-	['late', '100', 1200],
-] as const) {
-	test(`a readiness line Harper logs at boot, delivered ${label}, is not taken for a restart`, async () => {
-		let node: FakeHarperNode | undefined;
-		try {
-			node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: notifyMs });
-			await sleep(stopAfterMs);
+test('the readiness line Harper logs at boot is not taken for a restart', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: '100' });
+		await sleep(300);
 
-			// Windows gets a short grace: its SIGTERM-equivalent does not stop a background node process.
-			const start = Date.now();
-			await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
-			ok(Date.now() - start < 3000, 'killHarper must not wait for a relaunch that never happened');
-			await teardownHarper(node.ctx);
-			strictEqual(existsSync(node.dataRootDir), false, 'teardown should have removed the install directory');
-		} finally {
-			await cleanupFakeHarperNode(node);
-		}
-	});
-}
+		// Windows gets a short grace: its SIGTERM-equivalent does not stop a background node process.
+		const start = Date.now();
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+		ok(Date.now() - start < 3000, 'killHarper must not wait for a relaunch that never happened');
+		await teardownHarper(node.ctx);
+		strictEqual(existsSync(node.dataRootDir), false, 'teardown should have removed the install directory');
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
 
 test('a readiness line logged at boot does not hide a later restart', async () => {
 	let node: FakeHarperNode | undefined;
 	try {
-		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: '10', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: '100', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
 		await sleep(200);
 		await restartFakeHarper(node);
 

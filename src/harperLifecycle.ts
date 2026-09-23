@@ -126,19 +126,6 @@ function getRelaunchPidWaitMs(): number {
 const PROCESS_POLL_MS = 50;
 
 /**
- * Readiness reports this soon after startup readiness belong to the boot itself: with
- * `logging.stdStreams` on, Harper's logger repeats the readiness line immediately. A restart cannot
- * report this soon, since Harper waits 50ms after the `restart` operation before it even begins.
- */
-const BOOT_REPORT_SETTLE_MS = 50;
-
-/**
- * Harper exits within milliseconds of announcing a relaunch (it forks the replacement and exits in one
- * synchronous step), so an announcement further than this from the exit was a late-delivered boot log.
- */
-const RELAUNCH_EXIT_WINDOW_MS = 1000;
-
-/**
  * The runtime to use for running Harper during tests.
  * Set via the HARPER_RUNTIME environment variable ('node' or 'bun').
  * Defaults to 'node'.
@@ -462,8 +449,8 @@ export function runHarperCommand({
 	return new Promise((resolve, reject) => {
 		let stdout = '';
 		let stderr = '';
+		let readinessLine = '';
 		let postReadinessTail = '';
-		let readyAt = 0;
 		let settled = false;
 		let readinessDetected = false;
 		let idleTimer: NodeJS.Timeout;
@@ -486,7 +473,10 @@ export function runHarperCommand({
 		const succeed = () => {
 			if (settled || readinessDetected) return;
 			readinessDetected = true;
-			readyAt = Date.now();
+			if (completionMessage) {
+				const markerStart = stdout.indexOf(completionMessage);
+				readinessLine = stdout.slice(stdout.lastIndexOf('\n', markerStart) + 1, markerStart + completionMessage.length);
+			}
 			// Left armed across registration, these would let registry-lock contention time out — and
 			// kill — an instance that already booted successfully.
 			clearTimers();
@@ -529,15 +519,14 @@ export function runHarperCommand({
 			// returned startupOutput is a snapshot taken at readiness, and the server may run
 			// (and log) for the rest of the suite.
 			if (startupFinished()) {
-				// Harper's `restart` goes back through its startup path, reporting ready again just
-				// before it hands the node to a detached replacement and exits.
-				if (completionMessage && readinessDetected) {
+				// Harper's `restart` goes back through its startup path, printing the readiness line again
+				// just before it hands the node to a detached replacement and exits. The whole line has to
+				// match: with `logging.stdStreams` on, Harper's logger also reports readiness at boot, in a
+				// line of its own.
+				if (readinessLine) {
 					const recentOutput = postReadinessTail + dataString;
-					const now = Date.now();
-					if (recentOutput.includes(completionMessage) && now - readyAt >= BOOT_REPORT_SETTLE_MS) {
-						relaunchAnnouncements.set(proc, now);
-					}
-					postReadinessTail = recentOutput.slice(-(completionMessage.length - 1));
+					if (recentOutput.includes(readinessLine)) relaunchAnnouncements.set(proc, Date.now());
+					postReadinessTail = recentOutput.slice(-(readinessLine.length - 1));
 				}
 				return;
 			}
@@ -813,7 +802,6 @@ const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
 const relaunchAnnouncements = new WeakMap<ChildProcess, number>();
-const spawnedExitTimes = new WeakMap<ChildProcess, number>();
 
 /** Shared so that a concurrent `killHarper` on the same node cannot return before the first finishes. */
 const relaunchKills = new WeakMap<ChildProcess, Promise<boolean>>();
@@ -831,10 +819,7 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 
 	// Only the direct child is untracked here; its registry record covers the group, which can
 	// outlive it, and the monitor owns removing that.
-	proc.once('exit', () => {
-		liveHarperProcesses.delete(proc);
-		spawnedExitTimes.set(proc, Date.now());
-	});
+	proc.once('exit', () => liveHarperProcesses.delete(proc));
 
 	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
@@ -978,16 +963,13 @@ async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, gra
 	let pid = await readHarperPid(dataRootDir);
 	// Read after the await above, which lets stdout that arrived alongside the exit be processed first.
 	const announcedAt = relaunchAnnouncements.get(proc);
-	const exitedAt = spawnedExitTimes.get(proc);
-	const relaunched =
-		announcedAt !== undefined && exitedAt !== undefined && exitedAt - announcedAt <= RELAUNCH_EXIT_WINDOW_MS;
-	const relaunchDeadline = relaunched ? announcedAt + getRelaunchPidWaitMs() : 0;
+	const relaunchDeadline = announcedAt === undefined ? 0 : announcedAt + getRelaunchPidWaitMs();
 	while (pid === undefined && Date.now() < relaunchDeadline) {
 		await sleep(PROCESS_POLL_MS);
 		pid = await readHarperPid(dataRootDir);
 	}
-	// A replacement that has not shown up yet may still come, for this call and any later one.
-	if (pid === undefined) return !relaunched;
+	// An announced replacement that has not shown up yet may still come, for this call and any later one.
+	if (pid === undefined) return announcedAt === undefined;
 	relaunchAnnouncements.delete(proc);
 	// A stale file can still name the spawned process, whose pid may since have been reused.
 	if (pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) return true;
