@@ -1,5 +1,5 @@
 import { spawn, ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
+import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
@@ -143,7 +143,8 @@ export interface StartHarperOptions {
 	 * If not provided, resolution order is:
 	 *   1. This option
 	 *   2. HARPER_INTEGRATION_TEST_INSTALL_SCRIPT environment variable
-	 *   3. Auto-resolved from 'harper' package in node_modules
+	 *   3. Auto-resolved from the 'harper' package the project (cwd) resolves
+	 *   4. Auto-resolved from current directory or ancestors ('dist/bin/harper.js')
 	 */
 	harperBinPath?: string;
 }
@@ -213,7 +214,7 @@ export interface ContextWithHarper extends SuiteContext, TestContext {
  * Resolution order:
  * 1. `harperBinPath` argument
  * 2. `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` environment variable
- * 3. Auto-resolved from 'harper' package in node_modules
+ * 3. Auto-resolved from the 'harper' package the project (cwd) resolves, via its `bin` field
  * 4. Auto-resolved from current directory or ancestors ('dist/bin/harper.js')
  *
  * @returns The absolute path to the Harper CLI entry script
@@ -236,29 +237,16 @@ function getHarperScript(harperBinPath?: string): string {
 		return logResolvedHarperScript(envPath, 'HARPER_INTEGRATION_TEST_INSTALL_SCRIPT');
 	}
 
-	// 3. Auto-resolve from node_modules
-	try {
-		const require = createRequire(import.meta.url);
-		const resolved = require.resolve('harper/dist/bin/harper.js');
-		if (existsSync(resolved)) {
-			return logResolvedHarperScript(resolved, 'node_modules');
-		}
-	} catch {
-		// harper package not found in node_modules
+	// 3. Auto-resolve from the project's 'harper' package
+	const packageScript = resolveHarperPackageScript(process.cwd());
+	if (packageScript && existsSync(packageScript)) {
+		return logResolvedHarperScript(packageScript, "'harper' package");
 	}
 
 	// 4. Auto-resolve from current directory or ancestors
-	let currentDir = process.cwd();
-	while (true) {
-		const potentialPath = join(currentDir, 'dist/bin/harper.js');
-		if (existsSync(potentialPath)) {
-			return logResolvedHarperScript(potentialPath, 'ancestor dist');
-		}
-		const parentDir = dirname(currentDir);
-		if (parentDir === currentDir) {
-			break;
-		}
-		currentDir = parentDir;
+	const ancestorScript = findAncestorDistScript();
+	if (ancestorScript) {
+		return logResolvedHarperScript(ancestorScript, 'ancestor dist');
 	}
 
 	throw new Error(
@@ -270,6 +258,53 @@ function getHarperScript(harperBinPath?: string): string {
 	);
 }
 
+/**
+ * Locates the CLI script of the `harper` package that `require('harper')` resolves to from
+ * `projectDir`, via the package's `bin` field: harper's `exports` map exposes only `"."`, so
+ * `dist/bin/harper.js` cannot be resolved as a subpath.
+ *
+ * Resolving from the project rather than from this module matters inside the harper repo itself:
+ * package self-reference yields its local build, whereas this module's location would find the
+ * registry `harper` that npm auto-installs to satisfy our peer dependency.
+ *
+ * Returns `undefined` when no `harper` is resolvable. Exported for tests, not from `index.ts`.
+ */
+export function resolveHarperPackageScript(projectDir: string): string | undefined {
+	try {
+		const entryPath = createRequire(join(projectDir, 'noop.js')).resolve('harper');
+		let packageDir = dirname(entryPath);
+		while (true) {
+			const packageJsonPath = join(packageDir, 'package.json');
+			if (existsSync(packageJsonPath)) {
+				const { name, bin } = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+				if (name === 'harper') return join(packageDir, bin.harper);
+			}
+			const parentDir = dirname(packageDir);
+			if (parentDir === packageDir) return undefined;
+			packageDir = parentDir;
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') return undefined;
+		throw new Error(
+			`Could not locate the Harper CLI script of the 'harper' package resolved from ${projectDir}. ` +
+				`Provide it via the harperBinPath option or HARPER_INTEGRATION_TEST_INSTALL_SCRIPT.`,
+			{ cause: error }
+		);
+	}
+}
+
+/** Nearest `dist/bin/harper.js` in the current directory or its ancestors. */
+function findAncestorDistScript(): string | undefined {
+	let currentDir = process.cwd();
+	while (true) {
+		const potentialPath = join(currentDir, 'dist/bin/harper.js');
+		if (existsSync(potentialPath)) return potentialPath;
+		const parentDir = dirname(currentDir);
+		if (parentDir === currentDir) return undefined;
+		currentDir = parentDir;
+	}
+}
+
 const loggedHarperScripts = new Set<string>();
 
 /**
@@ -278,29 +313,21 @@ const loggedHarperScripts = new Set<string>();
  * Which binary runs is the single most consequential (and previously invisible)
  * decision the harness makes: resolving a stale `harper` package from
  * node_modules while the caller expected their local build produces confusing
- * wholesale test failures with no hint of the cause. When the `node_modules`
- * path wins while `./dist/bin/harper.js` also exists, warn with the override.
+ * wholesale test failures with no hint of the cause. When the `harper` package
+ * wins over a different local `dist/bin/harper.js` that step 4 would have
+ * picked, warn with the override.
  */
 function logResolvedHarperScript(scriptPath: string, source: string): string {
 	if (loggedHarperScripts.has(scriptPath)) return scriptPath;
 	loggedHarperScripts.add(scriptPath);
 	console.log(`[integration-testing] Using Harper at ${scriptPath} (via ${source})`);
-	if (source === 'node_modules') {
-		// Mirror resolution step 4's ancestor walk so the warning fires even when
-		// tests run from a subdirectory of the repo that holds the local build.
-		let currentDir = process.cwd();
-		while (true) {
-			const localDist = join(currentDir, 'dist/bin/harper.js');
-			if (existsSync(localDist) && localDist !== scriptPath) {
-				console.warn(
-					`[integration-testing] Warning: resolved the 'harper' package from node_modules, but ${localDist} also exists. ` +
-						`If you meant to test the local build, set HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=${localDist}.`
-				);
-				break;
-			}
-			const parentDir = dirname(currentDir);
-			if (parentDir === currentDir) break;
-			currentDir = parentDir;
+	if (source === "'harper' package") {
+		const localDist = findAncestorDistScript();
+		if (localDist && localDist !== scriptPath) {
+			console.warn(
+				`[integration-testing] Warning: resolved the 'harper' package, but ${localDist} also exists. ` +
+					`If you meant to test the local build, set HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=${localDist}.`
+			);
 		}
 	}
 	return scriptPath;

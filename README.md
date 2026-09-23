@@ -94,7 +94,8 @@ The Harper binary is resolved in the following order:
 
 1. `harperBinPath` option passed directly to `startHarper()`
 2. `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` environment variable (path to `dist/bin/harper.js`)
-3. Auto-resolved from a `harper` package installed as a project dependency
+3. Auto-resolved from a `harper` package installed as a project dependency — the one `require('harper')` resolves to from the working directory, located via its `bin` field. Inside the harper repo itself this is the local build (package self-reference), not the registry copy npm auto-installs for this package's peer dependency.
+4. The nearest `dist/bin/harper.js` in the working directory or its ancestors
 
 **Options:**
 
