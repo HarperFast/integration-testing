@@ -104,8 +104,9 @@ for (;;) {
   await writeRegistryFile(small);
 }
 `,
-	// Mirrors the handoff of Harper's `restart`: on a 'restart' line it removes hdb.pid, launches a detached
-	// replacement and exits 0; the replacement waits for its predecessor to exit, then records its pid.
+	// Mirrors the handoff of Harper's `restart`: on a 'restart' line it removes hdb.pid, reports ready again,
+	// launches a detached replacement and exits 0; the replacement waits for its predecessor to exit, then
+	// records its pid.
 	'restartable.cjs': `
 const { spawn } = require('node:child_process');
 const { writeFileSync, rmSync } = require('node:fs');
@@ -141,12 +142,14 @@ if (replacedPid) {
   process.stdin.on('data', (chunk) => {
     if (!String(chunk).includes('restart')) return;
     rmSync(pidFile, { force: true });
+    process.stdout.write('successfully started\\n');
     spawn(process.execPath, [__filename], {
       detached: true,
       stdio: 'ignore',
       env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
     }).unref();
-    process.exit(0);
+    // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
+    setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
   });
   process.stdout.write('successfully started\\n');
 }
@@ -1144,7 +1147,6 @@ interface FakeHarperNode {
 	spawnedPid: number;
 }
 
-/** Starts the restartable fake the way startHarper does (through runHarperCommand), with a data root of its own. */
 async function startRestartableFakeHarper(env: Record<string, string> = {}): Promise<FakeHarperNode> {
 	const dataRootDir = mkdtempSync(join(tmpdir(), 'harper-it-relaunch-'));
 	const result = await runHarperCommand({
@@ -1159,7 +1161,6 @@ async function startRestartableFakeHarper(env: Record<string, string> = {}): Pro
 	return { ctx, dataRootDir, spawnedPid: result.process.pid! };
 }
 
-/** Sends the fake its `restart` and resolves once the spawned process has exited, as Harper's does. */
 async function restartFakeHarper(node: FakeHarperNode): Promise<void> {
 	const exited = once(node.ctx.harper.process, 'exit');
 	node.ctx.harper.process.stdin!.write('restart\n');
@@ -1204,10 +1205,13 @@ test('killHarper waits for a replacement that has not yet recorded its pid', asy
 		await restartFakeHarper(node);
 		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'the test must run inside the handoff gap');
 
+		// An un-awaited killHarper followed by teardown's: neither may return before the replacement is gone.
+		const firstCall = killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
 		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
 
 		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
 		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+		await firstCall;
 	} finally {
 		await cleanupFakeHarperNode(node);
 	}
@@ -1251,15 +1255,34 @@ test('killHarper waits for the relaunched process group, not just its leader', {
 	}
 });
 
-test('killHarper does not wait for a relaunch after a shutdown it caused itself', async () => {
+test('killHarper follows a relaunch the spawned process announced before it was stopped', async () => {
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_LINGER_MS: '3000' });
+		node.ctx.harper.process.stdin!.write('restart\n');
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+		strictEqual(node.ctx.harper.process.exitCode, null, 'the spawned process must still be running when killHarper starts');
+
+		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+	} finally {
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper does not wait for a relaunch after a clean stop that announced none', { skip: !isPosix }, async () => {
 	let node: FakeHarperNode | undefined;
 	try {
 		node = await startRestartableFakeHarper();
-		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
-		// On POSIX the fake exits 0 from its SIGTERM handler, which is what a restart looks like too.
+		// A test stopping Harper itself: exit code 0, like a restart, but no second readiness report.
+		const exited = once(node.ctx.harper.process, 'exit');
+		process.kill(node.spawnedPid, 'SIGTERM');
+		strictEqual((await exited)[0], 0);
+
 		const start = Date.now();
 		await killHarper(node.ctx, { graceMs: 200 });
-		ok(Date.now() - start < 1000, 'the second call must not wait out the relaunch window');
+		ok(Date.now() - start < 1000, 'killHarper must not wait out the relaunch window');
 	} finally {
 		await cleanupFakeHarperNode(node);
 	}
