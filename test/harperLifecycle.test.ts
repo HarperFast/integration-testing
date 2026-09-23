@@ -1,11 +1,11 @@
 import { test, before, after } from 'node:test';
-import { ok, strictEqual, match, doesNotMatch, rejects } from 'node:assert';
+import { ok, strictEqual, match, doesNotMatch, rejects, throws } from 'node:assert';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { readFile, writeFile as writeFileAsync } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import {
@@ -18,6 +18,7 @@ import {
 	runHarperCommand,
 	HarperStartupError,
 	buildHarperChildEnv,
+	resolveHarperPackageScript,
 	type StartedHarperTestContext,
 } from '../src/harperLifecycle.ts';
 import {
@@ -143,6 +144,11 @@ for (const index of [0, 1]) {
   });
 }
 setInterval(() => {}, 1000);
+`,
+	// Starts Harper with no harperBinPath, so the binary comes from auto-resolution in this cwd.
+	'resolve-runner.mjs': `
+const { runHarperCommand } = await import(process.env.HARPER_LIFECYCLE_URL);
+await runHarperCommand({ args: [], env: {} });
 `,
 	'worker-harper.mjs': `
 import { parentPort, workerData } from 'node:worker_threads';
@@ -1084,4 +1090,99 @@ test('buildHarperChildEnv: isolates HOME/USERPROFILE to dataRootDir by default',
 	const env = buildHarperChildEnv('/tmp/data-root', {});
 	strictEqual(env.HOME, '/tmp/data-root');
 	strictEqual(env.USERPROFILE, '/tmp/data-root');
+});
+
+// The shape every published harper 5.x has: `exports` maps only ".", so dist/bin/harper.js is not a
+// resolvable subpath.
+const HARPER_PACKAGE_JSON = {
+	name: 'harper',
+	exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+	bin: { harper: 'dist/bin/harper.js' },
+};
+const BUILT_HARPER_FILES = ['dist/index.js', 'dist/bin/harper.js'];
+
+function writePackage(dir: string, packageJson: object, files: string[] = []): string {
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, 'package.json'), JSON.stringify(packageJson));
+	for (const file of files) {
+		mkdirSync(dirname(join(dir, file)), { recursive: true });
+		writeFileSync(join(dir, file), '');
+	}
+	return dir;
+}
+
+/** Realpath, since that is what module resolution returns and the assertions compare against. */
+function makeResolutionRoot(): string {
+	return realpathSync(mkdtempSync(join(fixtureDir, 'resolution-')));
+}
+
+/** Starts Harper through `runHarperCommand` from `cwd`, with nothing but auto-resolution to pick the binary. */
+async function runAutoResolution(cwd: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+	const runner = spawn(process.execPath, [fixtures['resolve-runner.mjs']], {
+		cwd,
+		env: {
+			...process.env,
+			HARPER_LIFECYCLE_URL: new URL('../src/harperLifecycle.ts', import.meta.url).href,
+			HARPER_INTEGRATION_TEST_INSTALL_SCRIPT: undefined,
+		},
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	let stdout = '';
+	let stderr = '';
+	runner.stdout.on('data', (chunk: Buffer) => (stdout += chunk));
+	runner.stderr.on('data', (chunk: Buffer) => (stderr += chunk));
+	const [code] = await once(runner, 'close');
+	return { code, stdout, stderr };
+}
+
+test("auto-resolution finds the CLI of a 'harper' dependency whose exports map only '.'", async () => {
+	const projectDir = writePackage(makeResolutionRoot(), { name: 'consumer' });
+	const harperDir = writePackage(join(projectDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON, BUILT_HARPER_FILES);
+
+	const { code, stdout, stderr } = await runAutoResolution(projectDir);
+
+	strictEqual(code, 0, stderr);
+	ok(
+		stdout.includes(`Using Harper at ${join(harperDir, 'dist', 'bin', 'harper.js')} (via 'harper' package)`),
+		stdout
+	);
+});
+
+test('a Harper build enclosing the working directory wins over node_modules/harper', async () => {
+	// harper-pro's shape: its own build, the registry harper npm auto-installs for this package's peer
+	// dependency, and tests run from a subdirectory whose package.json only sets the module type.
+	const productDir = writePackage(makeResolutionRoot(), { name: '@harperfast/harper-pro', bin: { harper: 'dist/bin/harper.js' } }, ['dist/bin/harper.js']);
+	writePackage(join(productDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON, BUILT_HARPER_FILES);
+	const testsDir = writePackage(join(productDir, 'integrationTests'), { type: 'module' });
+
+	const { code, stdout, stderr } = await runAutoResolution(testsDir);
+
+	strictEqual(code, 0, stderr);
+	ok(stdout.includes(`Using Harper at ${join(productDir, 'dist', 'bin', 'harper.js')} (via ancestor dist)`), stdout);
+});
+
+test('resolveHarperPackageScript falls through when the resolved harper is not built', () => {
+	const projectDir = makeResolutionRoot();
+	writePackage(join(projectDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON);
+
+	strictEqual(resolveHarperPackageScript(projectDir), undefined);
+});
+
+test("resolveHarperPackageScript reads npm's string form of bin", () => {
+	const projectDir = makeResolutionRoot();
+	const harperDir = writePackage(join(projectDir, 'node_modules', 'harper'), { ...HARPER_PACKAGE_JSON, bin: 'dist/bin/harper.js' }, BUILT_HARPER_FILES);
+
+	strictEqual(resolveHarperPackageScript(projectDir), join(harperDir, 'dist', 'bin', 'harper.js'));
+});
+
+test('resolveHarperPackageScript reports an installed harper it cannot resolve instead of skipping it', () => {
+	const projectDir = makeResolutionRoot();
+	writePackage(join(projectDir, 'node_modules', 'harper'), { ...HARPER_PACKAGE_JSON, exports: { './cli': './dist/bin/harper.js' } }, BUILT_HARPER_FILES);
+
+	throws(
+		() => resolveHarperPackageScript(projectDir),
+		(error: Error) =>
+			/Could not locate the Harper CLI script/.test(error.message) &&
+			(error.cause as NodeJS.ErrnoException).code === 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+	);
 });
