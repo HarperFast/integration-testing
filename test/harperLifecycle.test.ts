@@ -156,7 +156,9 @@ if (replacedPid) {
   });
   process.stdout.write('successfully started\\n');
   // What Harper's logger adds right after readiness when \`logging.stdStreams\` is on.
-  if (process.env.HARPER_FAKE_BOOT_NOTIFY === '1') setTimeout(() => process.stdout.write('Harper successfully started.\\n'), 10);
+  if (process.env.HARPER_FAKE_BOOT_NOTIFY_MS) {
+    setTimeout(() => process.stdout.write('Harper successfully started.\\n'), Number(process.env.HARPER_FAKE_BOOT_NOTIFY_MS));
+  }
 }
 `,
 	'orphan-runner.mjs': `
@@ -1294,25 +1296,33 @@ test('killHarper does not wait for a relaunch after a clean stop that announced 
 	}
 });
 
-test('a readiness line Harper logs at boot is not taken for a restart', async () => {
-	let node: FakeHarperNode | undefined;
-	try {
-		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY: '1' });
-		await sleep(200);
+for (const [label, notifyMs, stopAfterMs] of [
+	['right after boot', '10', 200],
+	// Past the boot settle window, as when a stalled runner reads the line late.
+	['late', '100', 1200],
+] as const) {
+	test(`a readiness line Harper logs at boot, delivered ${label}, is not taken for a restart`, async () => {
+		let node: FakeHarperNode | undefined;
+		try {
+			node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: notifyMs });
+			await sleep(stopAfterMs);
 
-		const start = Date.now();
-		await teardownHarper(node.ctx);
-		ok(Date.now() - start < 1000, 'teardown must not wait for a relaunch that never happened');
-		strictEqual(existsSync(node.dataRootDir), false, 'teardown should have removed the install directory');
-	} finally {
-		await cleanupFakeHarperNode(node);
-	}
-});
+			// Windows gets a short grace: its SIGTERM-equivalent does not stop a background node process.
+			const start = Date.now();
+			await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
+			ok(Date.now() - start < 3000, 'killHarper must not wait for a relaunch that never happened');
+			await teardownHarper(node.ctx);
+			strictEqual(existsSync(node.dataRootDir), false, 'teardown should have removed the install directory');
+		} finally {
+			await cleanupFakeHarperNode(node);
+		}
+	});
+}
 
 test('a readiness line logged at boot does not hide a later restart', async () => {
 	let node: FakeHarperNode | undefined;
 	try {
-		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY: '1', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		node = await startRestartableFakeHarper({ HARPER_FAKE_BOOT_NOTIFY_MS: '10', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
 		await sleep(200);
 		await restartFakeHarper(node);
 

@@ -133,6 +133,12 @@ const PROCESS_POLL_MS = 50;
 const BOOT_REPORT_SETTLE_MS = 50;
 
 /**
+ * Harper exits within milliseconds of announcing a relaunch (it forks the replacement and exits in one
+ * synchronous step), so an announcement further than this from the exit was a late-delivered boot log.
+ */
+const RELAUNCH_EXIT_WINDOW_MS = 1000;
+
+/**
  * The runtime to use for running Harper during tests.
  * Set via the HARPER_RUNTIME environment variable ('node' or 'bun').
  * Defaults to 'node'.
@@ -807,6 +813,7 @@ const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
 const relaunchAnnouncements = new WeakMap<ChildProcess, number>();
+const spawnedExitTimes = new WeakMap<ChildProcess, number>();
 
 /** Shared so that a concurrent `killHarper` on the same node cannot return before the first finishes. */
 const relaunchKills = new WeakMap<ChildProcess, Promise<boolean>>();
@@ -824,7 +831,10 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 
 	// Only the direct child is untracked here; its registry record covers the group, which can
 	// outlive it, and the monitor owns removing that.
-	proc.once('exit', () => liveHarperProcesses.delete(proc));
+	proc.once('exit', () => {
+		liveHarperProcesses.delete(proc);
+		spawnedExitTimes.set(proc, Date.now());
+	});
 
 	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
@@ -968,13 +978,16 @@ async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, gra
 	let pid = await readHarperPid(dataRootDir);
 	// Read after the await above, which lets stdout that arrived alongside the exit be processed first.
 	const announcedAt = relaunchAnnouncements.get(proc);
-	const relaunchDeadline = announcedAt === undefined ? 0 : announcedAt + getRelaunchPidWaitMs();
+	const exitedAt = spawnedExitTimes.get(proc);
+	const relaunched =
+		announcedAt !== undefined && exitedAt !== undefined && exitedAt - announcedAt <= RELAUNCH_EXIT_WINDOW_MS;
+	const relaunchDeadline = relaunched ? announcedAt + getRelaunchPidWaitMs() : 0;
 	while (pid === undefined && Date.now() < relaunchDeadline) {
 		await sleep(PROCESS_POLL_MS);
 		pid = await readHarperPid(dataRootDir);
 	}
-	// An announced replacement that has not shown up yet may still come, for this call and any later one.
-	if (pid === undefined) return announcedAt === undefined;
+	// A replacement that has not shown up yet may still come, for this call and any later one.
+	if (pid === undefined) return !relaunched;
 	relaunchAnnouncements.delete(proc);
 	// A stale file can still name the spawned process, whose pid may since have been reused.
 	if (pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) return true;
