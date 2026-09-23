@@ -526,7 +526,7 @@ export function runHarperCommand({
 				if (readinessLine) {
 					const recentOutput = postReadinessTail + dataString;
 					if (recentOutput.includes(readinessLine)) relaunchAnnouncements.set(proc, Date.now());
-					postReadinessTail = recentOutput.slice(-(readinessLine.length - 1));
+					postReadinessTail = recentOutput.slice(recentOutput.length - (readinessLine.length - 1));
 				}
 				return;
 			}
