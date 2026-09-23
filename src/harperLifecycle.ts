@@ -2,13 +2,20 @@ import { spawn, ChildProcess } from 'node:child_process';
 import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, cp, readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { type SuiteContext, type TestContext } from 'node:test';
 import { getNextAvailableLoopbackAddress, releaseLoopbackAddress } from './loopbackAddressPool.ts';
 import { waitForPortsFree } from './portUtils.ts';
 import { ok, equal } from 'node:assert';
 import { createRequire } from 'node:module';
-import { buildInstanceEnv, nextInstanceId, registerHarperInstance } from './harperInstanceRegistry.ts';
+import {
+	buildInstanceEnv,
+	nextInstanceId,
+	processGroupExists,
+	registerHarperInstance,
+	signalProcessGroup,
+} from './harperInstanceRegistry.ts';
 
 /**
  * Minimal context interface required by startHarper/teardownHarper.
@@ -100,6 +107,21 @@ export const DEFAULT_PORT_RELEASE_TIMEOUT_MS = parseInt(process.env.HARPER_INTEG
 
 /** Short backstop wait for the process 'exit' event after sending SIGKILL during teardown. */
 const SIGKILL_EXIT_WAIT_MS = 1000;
+
+/** Where Harper's main process records its pid, relative to its root path — the identity `harper stop` uses. */
+const HARPER_PID_FILE = 'hdb.pid';
+
+/**
+ * How long after Harper exits cleanly on its own teardown still watches for the process a `restart`
+ * relaunched it as. The replacement records its pid only after its predecessor has exited and it has
+ * finished loading (~0.5s measured on an idle machine), so a teardown inside that window would
+ * otherwise find no pid file and leave it running. Not scaled for CI: a node that exited without
+ * relaunching, or whose replacement was already stopped, pays this on teardown.
+ */
+const RELAUNCH_PID_WAIT_MS = 5000;
+
+/** Poll interval while waiting on a process that is not our child, which emits no 'exit' event. */
+const PROCESS_POLL_MS = 50;
 
 /**
  * The runtime to use for running Harper during tests.
@@ -760,6 +782,12 @@ interface TrackedHarperProcess {
 const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
+/**
+ * Deadline until which `killHarper` looks for a relaunched replacement, per spawned process that exited
+ * cleanly on its own. A clean exit is what Harper's `restart` looks like from here.
+ */
+const relaunchDeadlines = new WeakMap<ChildProcess, number>();
+
 function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: string): TrackedHarperProcess {
 	liveHarperProcesses.add(proc);
 	// A failed spawn leaves no PID and nothing to reap; the caller rejects on the 'error' event.
@@ -773,7 +801,10 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 
 	// Only the direct child is untracked here; its registry record covers the group, which can
 	// outlive it, and the monitor owns removing that.
-	proc.once('exit', () => liveHarperProcesses.delete(proc));
+	proc.once('exit', (code) => {
+		liveHarperProcesses.delete(proc);
+		if (code === 0) relaunchDeadlines.set(proc, Date.now() + RELAUNCH_PID_WAIT_MS);
+	});
 
 	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
@@ -846,6 +877,9 @@ const START_FROM_THE_CONTEXT =
  * After SIGKILL it waits briefly for the process to actually exit, so callers can rely on it
  * being gone — and, since a dead process releases its listening sockets, on its ports being free.
  *
+ * If the process we spawned has already exited because Harper's `restart` operation relaunched the
+ * node as a new process, that process — the one `hdb.pid` names — is terminated instead.
+ *
  * @param ctx
  * @param options.graceMs Time to wait after SIGTERM before sending SIGKILL. Defaults to
  *   {@link DEFAULT_TEARDOWN_GRACE_MS}.
@@ -854,10 +888,11 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 	assertHarperTestContext(ctx, 'killHarper', WRAP_THE_NODE('killHarper'));
 	const proc = ctx.harper?.process;
 	if (!proc) return;
-	// Already exited — nothing to do.
-	if (proc.exitCode !== null || proc.signalCode !== null) return;
-
 	const graceMs = options?.graceMs ?? DEFAULT_TEARDOWN_GRACE_MS;
+	if (proc.exitCode !== null || proc.signalCode !== null) {
+		if (ctx.harper.dataRootDir) await killRelaunchedHarper(proc, ctx.harper.dataRootDir, graceMs);
+		return;
+	}
 
 	await new Promise<void>((resolve) => {
 		let done = false;
@@ -867,6 +902,8 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 		const finish = () => {
 			if (done) return;
 			done = true;
+			// Our SIGTERM caused this exit, not a `restart`, so there is no relaunch to look for.
+			relaunchDeadlines.delete(proc);
 			proc.off('exit', finish);
 			clearTimeout(sigkillTimer);
 			clearTimeout(backstopTimer);
@@ -885,6 +922,83 @@ export async function killHarper(ctx: StartedHarperTestContext, options?: { grac
 			backstopTimer = setTimeout(finish, SIGKILL_EXIT_WAIT_MS);
 		}, graceMs);
 	});
+}
+
+/**
+ * Terminates the process Harper relaunched itself as, once the one we spawned has exited.
+ *
+ * Harper's `restart` forks a detached replacement and exits 0; the replacement writes its pid to
+ * `hdb.pid` only once its predecessor is gone. So the node now runs as whatever that file names, and
+ * shortly after a clean exit the file may not exist yet.
+ */
+async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, graceMs: number): Promise<void> {
+	const relaunchDeadline = relaunchDeadlines.get(proc) ?? 0;
+	// Only the first call after the exit waits for the relaunch; a later teardown must not wait again.
+	relaunchDeadlines.delete(proc);
+	let pid = await readHarperPid(dataRootDir);
+	while (pid === undefined && Date.now() < relaunchDeadline) {
+		await sleep(PROCESS_POLL_MS);
+		pid = await readHarperPid(dataRootDir);
+	}
+	// A stale file can still name the spawned process, whose pid may since have been reused.
+	if (pid === undefined || pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) return;
+
+	signalProcessTree(pid, 'SIGTERM');
+	if (!(await waitForProcessTreeExit(pid, graceMs))) {
+		signalProcessTree(pid, 'SIGKILL');
+		if (!(await waitForProcessTreeExit(pid, SIGKILL_EXIT_WAIT_MS))) return;
+	}
+	// Harper removes its pid file on SIGTERM but not on SIGKILL, and a pid left behind can be reused
+	// before a later call reads it.
+	if ((await readHarperPid(dataRootDir)) === pid) await rm(join(dataRootDir, HARPER_PID_FILE), { force: true });
+}
+
+/**
+ * Reads the pid Harper recorded for the node rooted at `dataRootDir`, or undefined if there is none.
+ * Exported for tests, not from `index.ts`.
+ */
+export async function readHarperPid(dataRootDir: string): Promise<number | undefined> {
+	let contents: string;
+	try {
+		contents = await readFile(join(dataRootDir, HARPER_PID_FILE), 'utf8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+		throw error;
+	}
+	const trimmed = contents.trim();
+	if (!/^\d+$/.test(trimmed)) return undefined;
+	const pid = Number(trimmed);
+	// As a process group, 0 is our own and 1 is every process we may signal.
+	return Number.isSafeInteger(pid) && pid > 1 ? pid : undefined;
+}
+
+/**
+ * On POSIX, whether `pid` still identifies a live process group. Harper's relaunch always leads its own
+ * group (it forks `detached`), and requiring that keeps an ordinary process that reused a stale pid
+ * from being signalled.
+ */
+function isProcessTreeAlive(pid: number): boolean {
+	if (process.platform !== 'win32') return processGroupExists(pid);
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function signalProcessTree(pid: number, signal: 'SIGTERM' | 'SIGKILL'): void {
+	if (process.platform === 'win32') signalWindowsProcessTree(pid, signal);
+	else signalProcessGroup(pid, signal);
+}
+
+async function waitForProcessTreeExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (isProcessTreeAlive(pid)) {
+		if (Date.now() >= deadline) return false;
+		await sleep(PROCESS_POLL_MS);
+	}
+	return true;
 }
 
 /**
