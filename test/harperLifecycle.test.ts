@@ -1148,21 +1148,17 @@ test("auto-resolution finds the CLI of a 'harper' dependency whose exports map o
 	);
 });
 
-test('inside a harper checkout, auto-resolution uses its own build, not node_modules/harper or an outer build', async () => {
-	// A harper checkout nested in another harper build (harper-pro/core inside harper-pro) that also
-	// has the registry harper npm auto-installs for this package's peer dependency.
-	const outerDir = writePackage(makeResolutionRoot(), { name: 'outer' }, ['dist/bin/harper.js']);
-	const checkoutDir = writePackage(join(outerDir, 'core'), HARPER_PACKAGE_JSON, BUILT_HARPER_FILES);
-	writePackage(join(checkoutDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON, BUILT_HARPER_FILES);
+test('a Harper build enclosing the working directory wins over node_modules/harper', async () => {
+	// harper-pro's shape: its own build, the registry harper npm auto-installs for this package's peer
+	// dependency, and tests run from a subdirectory whose package.json only sets the module type.
+	const productDir = writePackage(makeResolutionRoot(), { name: '@harperfast/harper-pro', bin: { harper: 'dist/bin/harper.js' } }, ['dist/bin/harper.js']);
+	writePackage(join(productDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON, BUILT_HARPER_FILES);
+	const testsDir = writePackage(join(productDir, 'integrationTests'), { type: 'module' });
 
-	const { code, stdout, stderr } = await runAutoResolution(checkoutDir);
+	const { code, stdout, stderr } = await runAutoResolution(testsDir);
 
 	strictEqual(code, 0, stderr);
-	ok(
-		stdout.includes(`Using Harper at ${join(checkoutDir, 'dist', 'bin', 'harper.js')} (via 'harper' package)`),
-		stdout
-	);
-	doesNotMatch(stderr, /Warning: resolved the 'harper' package/);
+	ok(stdout.includes(`Using Harper at ${join(productDir, 'dist', 'bin', 'harper.js')} (via ancestor dist)`), stdout);
 });
 
 test('resolveHarperPackageScript falls through when the resolved harper is not built', () => {
@@ -1170,6 +1166,13 @@ test('resolveHarperPackageScript falls through when the resolved harper is not b
 	writePackage(join(projectDir, 'node_modules', 'harper'), HARPER_PACKAGE_JSON);
 
 	strictEqual(resolveHarperPackageScript(projectDir), undefined);
+});
+
+test("resolveHarperPackageScript reads npm's string form of bin", () => {
+	const projectDir = makeResolutionRoot();
+	const harperDir = writePackage(join(projectDir, 'node_modules', 'harper'), { ...HARPER_PACKAGE_JSON, bin: 'dist/bin/harper.js' }, BUILT_HARPER_FILES);
+
+	strictEqual(resolveHarperPackageScript(projectDir), join(harperDir, 'dist', 'bin', 'harper.js'));
 });
 
 test('resolveHarperPackageScript reports an installed harper it cannot resolve instead of skipping it', () => {
