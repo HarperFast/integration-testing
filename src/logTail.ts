@@ -40,13 +40,15 @@ export function buildLogTail(content: string, tailLines: number): { output: stri
 		return { output: content, note: '' };
 	}
 	const rawLines = content.split('\n');
+	// A trailing '\n' in the log file splits into a phantom empty final element, not a line.
+	if (rawLines.length > 0 && rawLines[rawLines.length - 1] === '') {
+		rawLines.pop();
+	}
 	const lines = collapseRepeatedLines(rawLines);
 	if (lines.length <= tailLines) {
 		return { output: lines.join('\n'), note: '' };
 	}
 	let start = lines.length - tailLines;
-	// A slice boundary landing on a marker would print it detached from the line it counts —
-	// pull that line back in rather than show an orphaned "(repeated N times)".
 	if (REPEAT_MARKER_PATTERN.test(lines[start])) {
 		start--;
 	}

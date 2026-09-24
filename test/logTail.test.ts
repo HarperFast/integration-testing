@@ -27,9 +27,6 @@ test('tail length applies after collapsing, not before', () => {
 		...Array.from({ length: 50 }, (_, i) => pollLine(`2026-09-11T12:00:${String(i + 1).padStart(2, '0')}.000Z`)),
 	].join('\n');
 
-	// The collapsed log is only 3 lines (the error, the poll run's first line, its repeat
-	// marker), so a tail of 5 keeps the error line instead of cutting it off, which slicing
-	// the raw 51-line log to a tail of 5 would.
 	const { output, note } = buildLogTail(content, 5);
 	strictEqual(
 		output,
@@ -60,8 +57,6 @@ test('a tail boundary landing on a repeat marker pulls in the line it counts', (
 		'2026-09-11T12:00:03.000Z [main/1] [info]: line A',
 		'2026-09-11T12:00:04.000Z [main/1] [info]: line B',
 	].join('\n');
-	// Collapsed: [error, poll(first), '(repeated 2 times)', A, B]. A naive slice(-3) would
-	// start at the marker, printing it with no line to explain.
 	const { output, note } = buildLogTail(content, 3);
 	strictEqual(
 		output,
@@ -73,6 +68,13 @@ test('a tail boundary landing on a repeat marker pulls in the line it counts', (
 		].join('\n')
 	);
 	strictEqual(note, ' (last 4 of 5 collapsed lines, 5 raw; set HARPER_INTEGRATION_TEST_LOG_TAIL_LINES=0 for full log)');
+});
+
+test('a trailing newline does not consume a tail slot or count as a raw line', () => {
+	const lines = ['line1', 'line2', 'line3', 'line4', 'line5'];
+	const { output, note } = buildLogTail(lines.join('\n') + '\n', 3);
+	strictEqual(output, lines.slice(-3).join('\n'));
+	strictEqual(note, ' (last 3 of 5 collapsed lines, 5 raw; set HARPER_INTEGRATION_TEST_LOG_TAIL_LINES=0 for full log)');
 });
 
 test('LOG_TAIL_LINES=0 dumps the full, uncollapsed log', () => {
