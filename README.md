@@ -248,6 +248,10 @@ HARPER_INTEGRATION_TEST_LOG_DIR=/tmp/harper-test-logs npx harper-integration-tes
 
 Additionally, `startupOutput` on `HarperContext` provides the captured stdout/stderr from Harper startup for programmatic access (e.g. attaching to Playwright test results).
 
+On a test failure, the runner also prints a tail of each involved Harper node's `hdb.log` to the console. Runs of consecutive lines that are identical once their timestamp is stripped (e.g. a repeated poll) are collapsed into one line plus a `(repeated N times)` marker before the tail is taken, so noisy repeated lines don't push the actual error out of the printed window. Log files on disk are never modified.
+
+- `HARPER_INTEGRATION_TEST_LOG_TAIL_LINES` - Number of trailing (post-collapse) `hdb.log` lines printed per failed test. Default `200`. `0` (or any non-positive value) prints the entire log, uncollapsed.
+
 ### `HarperStartupError`
 
 When Harper fails to start or times out, a `HarperStartupError` is thrown. It extends `Error` and includes structured `stdout` and `stderr` properties for diagnostics:
