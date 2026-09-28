@@ -4,6 +4,7 @@ import { createServer, type AddressInfo, type Server } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { isPortFree } from '../src/portUtils.ts';
 
 const HOST = '127.0.0.1';
@@ -151,20 +152,17 @@ for (const value of ['0', 'false', '']) {
 	});
 }
 
-// A node still bound to the address itself is the conflict canary's case, on every platform: skip the
-// address and wait for it, never refuse the run.
-test('waits out a listener bound to the address itself instead of refusing it', async (t) => {
+test('waits out a listener bound to the address itself instead of refusing it', { timeout: 15000 }, async (t) => {
 	const warn = t.mock.method(console, 'warn', () => {});
+	const canaryWarned = () =>
+		warn.mock.calls.some((call) => String(call.arguments[0]).includes('still in use by another Harper node'));
 	const lingering = await listen(HOST, httpPort);
+	t.after(() => (lingering.listening ? close(lingering) : undefined));
 	const allocation = getNextAvailableLoopbackAddress();
-	setTimeout(() => void close(lingering), 200);
+	while (!canaryWarned()) await sleep(10);
+	await close(lingering);
 	strictEqual(await allocation, HOST);
 	await releaseLoopbackAddress(HOST);
-	const warnings = warn.mock.calls.map((call) => String(call.arguments[0]));
-	ok(
-		warnings.some((warning) => warning.includes('still in use by another Harper node')),
-		`expected the conflict canary's warning, got ${JSON.stringify(warnings)}`
-	);
 });
 
 test('startHarper removes the install directory it created when allocation refuses the address', async (t) => {

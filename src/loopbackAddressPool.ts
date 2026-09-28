@@ -76,9 +76,10 @@ interface LoopbackAddressError extends Error {
 
 // Custom error classes
 class LoopbackAddressValidationError extends Error {
-	constructor(address: string, cause?: Error) {
+	constructor(address: string, cause?: Error, message?: string) {
 		super(
-			`Failed to validate loopback address ${address}. This likely means your system does not have the required loopback addresses configured/enabled. Refer to the Harper Integration Test documentation (integrationTests/README.md) for more information.`
+			message ??
+				`Failed to validate loopback address ${address}. This likely means your system does not have the required loopback addresses configured/enabled. Refer to the Harper Integration Test documentation (integrationTests/README.md) for more information.`
 		);
 		this.name = 'LoopbackAddressValidationError';
 		if (cause) {
@@ -388,7 +389,8 @@ export async function validateLoopbackAddressPool(): Promise<{
  * **Lock file location:** `${tmpdir()}/harper-integration-test-loopback-pool.lock`
  *
  * @returns A promise that resolves with an allocated loopback address
- * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to
+ * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to, or cannot be
+ * checked for another process's listener (the slot is released in that case)
  * @throws {ForeignListenerError} If another process accepts connections on the address's canary
  * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
  */
@@ -474,8 +476,19 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				try {
 					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
 				} catch (error) {
+					const reason = (error as Error).message;
+					if (foreignListenersAllowed()) {
+						console.warn(
+							`[loopback-pool] Could not check ${loopbackAddress} for another process's listener (${reason}); continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set.`
+						);
+						return loopbackAddress;
+					}
 					await releaseLoopbackAddress(loopbackAddress);
-					throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
+					throw new LoopbackAddressValidationError(
+						loopbackAddress,
+						error as Error,
+						`Could not check whether another process accepts connections on ${loopbackAddress}'s Harper ports (${reason}). Set ${ALLOW_FOREIGN_LISTENERS_ENV}=1 to skip this check.`
+					);
 				}
 				if (shadowedPort === null) {
 					return loopbackAddress;
