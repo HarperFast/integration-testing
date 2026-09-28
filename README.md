@@ -126,7 +126,7 @@ Startup readiness is detected by Harper printing `successfully started`. Rather 
 - `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
-- `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` - Set to `1` or `true` to start a node on an address whose operations or HTTP port another process already accepts connections on, with a warning instead of a `ForeignListenerError` (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)).
+- `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` - Set to `1` or `true` to start a node on an address whose operations or HTTP port another process already accepts connections on, or that could not be checked for one, with a warning instead of an error (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)).
 
 ### `setupHarperWithFixture(ctx, fixturePath, options?)`
 

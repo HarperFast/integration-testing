@@ -597,7 +597,7 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	try {
 		loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
 	} catch (error) {
-		if (!ctx.harper?.dataRootDir) await rm(dataRootDir, { recursive: true, force: true });
+		if (!ctx.harper?.dataRootDir) await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
 		throw error;
 	}
 
