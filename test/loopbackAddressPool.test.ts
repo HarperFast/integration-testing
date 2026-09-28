@@ -30,9 +30,7 @@ async function twoFreePorts(): Promise<[number, number]> {
 	return [ports[0], ports[1]];
 }
 
-// The pool reads its file location, address range, and canary ports once, when it is imported, so
-// configure them first: a private pool file, the one address every OS has without aliases, and canary
-// ports this test owns.
+// The pool reads these once, when it is imported.
 const poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-test-'));
 const [operationsPort, httpPort] = await twoFreePorts();
 process.env.TMPDIR = process.env.TMP = process.env.TEMP = poolDir;
@@ -53,12 +51,7 @@ function readPool(): unknown {
 const CANARY_CATCHES_IT =
 	'an exclusive bind of the pool address conflicts with a listener on all interfaces here, so the conflict canary refuses the address before this check runs';
 
-/**
- * A listener on all interfaces, the way a local Harper instance with its default config binds. Where
- * an exclusive bind of the pool address conflicts with it (Linux), the conflict canary already refuses
- * the address — and, with a one-address pool, waits for it forever — so only platforms that allow
- * that bind (macOS) reach the check under test. Resolves a reason to skip instead of a server.
- */
+/** Where an exclusive bind of the pool address conflicts with it (Linux), resolves a reason to skip instead. */
 async function listenOnAllInterfaces(host: string, port: number): Promise<Server | string> {
 	let server: Server;
 	try {
