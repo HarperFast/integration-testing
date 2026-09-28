@@ -593,7 +593,13 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	);
 	const dataRootDir = ctx.harper?.dataRootDir ?? (await mkdtemp(dataRootDirPrefix));
 
-	const loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
+	let loopbackAddress: string;
+	try {
+		loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
+	} catch (error) {
+		if (!ctx.harper?.dataRootDir) await rm(dataRootDir, { recursive: true, force: true });
+		throw error;
+	}
 
 	// Set up per-suite log directory when HARPER_INTEGRATION_TEST_LOG_DIR is configured
 	const logDirEnv = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;

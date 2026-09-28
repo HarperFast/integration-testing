@@ -1,7 +1,7 @@
 import { test } from 'node:test';
-import { ok, strictEqual } from 'node:assert';
+import { ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
-import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
+import { acceptsConnections, findAcceptingPort, isPortFree, waitForPortsFree } from '../src/portUtils.ts';
 
 const HOST = '127.0.0.1';
 const IS_CI = !!process.env.CI;
@@ -103,4 +103,31 @@ test('waitForPortsFree resolves false when a port stays held past the timeout', 
 	} finally {
 		await close(server);
 	}
+});
+
+test('acceptsConnections returns false when nothing listens on the port', async () => {
+	await withFreePorts(HOST, 1, async ([port]) => {
+		strictEqual(await acceptsConnections(HOST, port), false);
+	});
+});
+
+test('acceptsConnections rejects when the probe cannot be made at all', async () => {
+	await rejects(acceptsConnections(HOST, 70000), { code: 'ERR_SOCKET_BAD_PORT' });
+});
+
+test('findAcceptingPort finds a listener bound to all interfaces through a loopback address', async () => {
+	const { server, port } = await listenEphemeral('0.0.0.0');
+	try {
+		await withFreePorts(HOST, 1, async ([freePort]) => {
+			strictEqual(await findAcceptingPort(HOST, [freePort, port]), port);
+		});
+	} finally {
+		await close(server);
+	}
+});
+
+test('findAcceptingPort returns null when no port accepts', async () => {
+	await withFreePorts(HOST, 2, async (ports) => {
+		strictEqual(await findAcceptingPort(HOST, ports), null);
+	});
 });
