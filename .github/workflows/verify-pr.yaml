@@ -22,7 +22,7 @@ jobs:
       # Run every OS/Node combination even if one fails, so the full matrix is visible.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [22, 24, 26]
     steps:
       - name: Checkout

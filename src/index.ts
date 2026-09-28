@@ -23,6 +23,7 @@ export {
 	getNextAvailableLoopbackAddress,
 	releaseLoopbackAddress,
 	releaseAllLoopbackAddressesForCurrentProcess,
+	ForeignListenerError,
 } from './loopbackAddressPool.ts';
 
 export { targz } from './targz.ts';

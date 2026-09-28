@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { findAcceptingPort } from './portUtils.ts';
 
 // Configuration constants
 // The pool starts at 127.0.0.2 by default (rather than 127.0.0.1) to avoid conflicting
@@ -93,6 +94,33 @@ class InvalidLoopbackAddressError extends Error {
 		);
 		this.name = 'InvalidLoopbackAddressError';
 	}
+}
+
+const ALLOW_FOREIGN_LISTENERS_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
+
+/**
+ * Thrown by {@link getNextAvailableLoopbackAddress} when another process accepts connections on one of
+ * a newly allocated address's canary ports before any Harper node runs there. The usual cause is a
+ * service listening on all interfaces, which covers every pool address, so another address would not
+ * help.
+ */
+export class ForeignListenerError extends Error {
+	loopbackAddress: string;
+	port: number;
+
+	constructor(address: string, port: number) {
+		super(
+			`Another process accepts connections on ${address}:${port}, a port the Harper node on this address will bind, before that node has started — most likely a service listening on all interfaces, such as a local Harper instance. Whenever the node has no listener of its own there (while it starts, while its HTTP workers restart, after teardown), its clients connect to that process instead, and keep-alive connections stay with it. Stop that process or bind it to a specific address (\`lsof -nP -iTCP:${port} -sTCP:LISTEN\`, or \`netstat -ano | findstr :${port}\` on Windows, names it), or set ${ALLOW_FOREIGN_LISTENERS_ENV}=1 to run anyway.`
+		);
+		this.name = 'ForeignListenerError';
+		this.loopbackAddress = address;
+		this.port = port;
+	}
+}
+
+function foreignListenersAllowed(): boolean {
+	const value = process.env[ALLOW_FOREIGN_LISTENERS_ENV];
+	return value === '1' || value?.toLowerCase() === 'true';
 }
 
 /**
@@ -351,7 +379,8 @@ export async function validateLoopbackAddressPool(): Promise<{
  * 3. Finds the first available (null) slot and assigns the current process PID to it
  * 4. Writes the updated pool back to disk and releases the lock
  * 5. Validates that the allocated address can actually be bound to
- * 6. Returns the loopback address (e.g., "127.0.0.2")
+ * 6. Checks that no other process accepts connections on the address's canary ports
+ * 7. Returns the loopback address (e.g., "127.0.0.2")
  *
  * If no addresses are available, waits and retries until one becomes available.
  *
@@ -360,6 +389,8 @@ export async function validateLoopbackAddressPool(): Promise<{
  *
  * @returns A promise that resolves with an allocated loopback address
  * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to
+ * @throws {ForeignListenerError} If another process accepts connections on the address's canary
+ * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
@@ -436,7 +467,27 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
 			}
 			if (conflictingPort === null) {
-				return loopbackAddress;
+				// The canary's exclusive bind just succeeded, so a listener that still accepts here is
+				// almost always bound more broadly, which macOS allows beside that bind (Linux refuses it,
+				// so the canary above reports that shape instead).
+				let shadowedPort: number | null;
+				try {
+					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
+				} catch (error) {
+					await releaseLoopbackAddress(loopbackAddress);
+					throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
+				}
+				if (shadowedPort === null) {
+					return loopbackAddress;
+				}
+				if (foreignListenersAllowed()) {
+					console.warn(
+						`[loopback-pool] Another process accepts connections on ${loopbackAddress}:${shadowedPort}; continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set. This node's clients reach that process whenever the node has no listener of its own there.`
+					);
+					return loopbackAddress;
+				}
+				await releaseLoopbackAddress(loopbackAddress);
+				throw new ForeignListenerError(loopbackAddress, shadowedPort);
 			}
 
 			// Release the slot back to the pool (so it isn't leaked under our PID) and remember
