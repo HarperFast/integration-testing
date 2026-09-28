@@ -469,9 +469,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
 			}
 			if (conflictingPort === null) {
-				// The canary's exclusive bind just succeeded, so a listener that still accepts here is
-				// almost always bound more broadly, which macOS allows beside that bind (Linux refuses it,
-				// so the canary above reports that shape instead).
+				// macOS lets the canary's exclusive bind succeed beside a listener on all interfaces; Linux refuses it.
 				let shadowedPort: number | null;
 				try {
 					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
