@@ -474,7 +474,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				try {
 					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
 				} catch (error) {
-					const reason = (error as Error).message;
+					const reason = error instanceof Error ? error.message : String(error);
 					if (foreignListenersAllowed()) {
 						console.warn(
 							`[loopback-pool] Could not check ${loopbackAddress} for another process's listener (${reason}); continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set.`
