@@ -80,7 +80,7 @@ Edit the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` value in the installed pl
 
 ### Other services listening on Harper's ports
 
-Each node binds its fixed ports on its own loopback address, so nodes on different addresses coexist. A process listening on the same port on **all interfaces** is different — a local Harper instance running with its default configuration is the usual one. On macOS, that process receives a node's connections whenever the node has no listener of its own on its address: while the node starts, while its HTTP workers restart, and after teardown. Keep-alive connections then stay with it, so a suite fails, or passes, against the wrong server.
+Each node binds its fixed ports on its own loopback address, so nodes on different addresses coexist. A process listening on the same port on **all interfaces** is different — a local Harper instance running with its default configuration is the usual one. On macOS and Windows, that process receives a node's connections whenever the node has no listener of its own on its address: while the node starts, while its HTTP workers restart, and after teardown. Keep-alive connections then stay with it, so a suite fails, or passes, against the wrong server.
 
 `getNextAvailableLoopbackAddress`, and therefore `startHarper`, refuses an address when another process already accepts connections on its operations or HTTP port, throwing a `ForeignListenerError` that names the port. Stop the other process or bind it to a specific address (`lsof -nP -iTCP:9926 -sTCP:LISTEN` names it). To run anyway, set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1`, which turns the error into a warning.
 

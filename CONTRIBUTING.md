@@ -29,7 +29,7 @@ Tests live in `test/` (separate from `src/`) and run on the built-in Node.js tes
 
 Internal-only helpers may be exported from their modules for testing (e.g. `runHarperCommand` in `harperLifecycle.ts`) but are deliberately **not** re-exported from `src/index.ts`, keeping them out of the public API.
 
-`loopbackAddressPool.ts` reads its pool file location, address range, and canary ports from the environment once, when it is imported, so `test/loopbackAddressPool.test.ts` sets them before a dynamic import: a private pool file in its own temp directory, and `127.0.0.1`, the one address every OS has without aliases. Its foreign-listener cases need an OS that lets an exclusive bind of that address succeed beside a listener on all interfaces, as macOS does; where the bind conflicts instead (Linux), the conflict canary refuses the address first and those cases skip themselves. That is why CI includes a macOS job.
+`loopbackAddressPool.ts` reads its pool file location, address range, and canary ports from the environment once, when it is imported, so `test/loopbackAddressPool.test.ts` sets them before a dynamic import: a private pool file in its own temp directory, and `127.0.0.1`, the one address every OS has without aliases. Its foreign-listener cases need an OS that lets an exclusive bind of that address succeed beside a listener on all interfaces, as macOS and Windows do; where the bind conflicts instead (Linux), the conflict canary refuses the address first and those cases skip themselves. That is why CI includes a macOS job alongside Linux and Windows.
 
 ## Releases
 
