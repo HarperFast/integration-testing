@@ -30,6 +30,12 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
 
+// How long an unusable pool file must go unmodified before it is reinitialized. The reservations
+// it lost may belong to runners that haven't bound their address yet, which the conflict canary
+// cannot see, so this has to outlast startHarper's reserve-to-bind time: DEFAULT_STARTUP_MAX_MS
+// (300s under CI) in harperLifecycle.ts, plus a minute for the work before that watchdog starts.
+const UNUSABLE_POOL_QUARANTINE_MS = 360000;
+
 // Port used as a conflict canary when allocating an address. This MUST be a port that
 // Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
 // harperLifecycle.ts — does exactly that, main-thread-only). Because that port is
@@ -203,35 +209,63 @@ async function withLock<T>(callback: () => Promise<T>): Promise<T> {
 	}
 }
 
+const quarantinedPoolPaths = new Set<string>();
+
+function emptyPool(): LoopbackPool {
+	return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
+}
+
 /**
  * Reads the loopback pool from the pool file. The pool is a JSON array where each
  * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
- * A missing, unparseable, non-array, or empty file all reinitialize to an empty pool rather
- * than throw. A non-empty array of any other length is trusted as-is, even if it doesn't
- * match this process's configured count: two processes configured with different counts
- * sharing this file would otherwise perpetually reinitialize each other's out of it.
+ * A missing file reads as an empty pool. An unusable one (unparseable, not an array, or an empty
+ * array) is quarantined instead: it is either still being written by a writer that doesn't publish
+ * by rename, or it has lost reservations whose holders may not have bound their address yet. This
+ * returns `null` until the file has gone UNUSABLE_POOL_QUARANTINE_MS unmodified, and an empty pool
+ * after that. A non-empty array of any other length is trusted as-is, even if it doesn't match
+ * this process's configured count: two processes configured with different counts sharing this
+ * file would otherwise perpetually reinitialize each other's out of it.
  *
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
- * @returns The loopback pool array
+ * @returns The loopback pool array, or `null` while the pool file is quarantined
  */
-export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH): Promise<LoopbackPool> {
+export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH): Promise<LoopbackPool | null> {
+	let problem: string;
 	try {
-		const content = await readFile(poolPath, 'utf-8');
-		const parsed: unknown = JSON.parse(content);
-		if (!Array.isArray(parsed) || parsed.length === 0) {
-			throw new SyntaxError(`pool file did not contain a non-empty JSON array (got ${typeof parsed})`);
+		const parsed: unknown = JSON.parse(await readFile(poolPath, 'utf-8'));
+		if (Array.isArray(parsed) && parsed.length > 0) {
+			quarantinedPoolPaths.delete(poolPath);
+			return parsed as LoopbackPool;
 		}
-		return parsed as LoopbackPool;
+		problem = Array.isArray(parsed) ? 'empty array' : `JSON ${parsed === null ? 'null' : typeof parsed} instead of an array`;
 	} catch (error) {
-		if (error instanceof SyntaxError) {
-			console.warn(`[loopback-pool] ${poolPath} is corrupt; reinitializing. ${error.message}`);
-		} else if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-			throw error;
-		}
-		return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPool();
+		if (!(error instanceof SyntaxError)) throw error;
+		problem = error.message;
 	}
+
+	let modifiedMs: number;
+	try {
+		modifiedMs = (await stat(poolPath)).mtimeMs;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPool();
+		throw error;
+	}
+	const unmodifiedMs = Date.now() - modifiedMs;
+	if (unmodifiedMs < UNUSABLE_POOL_QUARANTINE_MS) {
+		if (!quarantinedPoolPaths.has(poolPath)) {
+			quarantinedPoolPaths.add(poolPath);
+			console.warn(
+				`[loopback-pool] ${poolPath} is unusable (${problem}); allocation waits until it has gone ${UNUSABLE_POOL_QUARANTINE_MS / 1000}s unmodified, then reinitializes it. Deleting it skips the wait, but only once every integration-test run on this machine has stopped.`
+			);
+		}
+		return null;
+	}
+	quarantinedPoolPaths.delete(poolPath);
+	console.warn(`[loopback-pool] ${poolPath} has been unusable for ${Math.round(unmodifiedMs / 1000)}s (${problem}); reinitializing.`);
+	return emptyPool();
 }
 
 let pendingWriteCounter = 0;
@@ -420,7 +454,8 @@ export async function validateLoopbackAddressPool(): Promise<{
  * 6. Checks that no other process accepts connections on the address's canary ports
  * 7. Returns the loopback address (e.g., "127.0.0.2")
  *
- * If no addresses are available, waits and retries until one becomes available.
+ * If no addresses are available, or the pool file is quarantined (see readPoolFile), waits and
+ * retries until one becomes available.
  *
  * **Pool file location:** `${tmpdir()}/harper-integration-test-loopback-pool.json`
  * **Lock file location:** `${tmpdir()}/harper-integration-test-loopback-pool.lock`
@@ -458,6 +493,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 		const assignedIndex = await withLock(async () => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile();
+			if (!loopbackPool) return null;
 
 			// Find the first available index we haven't already found in-use this attempt
 			let index: number | null = null;
@@ -576,6 +612,11 @@ function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
 /**
  * Releases a loopback address back to the pool, making it available for other processes.
  *
+ * Only a slot this process holds is cleared: once the pool has been reinitialized, the same slot
+ * may already be another runner's reservation. Nothing is written while the pool file is
+ * quarantined (see readPoolFile): the reservation is already gone from it, and rewriting it would
+ * end the quarantine early.
+ *
  * @param address The loopback address to release (e.g., "127.0.0.2")
  * @throws InvalidLoopbackAddressError if the address format is invalid
  */
@@ -586,6 +627,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 	await withLock(async () => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
+		if (!loopbackPool || loopbackPool[index] !== process.pid) return;
 
 		// Release the address by setting it to null
 		loopbackPool[index] = null;
@@ -597,12 +639,14 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 
 /**
  * Releases all loopback addresses assigned to the current process.
- * Useful for cleanup during graceful shutdown.
+ * Useful for cleanup during graceful shutdown. Like releaseLoopbackAddress, writes nothing while
+ * the pool file is quarantined.
  */
 export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<void> {
 	await withLock(async () => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
+		if (!loopbackPool) return;
 
 		// Find and release all addresses assigned to this process
 		for (let i = 0; i < loopbackPool.length; i++) {
