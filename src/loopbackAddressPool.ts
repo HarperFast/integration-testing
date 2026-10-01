@@ -30,10 +30,9 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
 
-// How long an unusable pool file must go unmodified before it is reinitialized. The reservations
-// it lost may belong to runners that haven't bound their address yet, which the conflict canary
-// cannot see, so this has to outlast startHarper's reserve-to-bind time: DEFAULT_STARTUP_MAX_MS
-// (300s under CI) in harperLifecycle.ts, plus a minute for the work before that watchdog starts.
+// How long an unusable pool file must go unmodified before it is reinitialized. The reservations it
+// lost may not be bound yet, which the conflict canary can't see, so this must outlast startHarper's
+// reserve-to-bind time: its startup ceiling (DEFAULT_STARTUP_MAX_MS) plus the setup before it.
 const UNUSABLE_POOL_QUARANTINE_MS = 360000;
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
@@ -223,10 +222,10 @@ function emptyPool(): LoopbackPool {
  * A missing file reads as an empty pool. An unusable one (unparseable, not an array, or an empty
  * array) is quarantined instead: it is either still being written by a writer that doesn't publish
  * by rename, or it has lost reservations whose holders may not have bound their address yet. This
- * returns `null` until the file has gone UNUSABLE_POOL_QUARANTINE_MS unmodified, and an empty pool
- * after that. A non-empty array of any other length is trusted as-is, even if it doesn't match
- * this process's configured count: two processes configured with different counts sharing this
- * file would otherwise perpetually reinitialize each other's out of it.
+ * returns `null` until the file has gone UNUSABLE_POOL_QUARANTINE_MS unmodified; after that it
+ * publishes and returns an empty pool. A non-empty array of any other length is trusted as-is, even
+ * if it doesn't match this process's configured count: two processes configured with different
+ * counts would otherwise keep wiping each other's reservations.
  *
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
  * @returns The loopback pool array, or `null` while the pool file is quarantined
@@ -265,7 +264,9 @@ export async function readPoolFile(poolPath: string = HARPER_LOOPBACK_POOL_PATH)
 	}
 	quarantinedPoolPaths.delete(poolPath);
 	console.warn(`[loopback-pool] ${poolPath} has been unusable for ${Math.round(unmodifiedMs / 1000)}s (${problem}); reinitializing.`);
-	return emptyPool();
+	const pool = emptyPool();
+	await writePoolFile(pool, poolPath);
+	return pool;
 }
 
 let pendingWriteCounter = 0;
@@ -274,8 +275,8 @@ let pendingWriteCounter = 0;
  * Writes the loopback pool to the pool file as JSON.
  *
  * Publishes by write-to-temp-then-rename, so readers only ever see the old complete file or
- * the new complete file. The pending name must be unpredictable, not just unique — a fixed
- * or guessable one could be pre-planted as a symlink.
+ * the new complete file. The pending name must be unpredictable, not just unique: `wx` refuses
+ * a file already at that name, so a guessable one could be pre-planted to make every write fail.
  *
  * @param pool The loopback pool array to persist
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
@@ -649,13 +650,15 @@ export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<vo
 		if (!loopbackPool) return;
 
 		// Find and release all addresses assigned to this process
+		let released = false;
 		for (let i = 0; i < loopbackPool.length; i++) {
 			if (loopbackPool[i] === process.pid) {
 				loopbackPool[i] = null;
+				released = true;
 			}
 		}
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		if (released) await writePoolFile(loopbackPool);
 	});
 }

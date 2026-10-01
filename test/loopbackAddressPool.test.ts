@@ -272,6 +272,7 @@ test('readPoolFile quarantines an unusable pool file, then reinitializes it once
 			await age(poolPath);
 			const pool = await readPoolFile(poolPath);
 			ok(pool && pool.length > 0 && pool.every((slot) => slot === null), `aged ${JSON.stringify(content)} should reinitialize`);
+			deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), pool, 'the reinitialized pool should be published');
 		}
 	});
 });
