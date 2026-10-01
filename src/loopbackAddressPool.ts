@@ -1,8 +1,8 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomBytes } from 'node:crypto';
-import { basename, dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { lstat, open, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 
 // Configuration constants
@@ -28,7 +28,6 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
-const PENDING_FILE_STALE_TIMEOUT_MS = LOCK_STALE_TIMEOUT_MS;
 
 let lockTokenCounter = 0;
 
@@ -114,11 +113,10 @@ class LockOwnershipLostError extends Error {
  * a simple but effective cross-process mutex. Handles stale locks by removing lock files
  * older than LOCK_STALE_TIMEOUT_MS (10 seconds).
  *
- * @returns The token that identifies this lock acquisition and whether it reclaimed a stale lock
+ * @returns The token that identifies this lock acquisition
  */
-async function acquireLock(): Promise<{ token: string; reclaimedStaleLock: boolean }> {
+async function acquireLock(): Promise<string> {
 	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
-	let reclaimedStaleLock = false;
 	while (true) {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
@@ -131,7 +129,7 @@ async function acquireLock(): Promise<{ token: string; reclaimedStaleLock: boole
 				throw error;
 			}
 			await lockFileHandle.close();
-			return { token, reclaimedStaleLock };
+			return token;
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
 			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -140,7 +138,6 @@ async function acquireLock(): Promise<{ token: string; reclaimedStaleLock: boole
 					// If the lock file is older than the timeout, consider it stale and remove it
 					if (Date.now() - lockFileStat.mtimeMs > LOCK_STALE_TIMEOUT_MS) {
 						await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
-						reclaimedStaleLock = true;
 					}
 				} catch {
 					// Lock file may have been removed by another process, continue
@@ -178,28 +175,6 @@ async function assertLockHeld(token: string): Promise<void> {
 	if (currentToken !== token) throw new LockOwnershipLostError();
 }
 
-export async function sweepStalePendingPoolFiles(
-	poolPath: string = HARPER_LOOPBACK_POOL_PATH,
-	now: number = Date.now()
-): Promise<void> {
-	let fileNames: string[];
-	try {
-		fileNames = await readdir(dirname(poolPath));
-	} catch {
-		return;
-	}
-	const pendingPrefix = `${basename(poolPath)}.`;
-	for (const fileName of fileNames) {
-		if (!fileName.startsWith(pendingPrefix)) continue;
-		if (!/^\d+\.\d+\.[0-9a-f]+\.pending$/.test(fileName.slice(pendingPrefix.length))) continue;
-		const pendingPath = join(dirname(poolPath), fileName);
-		try {
-			const pendingStat = await lstat(pendingPath);
-			if (now - pendingStat.mtimeMs > PENDING_FILE_STALE_TIMEOUT_MS) await unlink(pendingPath);
-		} catch {}
-	}
-}
-
 /**
  * Executes a callback while holding the lock and releases only the lock this call acquired.
  * A section superseded before publication is rerun from fresh pool state so teardown callers
@@ -210,9 +185,8 @@ export async function sweepStalePendingPoolFiles(
  */
 export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
 	while (true) {
-		const { token, reclaimedStaleLock } = await acquireLock();
+		const token = await acquireLock();
 		try {
-			if (reclaimedStaleLock) await sweepStalePendingPoolFiles();
 			return await callback(token);
 		} catch (error) {
 			if (!(error instanceof LockOwnershipLostError)) throw error;
