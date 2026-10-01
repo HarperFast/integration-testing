@@ -38,7 +38,12 @@ const probeFails = await acceptsConnections(HOST, 0).then(
 	() => false,
 	() => true
 );
-const SKIP = probeFails ? false : 'connecting to port 0 is refused here, so the probe cannot be made to fail';
+const SKIP =
+	process.platform === 'linux'
+		? 'Linux skips the probe'
+		: probeFails
+			? false
+			: 'connecting to port 0 is refused here, so the probe cannot be made to fail';
 
 function readPool(): unknown {
 	return JSON.parse(readFileSync(join(poolDir, 'harper-integration-test-loopback-pool.json'), 'utf-8'));

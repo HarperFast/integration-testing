@@ -56,17 +56,22 @@ export function acceptsConnections(host: string, port: number, timeoutMs = 1000)
 
 /**
  * Returns the first of `ports` on `host` that accepts a TCP connection (see
- * {@link acceptsConnections}), or `null` if none does. The ports are probed concurrently, and a probe
- * that could not be made rejects the whole call.
+ * {@link acceptsConnections}), or `null` if none does. The ports are probed concurrently. A port that
+ * accepts wins over one that could not be checked; when none accepts, a probe that could not be made
+ * rejects the call with its error.
  *
  * @param host The host/address to connect to (e.g. "127.0.0.2")
  * @param ports The ports to probe
  * @param timeoutMs How long to wait for each handshake
  */
 export async function findAcceptingPort(host: string, ports: number[], timeoutMs?: number): Promise<number | null> {
-	const accepted = await Promise.all(ports.map((port) => acceptsConnections(host, port, timeoutMs)));
-	const index = accepted.indexOf(true);
-	return index === -1 ? null : ports[index];
+	const outcomes = await Promise.allSettled(ports.map((port) => acceptsConnections(host, port, timeoutMs)));
+	const index = outcomes.findIndex((outcome) => outcome.status === 'fulfilled' && outcome.value);
+	if (index !== -1) return ports[index];
+	for (const outcome of outcomes) {
+		if (outcome.status === 'rejected') throw outcome.reason;
+	}
+	return null;
 }
 
 /**

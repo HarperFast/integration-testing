@@ -28,12 +28,13 @@ export async function startChildListener(host: string, port: number): Promise<Ch
 			if (String(data).includes('listening')) resolve();
 		});
 	});
+	const connectHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
 	const fillers: Socket[] = [];
 	return {
 		async stall() {
 			child.kill('SIGSTOP');
 			for (let attempt = 0; attempt < 32; attempt++) {
-				const socket = connect({ host: '127.0.0.1', port });
+				const socket = connect({ host: connectHost, port });
 				socket.on('error', () => {});
 				fillers.push(socket);
 				const connected = await Promise.race([once(socket, 'connect').then(() => true), sleep(1000).then(() => false)]);
