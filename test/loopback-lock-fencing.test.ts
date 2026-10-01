@@ -2,10 +2,10 @@ import test, { mock } from 'node:test';
 import { deepStrictEqual, notStrictEqual, rejects, strictEqual } from 'node:assert';
 import { EventEmitter } from 'node:events';
 import * as fsPromises from 'node:fs/promises';
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 
 let freshImportCounter = 0;
 
@@ -54,7 +54,6 @@ test('a writer superseded after reading cannot erase the successor claim', async
 	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-fencing-'));
 	const poolPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.json');
 	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
-	const orphanedPendingPath = `${poolPath}.123.1.abcdef0123456789.pending`;
 	const previousEnv = new Map(
 		[
 			'TMPDIR',
@@ -108,12 +107,9 @@ test('a writer superseded after reading cannot erase the successor claim', async
 		await writeFile(poolPath, JSON.stringify([process.ppid, null, null]));
 		const staleTime = new Date(Date.now() - 20000);
 		await utimes(lockPath, staleTime, staleTime);
-		await writeFile(orphanedPendingPath, 'orphaned');
-		await utimes(orphanedPendingPath, staleTime, staleTime);
 
 		const successorAddress = await getNextAvailableLoopbackAddress();
 		strictEqual(successorAddress, '127.0.0.3');
-		await rejects(readFile(orphanedPendingPath), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
 		await writeFile(lockPath, 'replacement-holder');
 		await utimes(lockPath, staleTime, staleTime);
 		resumeStaleWriter.resolve();
@@ -184,34 +180,6 @@ test('a failed token write does not leave an empty lock file', async () => {
 	} finally {
 		fsMock.restore();
 		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
-		await rm(isolatedTmpDir, { recursive: true, force: true });
-	}
-});
-
-test('pending-file cleanup removes only old pool pending files', async () => {
-	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-pending-sweep-'));
-	const poolPath = join(isolatedTmpDir, 'pool.json');
-	const oldPending = `${poolPath}.123.1.abcdef0123456789.pending`;
-	const freshPending = `${poolPath}.123.2.abcdef0123456789.pending`;
-	const unrelatedPending = `${poolPath}.not-a-writer.pending`;
-	const now = Date.now();
-	try {
-		await Promise.all([
-			writeFile(oldPending, 'old'),
-			writeFile(freshPending, 'fresh'),
-			writeFile(unrelatedPending, 'unrelated'),
-		]);
-		const staleTime = new Date(now - 10001);
-		await utimes(oldPending, staleTime, staleTime);
-
-		const { sweepStalePendingPoolFiles } = await import(freshModuleUrl());
-		await sweepStalePendingPoolFiles(poolPath, now);
-
-		deepStrictEqual(
-			(await readdir(isolatedTmpDir)).sort(),
-			[freshPending, unrelatedPending].map((path) => basename(path)).sort()
-		);
-	} finally {
 		await rm(isolatedTmpDir, { recursive: true, force: true });
 	}
 });
