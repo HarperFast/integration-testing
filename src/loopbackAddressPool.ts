@@ -181,13 +181,12 @@ function emptyPool(): LoopbackPool {
  * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
- * A missing file reads as an empty pool. An unusable one (unparseable, not an array, or an empty
- * array) is quarantined instead: it is either still being written by a writer that doesn't publish
- * by rename, or it has lost reservations whose holders may not have bound their address yet. This
- * returns `null` until the file has gone UNUSABLE_POOL_QUARANTINE_MS unmodified; after that it
- * publishes and returns an empty pool. A non-empty array of any other length is trusted as-is, even
- * if it doesn't match this process's configured count: two processes configured with different
- * counts would otherwise keep wiping each other's reservations.
+ * An unusable file (unparseable, not an array, or an empty array) may still be mid-write by a
+ * writer that doesn't publish by rename, or may have lost reservations whose holders haven't bound
+ * their address yet, so it reads as `null` until it has gone UNUSABLE_POOL_QUARANTINE_MS
+ * unmodified, and only then is replaced with an empty pool. A non-empty array of another length
+ * is trusted as-is: two processes configured with different counts would otherwise keep wiping
+ * each other's reservations.
  *
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
  * @returns The loopback pool array, or `null` while the pool file is quarantined
@@ -566,8 +565,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 
 /**
  * Releases all loopback addresses assigned to the current process.
- * Useful for cleanup during graceful shutdown. Like releaseLoopbackAddress, writes nothing while
- * the pool file is quarantined.
+ * Useful for cleanup during graceful shutdown.
  */
 export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<void> {
 	await withLock(async () => {

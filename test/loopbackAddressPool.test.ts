@@ -24,8 +24,7 @@ async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> 
 
 const POOL_FILE_NAME = 'harper-integration-test-loopback-pool.json';
 
-/** Makes a file look like it was last written an hour ago, well past the quarantine. */
-async function age(path: string): Promise<void> {
+async function ageBeyondQuarantine(path: string): Promise<void> {
 	const anHourAgo = new Date(Date.now() - 3600000);
 	await utimes(path, anHourAgo, anHourAgo);
 }
@@ -65,7 +64,7 @@ test('readPoolFile quarantines an unusable pool file, then reinitializes it once
 			await writeFile(poolPath, content);
 			strictEqual(await readPoolFile(poolPath), null, `fresh ${JSON.stringify(content)} should be quarantined`);
 
-			await age(poolPath);
+			await ageBeyondQuarantine(poolPath);
 			const pool = await readPoolFile(poolPath);
 			ok(pool && pool.length > 0 && pool.every((slot) => slot === null), `aged ${JSON.stringify(content)} should reinitialize`);
 			deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), pool, 'the reinitialized pool should be published');
@@ -111,7 +110,7 @@ test('a reservation lost to an unusable pool file is not reissued until the quar
 			await pool.releaseAllLoopbackAddressesForCurrentProcess();
 			strictEqual(await readFile(poolPath, 'utf-8'), '[', 'releasing must not end the quarantine');
 
-			await age(poolPath);
+			await ageBeyondQuarantine(poolPath);
 			strictEqual(await Promise.race([reissued, sleep(5000).then(() => 'still waiting')]), '127.0.0.1');
 		} finally {
 			// Unblocks the allocation if an assertion above failed, so the test can't hang.
