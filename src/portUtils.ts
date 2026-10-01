@@ -25,15 +25,15 @@ export function isPortFree(host: string, port: number): Promise<boolean> {
 /**
  * Checks whether something accepts TCP connections on `host:port`.
  *
- * Resolves `true` once a handshake completes and `false` when the connection is refused. No answer
- * within `timeoutMs` is inconclusive and also resolves `false`. Any other failure means the check
+ * Resolves `true` once a handshake completes and `false` when the connection is refused. Anything
+ * else, including no answer within `timeoutMs` (a listener whose handshake stalls), means the check
  * could not be made, so it rejects with that error. The connection is closed as soon as it opens,
  * before anything is sent.
  *
  * @param host The host/address to connect to (e.g. "127.0.0.2")
  * @param port The port to connect to
  * @param timeoutMs How long to wait for the handshake (default 1000ms)
- * @returns A promise resolving to `true` if a connection was accepted, `false` if it was refused or timed out
+ * @returns A promise resolving to `true` if a connection was accepted, `false` if it was refused
  */
 export function acceptsConnections(host: string, port: number, timeoutMs = 1000): Promise<boolean> {
 	return new Promise((resolve, reject) => {
@@ -46,7 +46,9 @@ export function acceptsConnections(host: string, port: number, timeoutMs = 1000)
 			if (outcome instanceof Error) reject(outcome);
 			else resolve(outcome);
 		};
-		socket.setTimeout(timeoutMs, () => settle(false));
+		socket.setTimeout(timeoutMs, () =>
+			settle(Object.assign(new Error(`No answer from ${host}:${port} within ${timeoutMs} ms`), { code: 'ETIMEDOUT' }))
+		);
 		socket.once('connect', () => settle(true));
 		socket.on('error', (error: NodeJS.ErrnoException) => settle(error.code === 'ECONNREFUSED' ? false : error));
 	});

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import { ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import { acceptsConnections, findAcceptingPort, isPortFree, waitForPortsFree } from '../src/portUtils.ts';
+import { startChildListener } from './stalledListener.ts';
 
 const HOST = '127.0.0.1';
 const IS_CI = !!process.env.CI;
@@ -110,6 +111,21 @@ test('acceptsConnections returns false when nothing listens on the port', async 
 		strictEqual(await acceptsConnections(HOST, port), false);
 	});
 });
+
+test(
+	'acceptsConnections rejects when the handshake gets no answer in time',
+	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
+	async () => {
+		const [port] = await getFreePorts(HOST, 1);
+		const listener = await startChildListener(HOST, port);
+		try {
+			await listener.stall();
+			await rejects(acceptsConnections(HOST, port, 300), { code: 'ETIMEDOUT' });
+		} finally {
+			await listener.close();
+		}
+	}
+);
 
 test('acceptsConnections rejects when the probe cannot be made at all', async () => {
 	await rejects(acceptsConnections(HOST, 70000), { code: 'ERR_SOCKET_BAD_PORT' });

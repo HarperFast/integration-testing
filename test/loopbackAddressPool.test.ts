@@ -1,11 +1,12 @@
 import { test, after } from 'node:test';
 import { deepStrictEqual, match, ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isPortFree } from '../src/portUtils.ts';
+import { startChildListener } from './stalledListener.ts';
 
 const HOST = '127.0.0.1';
 const ALLOW_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
@@ -40,7 +41,9 @@ process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort)
 process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = String(httpPort);
 delete process.env[ALLOW_ENV];
 const { getNextAvailableLoopbackAddress, releaseLoopbackAddress } = await import('../src/loopbackAddressPool.ts');
-const { startHarper, publishHarperNode, createHarperContext } = await import('../src/harperLifecycle.ts');
+const { startHarper, setupHarperWithFixture, publishHarperNode, createHarperContext } = await import(
+	'../src/harperLifecycle.ts'
+);
 
 after(() => rmSync(poolDir, { recursive: true, force: true }));
 
@@ -158,7 +161,23 @@ test('waits out a listener bound to the address itself instead of refusing it', 
 	await releaseLoopbackAddress(HOST);
 });
 
-test('startHarper removes the install directory it created when allocation refuses the address', async (t) => {
+test('refuses an address whose port answers no handshake, as one that could not be checked', async (t) => {
+	if (process.platform === 'win32') return t.skip('stalling a handshake needs SIGSTOP');
+	const listener = await startChildListener('0.0.0.0', httpPort);
+	try {
+		if (!(await isPortFree(HOST, httpPort))) return t.skip(CANARY_CATCHES_IT);
+		await listener.stall();
+		const error = await refusal();
+		strictEqual(error.name, 'LoopbackAddressValidationError');
+		match(error.message, new RegExp(`No answer from ${HOST}:${httpPort}`));
+		match(error.message, new RegExp(`${ALLOW_ENV}=1`));
+	} finally {
+		await listener.close();
+	}
+	deepStrictEqual(readPool(), [null], 'the refused address must go back to the pool');
+});
+
+test('startHarper and setupHarperWithFixture remove the install directory they created when allocation refuses the address', async (t) => {
 	const listener = await listenOnAllInterfaces('0.0.0.0', httpPort);
 	if (typeof listener === 'string') return t.skip(listener);
 	const installParent = join(poolDir, 'installs');
@@ -168,6 +187,13 @@ test('startHarper removes the install directory it created when allocation refus
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(poolDir, 'no-such-harper.js');
 	try {
 		await rejects(startHarper(createHarperContext('refused')), { name: 'ForeignListenerError' });
+		deepStrictEqual(readdirSync(installParent), []);
+
+		const fixture = mkdtempSync(join(poolDir, 'fixture-'));
+		writeFileSync(join(fixture, 'config.yaml'), '');
+		await rejects(setupHarperWithFixture(createHarperContext('refused-fixture'), fixture), {
+			name: 'ForeignListenerError',
+		});
 		deepStrictEqual(readdirSync(installParent), []);
 
 		const callerDir = mkdtempSync(join(installParent, 'caller-'));
