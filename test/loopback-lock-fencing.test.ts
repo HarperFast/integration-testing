@@ -2,7 +2,7 @@ import test, { mock } from 'node:test';
 import { deepStrictEqual, notStrictEqual, rejects, strictEqual } from 'node:assert';
 import { EventEmitter } from 'node:events';
 import * as fsPromises from 'node:fs/promises';
-import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, unlink, utimes, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,6 +96,7 @@ test('a writer superseded after reading cannot erase the successor claim', async
 			createServer: createAvailableServer,
 		},
 	});
+	const warn = mock.method(console, 'warn', () => {});
 
 	let staleWriter: Promise<string> | undefined;
 	try {
@@ -117,11 +118,13 @@ test('a writer superseded after reading cannot erase the successor claim', async
 		const staleWriterAddress = await staleWriter;
 		notStrictEqual(staleWriterAddress, successorAddress);
 		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), [process.ppid, process.pid, process.pid]);
+		strictEqual(warn.mock.callCount(), 1);
 	} finally {
 		resumeStaleWriter.resolve();
 		await staleWriter?.catch(() => {});
 		fsMock.restore();
 		netMock.restore();
+		warn.mock.restore();
 		for (const [name, value] of previousEnv) restoreEnv(name, value);
 		await rm(isolatedTmpDir, { recursive: true, force: true });
 	}
@@ -179,6 +182,39 @@ test('a failed token write does not leave an empty lock file', async () => {
 		await rejects(readFile(lockPath), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
 	} finally {
 		fsMock.restore();
+		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
+		await rm(isolatedTmpDir, { recursive: true, force: true });
+	}
+});
+
+test('a holder that keeps losing the lock gives up instead of retrying forever', async () => {
+	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-persistent-loss-'));
+	const poolPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.json');
+	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
+	const previousTmpEnv = new Map(['TMPDIR', 'TMP', 'TEMP'].map((name) => [name, process.env[name]]));
+	for (const name of previousTmpEnv.keys()) process.env[name] = isolatedTmpDir;
+	const fsMock = mock.module('node:fs/promises', {
+		namedExports: {
+			...fsPromises,
+			readFile: async (path: string, encoding: BufferEncoding) => {
+				const contents = await readFile(path, encoding);
+				// Every section has its lock reclaimed as stale between reading and publishing.
+				if (path === poolPath) await unlink(lockPath);
+				return contents;
+			},
+		},
+	});
+	const warn = mock.method(console, 'warn', () => {});
+	try {
+		const pool = JSON.stringify([process.pid, null, null]);
+		await writeFile(poolPath, pool);
+		const { releaseAllLoopbackAddressesForCurrentProcess } = await import(freshModuleUrl());
+		await rejects(releaseAllLoopbackAddressesForCurrentProcess(), { name: 'LockOwnershipLostError' });
+		strictEqual(warn.mock.callCount(), 3);
+		strictEqual(await readFile(poolPath, 'utf-8'), pool);
+	} finally {
+		fsMock.restore();
+		warn.mock.restore();
 		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
 		await rm(isolatedTmpDir, { recursive: true, force: true });
 	}
