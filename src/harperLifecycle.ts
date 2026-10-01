@@ -98,8 +98,8 @@ export const DEFAULT_TEARDOWN_GRACE_MS = parseInt(process.env.HARPER_INTEGRATION
  * Time teardown's safety assertion waits for Harper's fixed ports to be free before recycling the
  * loopback address. Killing Harper's process tree (and waiting for exit) should free them
  * immediately, so this normally returns on the first check; it only matters if a child process
- * escaped the kill. If the ports are still in use at the deadline, a warning is logged and the address
- * is not recycled.
+ * escaped the kill. If the ports are still in use at the deadline, a warning is logged and neither the
+ * address is recycled nor the install directory removed.
  *
  * Override with `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS`. Default 5s.
  */
@@ -112,10 +112,11 @@ const SIGKILL_EXIT_WAIT_MS = 1000;
 const HARPER_PID_FILE = 'hdb.pid';
 
 /**
- * How long after Harper announces a relaunch teardown waits for the replacement to record its pid. The
- * replacement does that only once its predecessor has exited and it has finished loading (~0.5s on an
- * idle machine), so a teardown inside that window would otherwise find no pid file. Read per call, like
- * the monitor's tunables, so a test can shorten it after import.
+ * How long teardown waits for a relaunched Harper's replacement to record its pid, counted from when the
+ * process that announced the relaunch exited. The replacement records it only once that predecessor is
+ * gone and it has finished loading (~0.5s on an idle machine), so a teardown inside that window would
+ * otherwise find no pid file. Read per call, like the monitor's tunables, so a test can shorten it after
+ * import.
  *
  * Override with `HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS`. Default 5s (15s under CI).
  */
@@ -773,6 +774,7 @@ const liveHarperProcesses = new Set<ChildProcess>();
 let runnerCleanupRegistered = false;
 
 const relaunchAnnouncements = new WeakMap<ChildProcess, number>();
+const spawnedExitTimes = new WeakMap<ChildProcess, number>();
 
 /** Shared so that a concurrent `killHarper` on the same node cannot return before the first finishes. */
 const relaunchKills = new WeakMap<ChildProcess, Promise<boolean>>();
@@ -790,7 +792,10 @@ function trackHarperProcess(proc: ChildProcess, instanceId: string, hostname?: s
 
 	// Only the direct child is untracked here; its registry record covers the group, which can
 	// outlive it, and the monitor owns removing that.
-	proc.once('exit', () => liveHarperProcesses.delete(proc));
+	proc.once('exit', () => {
+		liveHarperProcesses.delete(proc);
+		spawnedExitTimes.set(proc, Date.now());
+	});
 
 	if (runnerCleanupRegistered) return trackedProcess;
 	runnerCleanupRegistered = true;
@@ -934,7 +939,12 @@ async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, gra
 	let pid = await readHarperPid(dataRootDir);
 	// Read after the await above, which lets stdout that arrived alongside the exit be processed first.
 	const announcedAt = relaunchAnnouncements.get(proc);
-	const relaunchDeadline = announcedAt === undefined ? 0 : announcedAt + getRelaunchPidWaitMs();
+	// Harper gives a restarting predecessor up to 15s to exit (RocksDB may still be closing), and the
+	// replacement cannot record its pid before then, so the wait runs from that exit.
+	const relaunchDeadline =
+		announcedAt === undefined
+			? 0
+			: Math.max(announcedAt, spawnedExitTimes.get(proc) ?? Date.now()) + getRelaunchPidWaitMs();
 	while (pid === undefined && Date.now() < relaunchDeadline) {
 		await sleep(PROCESS_POLL_MS);
 		pid = await readHarperPid(dataRootDir);
@@ -1051,10 +1061,12 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 			// (the exact failure the loopback pool exists to prevent). Leave the slot parked under
 			// this process's PID; it is reclaimed when this (per-file) process exits and its PID
 			// goes dead. The conflict canary in getNextAvailableLoopbackAddress is the backstop if
-			// the address is somehow handed out before then.
+			// the address is somehow handed out before then. The install directory stays too: the
+			// process holding the ports may still be using it.
 			console.warn(
-				`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); NOT recycling the address (a Harper child outlived the kill). The slot will be reclaimed when this process exits.`
+				`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); NOT recycling the address or removing ${ctx.harper.dataRootDir} (a Harper child outlived the kill). The slot will be reclaimed when this process exits.`
 			);
+			return;
 		}
 	}
 
