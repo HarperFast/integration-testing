@@ -61,8 +61,6 @@ test('a writer superseded after reading cannot erase the successor claim', async
 			'TEMP',
 			'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START',
 			'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT',
-			'HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT',
-			'HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT',
 		].map((name) => [name, process.env[name]])
 	);
 	process.env.TMPDIR = isolatedTmpDir;
@@ -70,8 +68,6 @@ test('a writer superseded after reading cannot erase the successor claim', async
 	process.env.TEMP = isolatedTmpDir;
 	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '2';
 	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '3';
-	process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = '0';
-	process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = '0';
 
 	const staleSnapshotRead = deferred();
 	const resumeStaleWriter = deferred();
