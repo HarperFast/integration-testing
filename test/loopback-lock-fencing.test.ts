@@ -152,7 +152,7 @@ test('a superseded holder does not unlink the replacement lock', async () => {
 	}
 });
 
-test('a failed token write does not leave an empty lock file', async () => {
+test('a failed token write does not delete a successor lock', async () => {
 	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-write-failure-'));
 	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
 	const previousTmpEnv = new Map(['TMPDIR', 'TMP', 'TEMP'].map((name) => [name, process.env[name]]));
@@ -161,11 +161,12 @@ test('a failed token write does not leave an empty lock file', async () => {
 		namedExports: {
 			...fsPromises,
 			open: async (path: string, flags: string) => {
-				const fileHandle = await fsPromises.open(path, flags);
-				if (path !== lockPath) return fileHandle;
+				if (path !== lockPath) return fsPromises.open(path, flags);
+				await writeFile(path, '', { flag: flags });
 				return {
-					close: () => fileHandle.close(),
+					close: async () => {},
 					writeFile: async () => {
+						await writeFile(lockPath, 'replacement-holder');
 						throw new Error('simulated token write failure');
 					},
 				};
@@ -175,7 +176,7 @@ test('a failed token write does not leave an empty lock file', async () => {
 	try {
 		const { withLock } = await import(freshModuleUrl());
 		await rejects(withLock(async () => {}), /simulated token write failure/);
-		await rejects(readFile(lockPath), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+		strictEqual(await readFile(lockPath, 'utf-8'), 'replacement-holder');
 	} finally {
 		fsMock.restore();
 		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
@@ -194,7 +195,6 @@ test('a holder that keeps losing the lock gives up instead of retrying forever',
 			...fsPromises,
 			readFile: async (path: string, encoding: BufferEncoding) => {
 				const contents = await readFile(path, encoding);
-				// Every section has its lock reclaimed as stale between reading and publishing.
 				if (path === poolPath) await unlink(lockPath);
 				return contents;
 			},
