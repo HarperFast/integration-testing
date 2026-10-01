@@ -29,8 +29,8 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
-// A one-off stall past LOCK_STALE_TIMEOUT_MS loses the lock once; losing it repeatedly means another
-// process keeps judging fresh locks stale (clock or mtime skew), which retrying cannot fix.
+// A one-off stall past LOCK_STALE_TIMEOUT_MS loses the lock once; losing it repeatedly means sections keep
+// outlasting it (a stalling event loop, or clock or mtime skew), which retrying cannot fix.
 const LOCK_OWNERSHIP_RETRIES = 3;
 
 let lockTokenCounter = 0;
@@ -165,14 +165,12 @@ async function acquireLock(): Promise<string> {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
+			// On a failed write the path may already be a successor's lock, so it is left to stale reclaim.
 			try {
 				await lockFileHandle.writeFile(token);
-			} catch (error) {
-				await lockFileHandle.close().catch(() => {});
-				await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH).catch(() => {});
-				throw error;
+			} finally {
+				await lockFileHandle.close();
 			}
-			await lockFileHandle.close();
 			return token;
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
@@ -198,7 +196,8 @@ async function acquireLock(): Promise<string> {
 }
 
 /**
- * Releases the file-based lock if it still belongs to this acquisition.
+ * Like writePoolFile's ownership check, the token comparison narrows, but does not close, the window
+ * in which a holder whose lock was taken over as stale deletes its successor's lock.
  */
 async function releaseLock(token: string): Promise<void> {
 	try {

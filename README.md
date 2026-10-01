@@ -292,6 +292,8 @@ These are used internally by `startHarper` and `teardownHarper`, but are exporte
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
 
+If other processes take over the pool lock as stale (held over 10 seconds) before this process publishes its update, the allocate and release functions retry from the current pool state with a `[loopback-pool]` warning; after four takeovers in a row they reject with an error named `LockOwnershipLostError`.
+
 ## Node.js Test Runner
 
 > Tests executed by this runner must use the `node:test` API. If you're using a different test framework, use the [lifecycle APIs](#api) directly and refer to the [runner source](./src/run.ts) as a reference implementation.
