@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { readFile, writeFile as writeFileAsync } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,7 @@ import {
 	killHarper,
 	teardownHarper,
 	markHarperNode,
+	OPERATIONS_API_PORT,
 	publishHarperNode,
 	readHarperPid,
 	setupHarperWithFixture,
@@ -151,7 +153,12 @@ if (replacedPid) {
           stdio: 'ignore',
           env: { ...process.env, HARPER_PARENT_PROCESS_PID: String(process.pid) },
         }).unref();
-        // Real Harper exits synchronously here; lingering lets a test stop it after it announced the relaunch.
+        // Real Harper exits here, but its exit handlers can take seconds while RocksDB closes, and its
+        // SIGTERM handler cannot run meanwhile; lingering stands in for both.
+        if (process.env.HARPER_FAKE_LINGER_IGNORES_TERM === '1') {
+          process.removeAllListeners('SIGTERM');
+          process.on('SIGTERM', () => {});
+        }
         setTimeout(() => process.exit(0), Number(process.env.HARPER_FAKE_LINGER_MS || 0));
       };
       if (process.env.HARPER_FAKE_SPLIT_READINESS !== '1') {
@@ -1307,11 +1314,13 @@ test('killHarper follows a relaunch the spawned process announced before it was 
 	}
 });
 
-test('killHarper follows a relaunch whose predecessor is slow to exit', async () => {
+test('killHarper waits for the replacement from its predecessor\'s exit, however long that took', async () => {
+	const previousWait = process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS;
+	process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS = '500';
 	let node: FakeHarperNode | undefined;
 	try {
-		// Harper's replacement allows its predecessor 15s to exit, for RocksDB to finish closing.
-		node = await startRestartableFakeHarper({ HARPER_FAKE_LINGER_MS: '1500', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
+		// The predecessor takes longer to exit than the whole relaunch wait, as Harper allows (up to 15s).
+		node = await startRestartableFakeHarper({ HARPER_FAKE_LINGER_MS: '1000', HARPER_FAKE_RELAUNCH_DELAY_MS: '300' });
 		await restartFakeHarper(node);
 
 		await killHarper(node.ctx, { graceMs: isPosix ? 2000 : 200 });
@@ -1319,6 +1328,30 @@ test('killHarper follows a relaunch whose predecessor is slow to exit', async ()
 		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
 		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
 	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('killHarper still finds the replacement when stopping a predecessor that is mid-exit outlasts the wait', { skip: !isPosix }, async () => {
+	const previousWait = process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS;
+	process.env.HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS = '500';
+	let node: FakeHarperNode | undefined;
+	try {
+		node = await startRestartableFakeHarper({
+			HARPER_FAKE_LINGER_MS: '5000',
+			HARPER_FAKE_LINGER_IGNORES_TERM: '1',
+			HARPER_FAKE_RELAUNCH_DELAY_MS: '300',
+		});
+		node.ctx.harper.process.stdin!.write('restart\n');
+		const replacementPid = await readPidFile(join(node.dataRootDir, 'replacement.pid'));
+
+		// SIGTERM is ignored, so the predecessor only goes at SIGKILL, after the grace and past the wait.
+		await killHarper(node.ctx, { graceMs: 1000 });
+
+		ok(!isAlive(replacementPid), `relaunched Harper ${replacementPid} should be gone when killHarper resolves`);
+	} finally {
+		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
 		await cleanupFakeHarperNode(node);
 	}
 });
@@ -1388,6 +1421,27 @@ test('teardownHarper keeps the data root when an announced replacement never rec
 	} finally {
 		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
 		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('teardownHarper keeps the install directory while the node\'s ports are still held', async () => {
+	const hostname = '127.0.0.1';
+	const dataRootDir = mkdtempSync(join(tmpdir(), 'harper-it-held-port-'));
+	// Stands in for a Harper child that escaped the kill; a port someone else already holds serves too.
+	const holder = createServer();
+	await new Promise<void>((resolve) => {
+		holder.once('error', () => resolve());
+		holder.listen(OPERATIONS_API_PORT, hostname, () => resolve());
+	});
+	try {
+		strictEqual(await isPortFree(hostname, OPERATIONS_API_PORT), false, 'the port must be held for this test');
+
+		await teardownHarper({ harper: markHarperNode({ dataRootDir, hostname }) } as unknown as StartedHarperTestContext);
+
+		ok(existsSync(dataRootDir), 'teardown must not delete the install directory under a process still holding its ports');
+	} finally {
+		await new Promise<void>((resolve) => holder.close(() => resolve()));
+		rmSync(dataRootDir, { recursive: true, force: true });
 	}
 });
 
