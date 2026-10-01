@@ -142,6 +142,24 @@ test('findAcceptingPort finds a listener bound to all interfaces through a loopb
 	}
 });
 
+test(
+	'findAcceptingPort reports an accepting port even when another port cannot be checked',
+	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
+	async () => {
+		const [stalledPort] = await getFreePorts(HOST, 1);
+		const stalled = await startChildListener(HOST, stalledPort);
+		const { server, port } = await listenEphemeral(HOST);
+		try {
+			await stalled.stall();
+			strictEqual(await findAcceptingPort(HOST, [stalledPort, port], 300), port);
+			await rejects(findAcceptingPort(HOST, [stalledPort], 300), { code: 'ETIMEDOUT' });
+		} finally {
+			await close(server);
+			await stalled.close();
+		}
+	}
+);
+
 test('findAcceptingPort returns null when no port accepts', async () => {
 	await withFreePorts(HOST, 2, async (ports) => {
 		strictEqual(await findAcceptingPort(HOST, ports), null);

@@ -124,6 +124,15 @@ function foreignListenersAllowed(): boolean {
 	return value === '1' || value?.toLowerCase() === 'true';
 }
 
+/** A failure to return a refused address must not replace the error that says why it was refused. */
+async function releaseRefusedAddress(address: string): Promise<void> {
+	try {
+		await releaseLoopbackAddress(address);
+	} catch (error) {
+		console.warn(`[loopback-pool] Could not return ${address} to the pool; it is reclaimed when this process exits:`, error);
+	}
+}
+
 /**
  * Acquires a file-based lock by creating the lock file. This enables safe concurrent
  * access to the loopback pool across multiple test processes.
@@ -470,6 +479,9 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			}
 			if (conflictingPort === null) {
 				// macOS and Windows let the canary's exclusive bind succeed beside a listener on all interfaces; Linux refuses it.
+				if (process.platform === 'linux') {
+					return loopbackAddress;
+				}
 				let shadowedPort: number | null;
 				try {
 					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
@@ -481,7 +493,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 						);
 						return loopbackAddress;
 					}
-					await releaseLoopbackAddress(loopbackAddress);
+					await releaseRefusedAddress(loopbackAddress);
 					throw new LoopbackAddressValidationError(
 						loopbackAddress,
 						error as Error,
@@ -497,7 +509,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 					);
 					return loopbackAddress;
 				}
-				await releaseLoopbackAddress(loopbackAddress);
+				await releaseRefusedAddress(loopbackAddress);
 				throw new ForeignListenerError(loopbackAddress, shadowedPort);
 			}
 
