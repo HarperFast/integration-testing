@@ -28,6 +28,9 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
+// A one-off stall past LOCK_STALE_TIMEOUT_MS loses the lock once; losing it repeatedly means another
+// process keeps judging fresh locks stale (clock or mtime skew), which retrying cannot fix.
+const LOCK_OWNERSHIP_RETRIES = 3;
 
 let lockTokenCounter = 0;
 
@@ -100,7 +103,10 @@ class InvalidLoopbackAddressError extends Error {
 
 class LockOwnershipLostError extends Error {
 	constructor(cause?: unknown) {
-		super('Loopback address pool lock ownership was lost before publishing', { cause });
+		super(
+			`Another process took over the loopback pool lock as stale (older than ${LOCK_STALE_TIMEOUT_MS}ms) before this process published its update`,
+			{ cause }
+		);
 		this.name = 'LockOwnershipLostError';
 	}
 }
@@ -177,19 +183,23 @@ async function assertLockHeld(token: string): Promise<void> {
 
 /**
  * Executes a callback while holding the lock and releases only the lock this call acquired.
- * A section superseded before publication is rerun from fresh pool state so teardown callers
- * do not inherit a transient lost-lock failure.
+ * A section whose lock was taken over as stale before it published is rerun from fresh pool
+ * state, up to LOCK_OWNERSHIP_RETRIES times, so teardown callers do not inherit a one-off
+ * lost-lock failure.
  *
  * @param callback The async function to execute while holding the lock
  * @returns The result of the callback function
  */
 export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
-	while (true) {
+	for (let attempt = 1; ; attempt++) {
 		const token = await acquireLock();
 		try {
 			return await callback(token);
 		} catch (error) {
-			if (!(error instanceof LockOwnershipLostError)) throw error;
+			if (!(error instanceof LockOwnershipLostError) || attempt > LOCK_OWNERSHIP_RETRIES) throw error;
+			console.warn(
+				`[loopback-pool] ${error.message}; retrying from the current pool state (retry ${attempt} of ${LOCK_OWNERSHIP_RETRIES}).`
+			);
 		} finally {
 			await releaseLock(token);
 		}
@@ -221,6 +231,10 @@ async function readPoolFile(): Promise<LoopbackPool> {
 
 /**
  * Writes the loopback pool to the pool file as JSON.
+ *
+ * The ownership check must stay immediately before the publishing write. It narrows, but does not
+ * close, the window in which a holder whose lock was taken over as stale overwrites its successor:
+ * a takeover between the check and the write still loses the successor's update.
  *
  * @param pool The loopback pool array to persist
  */
