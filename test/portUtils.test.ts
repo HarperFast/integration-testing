@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import { ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import { acceptsConnections, findAcceptingPort, isPortFree, waitForPortsFree } from '../src/portUtils.ts';
-import { startChildListener } from './stalledListener.ts';
+import { RESETS_INSTEAD_OF_STALLING, startChildListener } from './stalledListener.ts';
 
 const HOST = '127.0.0.1';
 const IS_CI = !!process.env.CI;
@@ -115,11 +115,11 @@ test('acceptsConnections returns false when nothing listens on the port', async 
 test(
 	'acceptsConnections rejects when the handshake gets no answer in time',
 	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
-	async () => {
+	async (t) => {
 		const [port] = await getFreePorts(HOST, 1);
 		const listener = await startChildListener(HOST, port);
 		try {
-			await listener.stall();
+			if (!(await listener.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
 			await rejects(acceptsConnections(HOST, port, 300), { code: 'ETIMEDOUT' });
 		} finally {
 			await listener.close();
@@ -145,12 +145,12 @@ test('findAcceptingPort finds a listener bound to all interfaces through a loopb
 test(
 	'findAcceptingPort reports an accepting port even when another port cannot be checked',
 	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
-	async () => {
+	async (t) => {
 		const [stalledPort] = await getFreePorts(HOST, 1);
 		const stalled = await startChildListener(HOST, stalledPort);
 		const { server, port } = await listenEphemeral(HOST);
 		try {
-			await stalled.stall();
+			if (!(await stalled.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
 			strictEqual(await findAcceptingPort(HOST, [stalledPort, port], 300), port);
 			await rejects(findAcceptingPort(HOST, [stalledPort], 300), { code: 'ETIMEDOUT' });
 		} finally {

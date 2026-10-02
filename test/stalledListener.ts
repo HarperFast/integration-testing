@@ -1,11 +1,16 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { connect, type Socket } from 'node:net';
-import { setTimeout as sleep } from 'node:timers/promises';
+
+export const RESETS_INSTEAD_OF_STALLING =
+	'this OS resets a connection past a full backlog instead of stalling it, so no handshake can be stalled here';
 
 export interface ChildListener {
-	/** Stops the child and fills its accept queue, so the next connection's handshake never completes. */
-	stall(): Promise<void>;
+	/**
+	 * Stops the child and fills its accept queue, so the next connection's handshake never completes.
+	 * Resolves false where the OS resets a connection past a full backlog instead (macOS 27).
+	 */
+	stall(): Promise<boolean>;
 	close(): Promise<void>;
 }
 
@@ -35,10 +40,19 @@ export async function startChildListener(host: string, port: number): Promise<Ch
 			child.kill('SIGSTOP');
 			for (let attempt = 0; attempt < 32; attempt++) {
 				const socket = connect({ host: connectHost, port });
-				socket.on('error', () => {});
 				fillers.push(socket);
-				const connected = await Promise.race([once(socket, 'connect').then(() => true), sleep(1000).then(() => false)]);
-				if (!connected) return;
+				const outcome = await new Promise<'connected' | 'reset' | 'stalled'>((resolve) => {
+					const timer = setTimeout(() => resolve('stalled'), 1000);
+					socket.once('connect', () => {
+						clearTimeout(timer);
+						resolve('connected');
+					});
+					socket.on('error', () => {
+						clearTimeout(timer);
+						resolve('reset');
+					});
+				});
+				if (outcome !== 'connected') return outcome === 'stalled';
 			}
 			throw new Error(`the accept queue of ${host}:${port} never filled`);
 		},
