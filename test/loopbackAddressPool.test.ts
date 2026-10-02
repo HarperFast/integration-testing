@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isPortFree } from '../src/portUtils.ts';
-import { startChildListener } from './stalledListener.ts';
+import { RESETS_INSTEAD_OF_STALLING, startChildListener } from './stalledListener.ts';
 
 const HOST = '127.0.0.1';
 const ALLOW_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
@@ -166,7 +166,7 @@ test('refuses an address whose port answers no handshake, as one that could not 
 	const listener = await startChildListener('0.0.0.0', httpPort);
 	try {
 		if (!(await isPortFree(HOST, httpPort))) return t.skip(CANARY_CATCHES_IT);
-		await listener.stall();
+		if (!(await listener.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
 		const error = await refusal();
 		strictEqual(error.name, 'LoopbackAddressValidationError');
 		match(error.message, new RegExp(`No answer from ${HOST}:${httpPort}`));
@@ -191,10 +191,10 @@ test('startHarper and setupHarperWithFixture remove the install directory they c
 
 		const fixture = mkdtempSync(join(poolDir, 'fixture-'));
 		writeFileSync(join(fixture, 'config.yaml'), '');
-		await rejects(setupHarperWithFixture(createHarperContext('refused-fixture'), fixture), {
-			name: 'ForeignListenerError',
-		});
+		const fixtureCtx = createHarperContext('refused-fixture');
+		await rejects(setupHarperWithFixture(fixtureCtx, fixture), { name: 'ForeignListenerError' });
 		deepStrictEqual(readdirSync(installParent), []);
+		strictEqual(fixtureCtx.harper, undefined, 'a retry must not reuse the removed install directory');
 
 		const callerDir = mkdtempSync(join(installParent, 'caller-'));
 		const ctx = createHarperContext('refused-with-directory');

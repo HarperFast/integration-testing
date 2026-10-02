@@ -606,7 +606,10 @@ async function launchHarper(
 	try {
 		loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
 	} catch (error) {
-		if (ownsDataRootDir) await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+		if (ownsDataRootDir) {
+			await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+			if (ctx.harper?.dataRootDir === dataRootDir) ctx.harper = undefined;
+		}
 		throw error;
 	}
 
