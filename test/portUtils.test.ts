@@ -1,7 +1,8 @@
 import { test } from 'node:test';
-import { ok, strictEqual } from 'node:assert';
+import { ok, rejects, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo, type Server } from 'node:net';
-import { isPortFree, waitForPortsFree } from '../src/portUtils.ts';
+import { acceptsConnections, findAcceptingPort, isPortFree, waitForPortsFree } from '../src/portUtils.ts';
+import { RESETS_INSTEAD_OF_STALLING, startChildListener } from './stalledListener.ts';
 
 const HOST = '127.0.0.1';
 const IS_CI = !!process.env.CI;
@@ -103,4 +104,64 @@ test('waitForPortsFree resolves false when a port stays held past the timeout', 
 	} finally {
 		await close(server);
 	}
+});
+
+test('acceptsConnections returns false when nothing listens on the port', async () => {
+	await withFreePorts(HOST, 1, async ([port]) => {
+		strictEqual(await acceptsConnections(HOST, port), false);
+	});
+});
+
+test(
+	'acceptsConnections rejects when the handshake gets no answer in time',
+	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
+	async (t) => {
+		const [port] = await getFreePorts(HOST, 1);
+		const listener = await startChildListener(HOST, port);
+		try {
+			if (!(await listener.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
+			await rejects(acceptsConnections(HOST, port, 300), { code: 'ETIMEDOUT' });
+		} finally {
+			await listener.close();
+		}
+	}
+);
+
+test('acceptsConnections rejects when the probe cannot be made at all', async () => {
+	await rejects(acceptsConnections(HOST, 70000), { code: 'ERR_SOCKET_BAD_PORT' });
+});
+
+test('findAcceptingPort finds a listener bound to all interfaces through a loopback address', async () => {
+	const { server, port } = await listenEphemeral('0.0.0.0');
+	try {
+		await withFreePorts(HOST, 1, async ([freePort]) => {
+			strictEqual(await findAcceptingPort(HOST, [freePort, port]), port);
+		});
+	} finally {
+		await close(server);
+	}
+});
+
+test(
+	'findAcceptingPort reports an accepting port even when another port cannot be checked',
+	{ skip: process.platform === 'win32' ? 'stalling a handshake needs SIGSTOP' : false },
+	async (t) => {
+		const [stalledPort] = await getFreePorts(HOST, 1);
+		const stalled = await startChildListener(HOST, stalledPort);
+		const { server, port } = await listenEphemeral(HOST);
+		try {
+			if (!(await stalled.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
+			strictEqual(await findAcceptingPort(HOST, [stalledPort, port], 300), port);
+			await rejects(findAcceptingPort(HOST, [stalledPort], 300), { code: 'ETIMEDOUT' });
+		} finally {
+			await close(server);
+			await stalled.close();
+		}
+	}
+);
+
+test('findAcceptingPort returns null when no port accepts', async () => {
+	await withFreePorts(HOST, 2, async (ports) => {
+		strictEqual(await findAcceptingPort(HOST, ports), null);
+	});
 });

@@ -557,7 +557,7 @@ export async function setupHarperWithFixture(
 	const dataRootDir = await mkdtemp(dataRootDirPrefix);
 	await cp(fixturePath, join(dataRootDir, 'components', basename(fixturePath)), { recursive: true, dereference: true });
 	publishHarperNode(ctx, { dataRootDir });
-	return startHarper(ctx, options);
+	return launchHarper(ctx, options, true);
 }
 
 /**
@@ -587,13 +587,31 @@ export async function setupHarperWithFixture(
  */
 export async function startHarper(ctx: HarperTestContext, options?: StartHarperOptions): Promise<StartedHarperTestContext> {
 	assertHarperTestContext(ctx, 'startHarper', START_FROM_THE_CONTEXT);
+	return launchHarper(ctx, options, !ctx.harper?.dataRootDir);
+}
+
+/** `ownsDataRootDir`: the install directory was created for this start, so an allocation that throws removes it. */
+async function launchHarper(
+	ctx: HarperTestContext,
+	options: StartHarperOptions | undefined,
+	ownsDataRootDir: boolean
+): Promise<StartedHarperTestContext> {
 	const dataRootDirPrefix = join(
 		process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(),
 		`harper-integration-test-`
 	);
 	const dataRootDir = ctx.harper?.dataRootDir ?? (await mkdtemp(dataRootDirPrefix));
 
-	const loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
+	let loopbackAddress: string;
+	try {
+		loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
+	} catch (error) {
+		if (ownsDataRootDir) {
+			await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+			if (ctx.harper?.dataRootDir === dataRootDir) ctx.harper = undefined;
+		}
+		throw error;
+	}
 
 	// Set up per-suite log directory when HARPER_INTEGRATION_TEST_LOG_DIR is configured
 	const logDirEnv = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;

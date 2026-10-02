@@ -78,6 +78,14 @@ ifconfig lo0 | grep '127.0.0' | tail -3       # aliases present
 
 Edit the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` value in the installed plist to change the pool size (it defaults to 32, matching the script). To remove the daemon: `sudo launchctl bootout system/io.harperdb.loopback-setup` and delete the plist. If you edit the installed plist, `bootout` then `bootstrap` again to reload it.
 
+### Other services listening on Harper's ports
+
+Each node binds its fixed ports on its own loopback address, so nodes on different addresses coexist. A process listening on the same port on **all interfaces** is different — a local Harper instance running with its default configuration is the usual one. On macOS and Windows, that process receives a node's connections whenever the node has no listener of its own on its address: while the node starts, while its HTTP workers restart, and after teardown. Keep-alive connections then stay with it, so a suite fails, or passes, against the wrong server.
+
+`getNextAvailableLoopbackAddress`, and therefore `startHarper`, refuses an address when another process already accepts connections on its operations or HTTP port, throwing a `ForeignListenerError` that names the port. Stop the other process or bind it to a specific address (`lsof -nP -iTCP:9926 -sTCP:LISTEN` names it). To run anyway, set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1`, which turns the error into a warning.
+
+On Linux, binding a pool address beside such a listener already fails, so the pool reports each address as still in use by another node instead.
+
 ## API
 
 The lifecycle and utility APIs below are framework-agnostic. They manage Harper child processes and a cross-process loopback address pool. Use them in the setup/teardown hooks of whichever test framework you prefer.
@@ -118,6 +126,7 @@ Startup readiness is detected by Harper printing `successfully started`. Rather 
 - `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
+- `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` - Set to `1` or `true` to start a node on an address whose operations or HTTP port another process already accepts connections on, or that could not be checked for one, with a warning instead of an error (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)).
 
 ### `setupHarperWithFixture(ctx, fixturePath, options?)`
 
@@ -266,6 +275,10 @@ try {
 }
 ```
 
+### `ForeignListenerError`
+
+Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when another process already accepts connections on the operations or HTTP port of a newly allocated address (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)). It extends `Error` with `name` set to `'ForeignListenerError'`, plus `loopbackAddress` and `port` properties naming what was reached. The address is returned to the pool before it is thrown. Set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1` (or `true`) to get a warning instead.
+
 ### `targz(dirPath)`
 
 Packs and compresses a directory into a base64-encoded tar.gz string. Useful for `deploy_component` Operations API calls.
@@ -275,7 +288,7 @@ Packs and compresses a directory into a base64-encoded tar.gz string. Useful for
 These are used internally by `startHarper` and `teardownHarper`, but are exported for advanced use cases or custom runner integrations.
 
 - `validateLoopbackAddressPool(): Promise<{ successful: string[]; failed: { loopbackAddress: string; error: Error }[] }>` - Validates all pool addresses can be bound to
-- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool
+- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool; throws a `ForeignListenerError` if another process already accepts connections on its operations or HTTP port (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports))
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
 
