@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
@@ -28,6 +29,11 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
+// A one-off stall past LOCK_STALE_TIMEOUT_MS loses the lock once; losing it repeatedly means sections keep
+// outlasting it (a stalling event loop, or clock or mtime skew), which retrying cannot fix.
+const LOCK_OWNERSHIP_RETRIES = 3;
+
+let lockTokenCounter = 0;
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
 // Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
@@ -133,6 +139,16 @@ async function releaseRefusedAddress(address: string): Promise<void> {
 	}
 }
 
+class LockOwnershipLostError extends Error {
+	constructor(cause?: unknown) {
+		super(
+			`Another process took over the loopback pool lock as stale (older than ${LOCK_STALE_TIMEOUT_MS}ms) before this process published its update`,
+			{ cause }
+		);
+		this.name = 'LockOwnershipLostError';
+	}
+}
+
 /**
  * Acquires a file-based lock by creating the lock file. This enables safe concurrent
  * access to the loopback pool across multiple test processes.
@@ -141,16 +157,21 @@ async function releaseRefusedAddress(address: string): Promise<void> {
  * a simple but effective cross-process mutex. Handles stale locks by removing lock files
  * older than LOCK_STALE_TIMEOUT_MS (10 seconds).
  *
- * @returns A promise that resolves when the lock is acquired
+ * @returns The token that identifies this lock acquisition
  */
-async function acquireLock(): Promise<void> {
+async function acquireLock(): Promise<string> {
+	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
 	while (true) {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
-			// We have the lock - close the handle as we don't intend to write to it
-			await lockFileHandle.close();
-			return;
+			// On a failed write the path may already be a successor's lock, so it is left to stale reclaim.
+			try {
+				await lockFileHandle.writeFile(token);
+			} finally {
+				await lockFileHandle.close();
+			}
+			return token;
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
 			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -175,30 +196,50 @@ async function acquireLock(): Promise<void> {
 }
 
 /**
- * Releases the file-based lock by deleting the lock file.
+ * Like writePoolFile's ownership check, the token comparison narrows, but does not close, the window
+ * in which a holder whose lock was taken over as stale deletes its successor's lock.
  */
-async function releaseLock(): Promise<void> {
+async function releaseLock(token: string): Promise<void> {
 	try {
-		await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
-	} catch {
-		// Ignore errors if lock file is already gone
+		if ((await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8')) === token) {
+			await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
+		}
+	} catch {}
+}
+
+async function assertLockHeld(token: string): Promise<void> {
+	let currentToken: string;
+	try {
+		currentToken = await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new LockOwnershipLostError(error);
+		throw error;
 	}
+	if (currentToken !== token) throw new LockOwnershipLostError();
 }
 
 /**
- * Executes a callback function while holding the lock. Automatically acquires
- * and releases the lock, ensuring the lock is always released even if the callback
- * throws an error.
+ * Executes a callback while holding the lock and checks the current token before attempting release.
+ * A section whose lock was taken over as stale before it published is rerun from fresh pool
+ * state, up to LOCK_OWNERSHIP_RETRIES times, so teardown callers do not inherit a one-off
+ * lost-lock failure.
  *
  * @param callback The async function to execute while holding the lock
  * @returns The result of the callback function
  */
-async function withLock<T>(callback: () => Promise<T>): Promise<T> {
-	await acquireLock();
-	try {
-		return await callback();
-	} finally {
-		await releaseLock();
+export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		const token = await acquireLock();
+		try {
+			return await callback(token);
+		} catch (error) {
+			if (!(error instanceof LockOwnershipLostError) || attempt > LOCK_OWNERSHIP_RETRIES) throw error;
+			console.warn(
+				`[loopback-pool] ${error.message}; retrying from the current pool state (retry ${attempt} of ${LOCK_OWNERSHIP_RETRIES}).`
+			);
+		} finally {
+			await releaseLock(token);
+		}
 	}
 }
 
@@ -228,9 +269,14 @@ async function readPoolFile(): Promise<LoopbackPool> {
 /**
  * Writes the loopback pool to the pool file as JSON.
  *
+ * The ownership check must stay immediately before the publishing write. It narrows, but does not
+ * close, the window in which a holder whose lock was taken over as stale overwrites its successor:
+ * a takeover between the check and the write still loses the successor's update.
+ *
  * @param pool The loopback pool array to persist
  */
-async function writePoolFile(pool: LoopbackPool): Promise<void> {
+async function writePoolFile(pool: LoopbackPool, lockToken: string): Promise<void> {
+	await assertLockHeld(lockToken);
 	await writeFile(HARPER_LOOPBACK_POOL_PATH, JSON.stringify(pool));
 }
 
@@ -402,6 +448,7 @@ export async function validateLoopbackAddressPool(): Promise<{
  * checked for another process's listener (the slot is released in that case)
  * @throws {ForeignListenerError} If another process accepts connections on the address's canary
  * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
+ * @throws {LockOwnershipLostError} If ownership is lost on the initial attempt and all three retries
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
@@ -427,7 +474,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
 	while (true) {
-		const assignedIndex = await withLock(async () => {
+		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile();
 
@@ -448,7 +495,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				loopbackPool[index] = process.pid;
 			}
 			// Write the updated pool back to the file
-			await writePoolFile(loopbackPool);
+			await writePoolFile(loopbackPool, lockToken);
 
 			return index;
 		});
@@ -555,7 +602,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);
 
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 
@@ -563,7 +610,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 		loopbackPool[index] = null;
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		await writePoolFile(loopbackPool, lockToken);
 	});
 }
 
@@ -572,7 +619,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
  * Useful for cleanup during graceful shutdown.
  */
 export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<void> {
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 
@@ -584,6 +631,6 @@ export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<vo
 		}
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		await writePoolFile(loopbackPool, lockToken);
 	});
 }
