@@ -448,6 +448,7 @@ export async function validateLoopbackAddressPool(): Promise<{
  * checked for another process's listener (the slot is released in that case)
  * @throws {ForeignListenerError} If another process accepts connections on the address's canary
  * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
+ * @throws {LockOwnershipLostError} If ownership is lost on the initial attempt and all three retries
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)

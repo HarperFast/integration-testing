@@ -50,6 +50,14 @@ function createAvailableServer() {
 	return server;
 }
 
+function createRefusedSocket(): net.Socket {
+	const socket = new EventEmitter() as unknown as net.Socket;
+	socket.setTimeout = () => socket;
+	socket.destroy = () => socket;
+	queueMicrotask(() => socket.emit('error', Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' })));
+	return socket;
+}
+
 test('a writer superseded after reading cannot erase the successor claim', async () => {
 	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-fencing-'));
 	const poolPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.json');
@@ -90,6 +98,7 @@ test('a writer superseded after reading cannot erase the successor claim', async
 		namedExports: {
 			...net,
 			createServer: createAvailableServer,
+			connect: createRefusedSocket,
 		},
 	});
 	const warn = mock.method(console, 'warn', () => {});
