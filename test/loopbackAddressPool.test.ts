@@ -106,18 +106,19 @@ async function ageBeyondQuarantine(path: string): Promise<void> {
 
 /**
  * A fresh copy of the pool module whose pool and lock live in `dir` and which hands out only
- * 127.0.0.1. Both canary ports are 0 (an ephemeral bind, always free) so a real Harper on this
- * machine can't make the result depend on the host.
+ * 127.0.0.1. Both canary ports are chosen ephemerally, so a real Harper on this machine can't
+ * make the result depend on the host.
  */
 async function importIsolatedPool(dir: string): Promise<typeof import('../src/loopbackAddressPool.ts')> {
+	const [operationsPort, httpPort] = await twoFreePorts();
 	const overrides: Record<string, string> = {
 		TMPDIR: dir,
 		TMP: dir,
 		TEMP: dir,
 		HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START: '1',
 		HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT: '1',
-		HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT: '0',
-		HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT: '0',
+		HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT: String(operationsPort),
+		HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT: String(httpPort),
 	};
 	const saved = Object.fromEntries(Object.keys(overrides).map((name) => [name, process.env[name]]));
 	Object.assign(process.env, overrides);
