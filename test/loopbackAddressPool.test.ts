@@ -34,7 +34,8 @@ async function twoFreePorts(): Promise<[number, number]> {
 // The pool reads these once, when it is imported.
 const poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-test-'));
 const [operationsPort, httpPort] = await twoFreePorts();
-process.env.TMPDIR = process.env.TMP = process.env.TEMP = poolDir;
+// The pool keeps its state in os.tmpdir(), which prefers TMPDIR on POSIX and TEMP on Windows.
+process.env.TMPDIR = process.env.TEMP = poolDir;
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '1';
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
 process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort);
