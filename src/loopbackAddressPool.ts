@@ -219,7 +219,7 @@ async function assertLockHeld(token: string): Promise<void> {
 }
 
 /**
- * Executes a callback while holding the lock and releases only the lock this call acquired.
+ * Executes a callback while holding the lock and checks the current token before attempting release.
  * A section whose lock was taken over as stale before it published is rerun from fresh pool
  * state, up to LOCK_OWNERSHIP_RETRIES times, so teardown callers do not inherit a one-off
  * lost-lock failure.
