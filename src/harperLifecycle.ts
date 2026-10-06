@@ -590,7 +590,18 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
 	return launchHarper(ctx, options, !ctx.harper?.dataRootDir);
 }
 
-/** `ownsDataRootDir`: the install directory was created for this start, so an allocation that throws removes it. */
+/**
+ * Starts Harper for {@link startHarper} and {@link setupHarperWithFixture}. Reuses the install directory
+ * and loopback address `ctx.harper` already names, creates or allocates whichever it lacks, and publishes
+ * the running node on `ctx`.
+ *
+ * @param ctx - The test context to populate with Harper instance details
+ * @param options - Optional configuration for the setup process
+ * @param ownsDataRootDir - Whether the install directory was created for this start. If allocating a
+ *   loopback address throws, an owned directory is removed, and `ctx.harper` cleared if it names that
+ *   directory, before the error propagates; a caller-supplied directory is left for the caller.
+ * @returns The context with the `harper` property populated
+ */
 async function launchHarper(
 	ctx: HarperTestContext,
 	options: StartHarperOptions | undefined,
