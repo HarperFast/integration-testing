@@ -120,7 +120,11 @@ const readinessLine = 'Harper 0.0.0-fake successfully started\\n';
 function serve() {
   if (replacedPid && process.env.HARPER_FAKE_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
   else process.on('SIGTERM', () => { rmSync(pidFile, { force: true }); process.exit(0); });
-  if (replacedPid && process.env.HARPER_FAKE_DESCENDANT) {
+  if (replacedPid && process.env.HARPER_FAKE_DESCENDANT === 'zombie') {
+    // Stands in for a member stuck in uninterruptible I/O: a child that exits at once under a parent that
+    // then leaves the group without reaping it, so the group outlives SIGKILL until that parent goes.
+    spawn('perl', ['-e', 'use POSIX; exit 0 unless fork(); POSIX::setsid(); open(my $f, ">", $ARGV[0]) or die; print $f $$; close($f); sleep 1000', join(root, 'zombie-holder.pid')], { stdio: 'ignore' });
+  } else if (replacedPid && process.env.HARPER_FAKE_DESCENDANT) {
     const script = process.env.HARPER_FAKE_DESCENDANT === 'ignore-term'
       ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"
       : 'setInterval(() => {}, 1000)';
@@ -1196,7 +1200,7 @@ async function restartFakeHarper(node: FakeHarperNode): Promise<void> {
 
 async function cleanupFakeHarperNode(node: FakeHarperNode | undefined): Promise<void> {
 	if (!node) return;
-	for (const name of ['replacement.pid', 'descendant.pid']) {
+	for (const name of ['replacement.pid', 'descendant.pid', 'zombie-holder.pid']) {
 		const pid = Number(await readFile(join(node.dataRootDir, name), 'utf-8').catch(() => ''));
 		if (pid > 0) forceKill(pid);
 	}
@@ -1420,6 +1424,32 @@ test('teardownHarper keeps the data root when an announced replacement never rec
 		ok(existsSync(node.dataRootDir), 'teardown must not delete the root under a replacement that may still come up');
 	} finally {
 		restoreEnv('HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS', previousWait);
+		await cleanupFakeHarperNode(node);
+	}
+});
+
+test('a replacement group that outlived SIGKILL keeps a later teardown from cleaning up under it', { skip: process.platform !== 'linux' && 'relies on a zombie keeping a Linux process group alive' }, async () => {
+	let node: FakeHarperNode | undefined;
+	// Held here too: a teardown that wrongly cleans up deletes the file cleanup would read it from.
+	let holderPid: number | undefined;
+	try {
+		node = await startRestartableFakeHarper({ HARPER_FAKE_DESCENDANT: 'zombie' });
+		await restartFakeHarper(node);
+		await readPidFile(join(node.dataRootDir, 'hdb.pid'));
+		holderPid = await readPidFile(join(node.dataRootDir, 'zombie-holder.pid'));
+
+		await killHarper(node.ctx, { graceMs: 200 });
+		strictEqual(existsSync(join(node.dataRootDir, 'hdb.pid')), false, 'the leader should have removed hdb.pid on SIGTERM');
+
+		await teardownHarper(node.ctx);
+		ok(existsSync(node.dataRootDir), 'teardown must not delete the root under a group that outlived SIGKILL');
+
+		// Once the group is gone, the stop is confirmed after all.
+		forceKill(holderPid);
+		await teardownHarper(node.ctx);
+		strictEqual(existsSync(node.dataRootDir), false, 'teardown should clean up once the surviving group is gone');
+	} finally {
+		forceKill(holderPid);
 		await cleanupFakeHarperNode(node);
 	}
 });

@@ -804,6 +804,8 @@ let runnerCleanupRegistered = false;
 
 const relaunchAnnouncements = new WeakMap<ChildProcess, number>();
 const spawnedExitTimes = new WeakMap<ChildProcess, number>();
+/** A replacement whose group outlived SIGKILL. Harper removes `hdb.pid` on SIGTERM, so a later call may only know it from here. */
+const relaunchSurvivors = new WeakMap<ChildProcess, number>();
 
 /** Shared so that a concurrent `killHarper` on the same node cannot return before the first finishes. */
 const relaunchKills = new WeakMap<ChildProcess, Promise<boolean>>();
@@ -962,10 +964,11 @@ function killSpawnedHarper(proc: ChildProcess, graceMs: number): Promise<boolean
  * Harper's `restart` forks a detached replacement and exits 0; the replacement writes its pid to
  * `hdb.pid` only once its predecessor is gone. So the node now runs as whatever that file names, and
  * shortly after the relaunch the file may not exist yet. Resolves false when a replacement may still be
- * running: one was announced but never recorded its pid, or it outlived SIGKILL.
+ * running: one was announced but never recorded its pid, or it outlived SIGKILL. Later calls stay
+ * unconfirmed until that replacement is gone, so a teardown after a failed `killHarper` keeps the root.
  */
 async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, graceMs: number): Promise<boolean> {
-	let pid = await readHarperPid(dataRootDir);
+	let pid = (await readHarperPid(dataRootDir)) ?? relaunchSurvivors.get(proc);
 	// Read after the await above, which lets stdout that arrived alongside the exit be processed first.
 	const announcedAt = relaunchAnnouncements.get(proc);
 	// Harper gives a restarting predecessor up to 15s to exit (RocksDB may still be closing), and the
@@ -982,13 +985,20 @@ async function killRelaunchedHarper(proc: ChildProcess, dataRootDir: string, gra
 	if (pid === undefined) return announcedAt === undefined;
 	relaunchAnnouncements.delete(proc);
 	// A stale file can still name the spawned process, whose pid may since have been reused.
-	if (pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) return true;
+	if (pid === proc.pid || pid === process.pid || !isProcessTreeAlive(pid)) {
+		relaunchSurvivors.delete(proc);
+		return true;
+	}
 
 	signalProcessTree(pid, 'SIGTERM');
 	if (!(await waitForProcessTreeExit(pid, graceMs))) {
 		signalProcessTree(pid, 'SIGKILL');
-		if (!(await waitForProcessTreeExit(pid, SIGKILL_EXIT_WAIT_MS))) return false;
+		if (!(await waitForProcessTreeExit(pid, SIGKILL_EXIT_WAIT_MS))) {
+			relaunchSurvivors.set(proc, pid);
+			return false;
+		}
 	}
+	relaunchSurvivors.delete(proc);
 	// Harper removes its pid file on SIGTERM but not on SIGKILL, and a pid left behind can be reused
 	// before a later call reads it.
 	if ((await readHarperPid(dataRootDir)) === pid) await rm(join(dataRootDir, HARPER_PID_FILE), { force: true });

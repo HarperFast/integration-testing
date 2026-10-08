@@ -146,7 +146,7 @@ Kills Harper's process tree, releases the loopback address back to the pool, and
 
 Since `killHarper` waits for the process tree to exit, its fixed ports (Operations API, HTTP/S, MQTT/S) are already released by the time the address is recycled. As a safety assertion, teardown still verifies those ports are free before recycling — the pool only guarantees the *address* is bindable, not that these specific ports are free — and if any are still held (a sign a Harper process escaped the kill) it logs a warning and leaves both the address and the install directory in place: the slot stays parked until this process exits, so a later suite cannot co-bind the ports, and the directory is not deleted under the process still holding them.
 
-If the kill itself could not be confirmed — Harper announced a relaunch but the replacement never recorded its pid, or a process outlived SIGKILL — teardown logs a warning and leaves both the install directory and the address in place rather than deleting the directory under a process that may still be running.
+If the kill itself could not be confirmed — Harper announced a relaunch but the replacement never recorded its pid, or a process outlived SIGKILL — teardown logs a warning and leaves both the install directory and the address in place rather than deleting the directory under a process that may still be running. This holds for a teardown after a `killHarper` that already warned: the stop stays unconfirmed until that replacement is gone.
 
 **Environment Variables:**
 
