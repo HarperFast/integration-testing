@@ -29,6 +29,14 @@ test('a skipped test that fails', (t) => {
 	assert.strictEqual(1, 2);
 });
 `,
+	'empty-reason-todo-fail.test.mjs': `
+import { test } from 'node:test';
+import assert from 'node:assert';
+
+test('a todo test with a falsy reason that fails', { todo: '' }, () => {
+	assert.strictEqual(1, 2);
+});
+`,
 	'real-fail.test.mjs': `
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -55,28 +63,31 @@ after(() => {
 	if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
 });
 
-// Strip the runner's own env vars so a shell that happens to export e.g. HARPER_INTEGRATION_TEST_SHARD
-// for an outer CI job can't change which fixture files the spawned CLI selects.
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HARPER_INTEGRATION_TEST_')));
 
-async function runCli(globPattern: string): Promise<number> {
+async function runCli(globPattern: string, signal: AbortSignal): Promise<number> {
 	const child = spawn(process.execPath, [RUN_SCRIPT, '--isolation=none', globPattern], {
 		stdio: 'ignore',
 		env: cleanEnv,
+		signal,
 	});
-	const [code, signal] = await once(child, 'exit');
-	ok(signal === null, `run.ts was killed by signal ${signal}`);
+	const [code, exitSignal] = await once(child, 'exit');
+	ok(exitSignal === null, `run.ts was killed by signal ${exitSignal}`);
 	return code;
 }
 
-test('a suite whose only failure is a todo test exits 0', { timeout: 15_000 }, async () => {
-	strictEqual(await runCli(fixtures['todo-fail.test.mjs']), 0);
+test('a suite whose only failure is a todo test exits 0', { timeout: 15_000 }, async (t) => {
+	strictEqual(await runCli(fixtures['todo-fail.test.mjs'], t.signal), 0);
 });
 
-test('a suite whose only failure is a skipped test exits 0', { timeout: 15_000 }, async () => {
-	strictEqual(await runCli(fixtures['skip-fail.test.mjs']), 0);
+test('a suite whose only failure is a skipped test exits 0', { timeout: 15_000 }, async (t) => {
+	strictEqual(await runCli(fixtures['skip-fail.test.mjs'], t.signal), 0);
 });
 
-test('a suite with a real failure exits 1 (control)', { timeout: 15_000 }, async () => {
-	strictEqual(await runCli(fixtures['real-fail.test.mjs']), 1);
+test('a suite whose only failure is a todo test with a falsy reason exits 0', { timeout: 15_000 }, async (t) => {
+	strictEqual(await runCli(fixtures['empty-reason-todo-fail.test.mjs'], t.signal), 0);
+});
+
+test('a suite with a real failure exits 1 (control)', { timeout: 15_000 }, async (t) => {
+	strictEqual(await runCli(fixtures['real-fail.test.mjs'], t.signal), 1);
 });
