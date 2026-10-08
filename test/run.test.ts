@@ -1,5 +1,5 @@
 import { test, before, after } from 'node:test';
-import { strictEqual } from 'node:assert';
+import { strictEqual, ok } from 'node:assert';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 const RUN_SCRIPT = fileURLToPath(new URL('../src/run.ts', import.meta.url));
 
-// A todo-marked failure and a real failure, run through the actual CLI to exercise its exit-code
-// semantics end to end (node:test's `test:fail` event fires for both; only the real one must fail the run).
+// The skip fixture calls `t.skip()` from inside the body instead of passing `{ skip: true }`, which
+// skips the body entirely and would never reach the `data.skip` branch under test.
 const FIXTURE_SOURCES: Record<string, string> = {
 	'todo-fail.test.mjs': `
 import { test } from 'node:test';
@@ -24,7 +24,8 @@ test('a todo test that fails', { todo: true }, () => {
 import { test } from 'node:test';
 import assert from 'node:assert';
 
-test('a skipped test that fails', { skip: true }, () => {
+test('a skipped test that fails', (t) => {
+	t.skip('skipped for testing');
 	assert.strictEqual(1, 2);
 });
 `,
@@ -38,7 +39,7 @@ test('a real failure', () => {
 `,
 };
 
-let fixtureDir: string;
+let fixtureDir: string | undefined;
 const fixtures: Record<string, string> = {};
 
 before(() => {
@@ -51,25 +52,31 @@ before(() => {
 });
 
 after(() => {
-	rmSync(fixtureDir, { recursive: true, force: true });
+	if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
 });
+
+// Strip the runner's own env vars so a shell that happens to export e.g. HARPER_INTEGRATION_TEST_SHARD
+// for an outer CI job can't change which fixture files the spawned CLI selects.
+const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HARPER_INTEGRATION_TEST_')));
 
 async function runCli(globPattern: string): Promise<number> {
 	const child = spawn(process.execPath, [RUN_SCRIPT, '--isolation=none', globPattern], {
 		stdio: 'ignore',
+		env: cleanEnv,
 	});
-	const [code] = await once(child, 'exit');
-	return code ?? 0;
+	const [code, signal] = await once(child, 'exit');
+	ok(signal === null, `run.ts was killed by signal ${signal}`);
+	return code;
 }
 
-test('a suite whose only failure is a todo test exits 0', async () => {
+test('a suite whose only failure is a todo test exits 0', { timeout: 15_000 }, async () => {
 	strictEqual(await runCli(fixtures['todo-fail.test.mjs']), 0);
 });
 
-test('a suite whose only failure is a skipped test exits 0', async () => {
+test('a suite whose only failure is a skipped test exits 0', { timeout: 15_000 }, async () => {
 	strictEqual(await runCli(fixtures['skip-fail.test.mjs']), 0);
 });
 
-test('a suite with a real failure exits 1 (control)', async () => {
+test('a suite with a real failure exits 1 (control)', { timeout: 15_000 }, async () => {
 	strictEqual(await runCli(fixtures['real-fail.test.mjs']), 1);
 });

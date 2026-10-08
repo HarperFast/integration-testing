@@ -125,8 +125,10 @@ runner.on('test:stdout', (data: any) => {
 });
 
 runner.on('test:fail', (data: any) => {
-	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run.
-	if (data.todo || data.skip) {
+	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run. Match node's own
+	// CLI classification (not `|| data.todo`) so a falsy-but-present reason, e.g. `{ todo: '' }`, still counts.
+	const isTodoOrSkip = (data.todo !== undefined && data.todo !== false) || (data.skip !== undefined && data.skip !== false);
+	if (isTodoOrSkip) {
 		return;
 	}
 	process.exitCode = 1;
