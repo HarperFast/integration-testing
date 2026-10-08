@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import { ok, strictEqual, match, doesNotMatch, rejects } from 'node:assert';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { readFile, writeFile as writeFileAsync } from 'node:fs/promises';
@@ -1428,7 +1428,10 @@ test('teardownHarper keeps the data root when an announced replacement never rec
 	}
 });
 
-test('a replacement group that outlived SIGKILL keeps a later teardown from cleaning up under it', { skip: process.platform !== 'linux' && 'relies on a zombie keeping a Linux process group alive' }, async () => {
+// The fixture's zombie holder needs perl, and a zombie keeping a process group alive is verified only on Linux.
+const canHoldZombieGroup = process.platform === 'linux' && spawnSync('perl', ['-e', '1']).status === 0;
+
+test('a replacement group that outlived SIGKILL keeps a later teardown from cleaning up under it', { skip: !canHoldZombieGroup && 'needs Linux and perl for a group that outlives SIGKILL' }, async () => {
 	let node: FakeHarperNode | undefined;
 	// Held here too: a teardown that wrongly cleans up deletes the file cleanup would read it from.
 	let holderPid: number | undefined;
