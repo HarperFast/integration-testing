@@ -125,6 +125,10 @@ runner.on('test:stdout', (data: any) => {
 });
 
 runner.on('test:fail', (data: any) => {
+	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run.
+	if (data.todo || data.skip) {
+		return;
+	}
 	process.exitCode = 1;
 	if (data.file) {
 		failedFiles.add(resolve(data.file));
