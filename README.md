@@ -292,6 +292,16 @@ These are used internally by `startHarper` and `teardownHarper`, but are exporte
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
 
+The pool is one file shared by every process on the machine: `${TMPDIR}/harper-integration-test-loopback-pool.json`, a JSON array with one slot per address holding the PID of the process that reserved it (or `null`), guarded by the `harper-integration-test-loopback-pool.lock` mutex beside it. Updates are published by renaming a complete `*.pending` file over it, so a process killed mid-update leaves the previous pool intact (and possibly an inert `*.pending` file). Releasing an address clears its slot only if this process holds it.
+
+A pool file that is unparseable, not an array, or an empty array can still be produced by a writer that doesn't publish by rename (an older version of this package killed mid-write) or by an outside edit. Such a file is either about to be completed or has lost reservations whose holders may not have bound their address yet. Allocation does refuse an address that a Harper node is already listening on, but that check cannot see a reservation nothing is listening on yet. So the file is quarantined rather than reset:
+
+- `getNextAvailableLoopbackAddress()` waits, and both release functions leave the file untouched, until it has gone 6 minutes without modification. That outlasts `startHarper`'s default startup ceiling (2 minutes, 5 under CI), so a `startHarper` that reserved an address before the file broke has bound it or given up by then.
+- After that, the pool is reinitialized with every address free and a warning is logged. From then on, an address still in use is protected only by that listening check.
+- Deleting the file skips the wait, but only do that once every integration-test run on the machine — including ones using older versions of this package — has stopped.
+
+The quarantine bounds, rather than eliminates, the risk of handing out an address twice: a caller that holds an address for longer than that without binding it (for example, with a `startupMaxMs` above 5 minutes) is not covered.
+
 ## Node.js Test Runner
 
 > Tests executed by this runner must use the `node:test` API. If you're using a different test framework, use the [lifecycle APIs](#api) directly and refer to the [runner source](./src/run.ts) as a reference implementation.
