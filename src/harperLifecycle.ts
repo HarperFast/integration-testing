@@ -4,7 +4,7 @@ import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
 import { type SuiteContext, type TestContext } from 'node:test';
-import { reserveLoopbackAddress, releaseLoopbackAddress } from './loopbackAddressPool.ts';
+import { reserveLoopbackAddress, releaseLoopbackAddress, releaseLoopbackReservation } from './loopbackAddressPool.ts';
 import { waitForPortsFree } from './portUtils.ts';
 import { ok, equal } from 'node:assert';
 import { createRequire } from 'node:module';
@@ -359,9 +359,11 @@ interface RunHarperCommandOptions {
 	harperBinPath?: string;
 	/** Idle timeout (ms): max time between output chunks before treating the process as hung. Resets on output. Falls back to DEFAULT_STARTUP_TIMEOUT_MS. */
 	timeoutMs?: number;
-	/** Absolute timeout (ms): ceiling on total time regardless of output. Falls back to DEFAULT_STARTUP_MAX_MS. */
+	/** Absolute ceiling (ms) from reservedAt (or this call's entry) through readiness. Falls back to DEFAULT_STARTUP_MAX_MS. */
 	maxMs?: number;
+	/** Claim time, or launch entry when reusing a hostname. */
 	reservedAt?: number;
+	/** Called after listeners are attached so lifecycle cleanup can reap a failed child. */
 	onSpawn?: (proc: ChildProcess) => void;
 	/** Loopback address this instance is bound to; recorded with the instance monitor for diagnostics. */
 	hostname?: string;
@@ -530,7 +532,7 @@ export function runHarperCommand({
 			reject(error);
 		});
 		proc.on('exit', (statusCode, signal) => {
-			if (!startupFinished() && Date.now() >= startupDeadline) failStartup(maxTimeoutMessage);
+			if (statusCode === 0 && !startupFinished() && Date.now() >= startupDeadline) failStartup(maxTimeoutMessage);
 			if (!settled) {
 				settled = true;
 				clearTimers();
@@ -713,14 +715,19 @@ async function launchHarper(
 		return ctx as StartedHarperTestContext;
 	} catch (error) {
 		if (spawnedProcess?.pid !== undefined) {
+			signalHarperTree(spawnedProcess, 'SIGKILL');
 			await killHarper({ harper: { process: spawnedProcess } } as StartedHarperTestContext, { graceMs: 0 });
 			if (spawnedProcess.exitCode === null && spawnedProcess.signalCode === null) {
 				console.warn(`[integration-testing] Could not confirm startup process exit; keeping ${loopbackAddress} and ${dataRootDir}`);
 				throw error;
 			}
+			if (loopbackAddress && !(await waitForPortsFree(loopbackAddress, ALL_HARPER_PORTS, DEFAULT_PORT_RELEASE_TIMEOUT_MS))) {
+				console.warn(`[integration-testing] Harper ports on ${loopbackAddress} still in use after startup failed; keeping ${dataRootDir} and the reservation`);
+				throw error;
+			}
 		}
 		if (ownsLoopbackAddress && loopbackAddress) {
-			await releaseLoopbackAddress(loopbackAddress).catch((cleanupError) => {
+			await releaseLoopbackReservation(loopbackAddress, reservedAt).catch((cleanupError) => {
 				console.warn(`[integration-testing] Could not release ${loopbackAddress} after startup failed: ${cleanupError}`);
 			});
 		}

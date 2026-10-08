@@ -515,9 +515,9 @@ export async function reserveLoopbackAddress(): Promise<{ loopbackAddress: strin
 			} else {
 				// Assign the process PID to that index to mark it as used
 				loopbackPool[index] = process.pid;
+				reservedAt = Date.now();
 			}
 			// Write the updated pool back to the file
-			if (index !== null) reservedAt = Date.now();
 			await writePoolFile(loopbackPool);
 
 			return index;
@@ -628,6 +628,10 @@ function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
  * @throws InvalidLoopbackAddressError if the address format is invalid
  */
 export async function releaseLoopbackAddress(address: string): Promise<void> {
+	await releaseLoopbackReservation(address);
+}
+
+export async function releaseLoopbackReservation(address: string, reservedAt?: number): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);
 
@@ -635,6 +639,10 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 		if (!loopbackPool || loopbackPool[index] !== process.pid) return;
+		if (reservedAt !== undefined && Date.now() - reservedAt >= UNUSABLE_POOL_QUARANTINE_MS) {
+			console.warn(`[loopback-pool] Skipping automatic release of ${address}: its old claim may have been replaced during quarantine recovery.`);
+			return;
+		}
 
 		// Release the address by setting it to null
 		loopbackPool[index] = null;
