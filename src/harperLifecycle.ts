@@ -4,7 +4,7 @@ import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, rm, cp } from 'node:fs/promises';
 import { type SuiteContext, type TestContext } from 'node:test';
-import { getNextAvailableLoopbackAddress, releaseLoopbackAddress } from './loopbackAddressPool.ts';
+import { reserveLoopbackAddress, releaseLoopbackAddress } from './loopbackAddressPool.ts';
 import { waitForPortsFree } from './portUtils.ts';
 import { ok, equal } from 'node:assert';
 import { createRequire } from 'node:module';
@@ -71,7 +71,8 @@ export const DEFAULT_STARTUP_TIMEOUT_MS =
 	parseInt(process.env.HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS || '', 10) || (IS_CI ? 150000 : 60000);
 
 /**
- * Absolute ceiling on total startup time, regardless of ongoing output — a generous backstop
+ * Absolute ceiling from address reservation through readiness, including setup after reservation,
+ * regardless of ongoing output — a generous backstop
  * so a process that chatters forever without ever reporting ready still fails. Higher under CI,
  * where shared/contended runners boot more slowly.
  *
@@ -126,7 +127,8 @@ export interface StartHarperOptions {
 	 */
 	startupTimeoutMs?: number;
 	/**
-	 * Absolute ceiling (ms) on total startup time, regardless of ongoing output.
+	 * Absolute ceiling (ms) from address reservation through readiness, including setup after
+	 * reservation. Pool waits before the claim are excluded; reused hostnames get a new per-call ceiling.
 	 * Falls back to {@link DEFAULT_STARTUP_MAX_MS} (120s locally, 300s under CI).
 	 */
 	startupMaxMs?: number;
@@ -359,6 +361,8 @@ interface RunHarperCommandOptions {
 	timeoutMs?: number;
 	/** Absolute timeout (ms): ceiling on total time regardless of output. Falls back to DEFAULT_STARTUP_MAX_MS. */
 	maxMs?: number;
+	reservedAt?: number;
+	onSpawn?: (proc: ChildProcess) => void;
 	/** Loopback address this instance is bound to; recorded with the instance monitor for diagnostics. */
 	hostname?: string;
 }
@@ -389,8 +393,13 @@ export function runHarperCommand({
 	harperBinPath,
 	timeoutMs,
 	maxMs,
+	reservedAt = Date.now(),
+	onSpawn,
 	hostname,
 }: RunHarperCommandOptions): Promise<RunHarperCommandResult> {
+	const maxTimeoutMs = maxMs ?? DEFAULT_STARTUP_MAX_MS;
+	const startupDeadline = reservedAt + maxTimeoutMs;
+	const maxTimeoutMessage = `Harper did not report ready within the maximum startup time of ${maxTimeoutMs}ms`;
 	const harperScript = getHarperScript(harperBinPath);
 	const runtime = HARPER_RUNTIME;
 	const runtimeArgs =
@@ -398,7 +407,7 @@ export function runHarperCommand({
 			? [harperScript, ...args]
 			: ['--trace-warnings', '--force-node-api-uncaught-exceptions-policy=true', harperScript, ...args];
 	const instanceId = nextInstanceId();
-	const proc = spawn(runtime, runtimeArgs, {
+	const spawnOptions = {
 		env: { ...process.env, ...env, ...buildInstanceEnv(instanceId) },
 		// On POSIX, run Harper as its own process-group leader so both teardown and the shared
 		// instance monitor can signal the whole group (parent + any worker children), not just the
@@ -406,7 +415,9 @@ export function runHarperCommand({
 		// stdio stays piped (not detached), and we never unref, so output capture and lifetime
 		// management are unchanged.
 		detached: process.platform !== 'win32',
-	});
+	};
+	if (Date.now() >= startupDeadline) throw new HarperStartupError(maxTimeoutMessage, '', '');
+	const proc = spawn(runtime, runtimeArgs, spawnOptions);
 
 	// Publishes the instance to the shared monitor, which reaps it if this runner dies without
 	// running cleanup, and installs the runner-side handlers covering cooperative exits.
@@ -420,7 +431,6 @@ export function runHarperCommand({
 	}
 
 	const idleTimeoutMs = timeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
-	const maxTimeoutMs = maxMs ?? DEFAULT_STARTUP_MAX_MS;
 
 	return new Promise((resolve, reject) => {
 		let stdout = '';
@@ -446,6 +456,10 @@ export function runHarperCommand({
 
 		const succeed = () => {
 			if (settled || readinessDetected) return;
+			if (Date.now() >= startupDeadline) {
+				failStartup(maxTimeoutMessage);
+				return;
+			}
 			readinessDetected = true;
 			// Left armed across registration, these would let registry-lock contention time out — and
 			// kill — an instance that already booted successfully.
@@ -477,8 +491,8 @@ export function runHarperCommand({
 
 		// Absolute backstop, regardless of ongoing output.
 		maxTimer = setTimeout(
-			() => failStartup(`Harper did not report ready within the maximum startup time of ${maxTimeoutMs}ms`),
-			maxTimeoutMs
+			() => failStartup(maxTimeoutMessage),
+			Math.max(0, startupDeadline - Date.now())
 		);
 		resetIdleTimer();
 
@@ -516,6 +530,7 @@ export function runHarperCommand({
 			reject(error);
 		});
 		proc.on('exit', (statusCode, signal) => {
+			if (!startupFinished() && Date.now() >= startupDeadline) failStartup(maxTimeoutMessage);
 			if (!settled) {
 				settled = true;
 				clearTimers();
@@ -530,6 +545,7 @@ export function runHarperCommand({
 			stdoutStream?.end();
 			stderrStream?.end();
 		});
+		onSpawn?.(proc);
 	});
 }
 
@@ -598,8 +614,8 @@ export async function startHarper(ctx: HarperTestContext, options?: StartHarperO
  * @param ctx - The test context to populate with Harper instance details
  * @param options - Optional configuration for the setup process
  * @param ownsDataRootDir - Whether the install directory was created for this start. If allocating a
- *   loopback address throws, an owned directory is removed, and `ctx.harper` cleared if it names that
- *   directory, before the error propagates; a caller-supplied directory is left for the caller.
+ *   loopback address or starting throws, an owned directory is removed once the child is gone, and
+ *   `ctx.harper` cleared if it names that directory; a caller-supplied directory is left for the caller.
  * @returns The context with the `harper` property populated
  */
 async function launchHarper(
@@ -607,94 +623,115 @@ async function launchHarper(
 	options: StartHarperOptions | undefined,
 	ownsDataRootDir: boolean
 ): Promise<StartedHarperTestContext> {
+	let reservedAt = Date.now();
 	const dataRootDirPrefix = join(
 		process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(),
 		`harper-integration-test-`
 	);
 	const dataRootDir = ctx.harper?.dataRootDir ?? (await mkdtemp(dataRootDirPrefix));
 
-	let loopbackAddress: string;
+	let loopbackAddress = ctx.harper?.hostname;
+	const ownsLoopbackAddress = loopbackAddress == null;
+	let spawnedProcess: ChildProcess | undefined;
 	try {
-		loopbackAddress = ctx.harper?.hostname ?? (await getNextAvailableLoopbackAddress());
+		if (loopbackAddress == null) {
+			({ loopbackAddress, reservedAt } = await reserveLoopbackAddress());
+		}
+
+		// Set up per-suite log directory when HARPER_INTEGRATION_TEST_LOG_DIR is configured
+		const logDirEnv = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
+		let logDir: string | undefined;
+		if (logDirEnv) {
+			const suiteName = sanitizeForFilesystem(ctx.name || 'unknown');
+			const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+			logDir = join(logDirEnv, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
+			await mkdir(logDir, { recursive: true });
+
+			// Output for the test runner (e.g. run.ts) to map this log dir to the current test file
+			process.stdout.write(`${LOG_DIR_MARKER_PREFIX} ${logDir}\n`);
+		}
+
+		// Point Harper's log directory to the suite log dir so hdb.log is preserved for upload
+		const config = { ...options?.config };
+		if (logDir) {
+			config.logging = { ...config.logging, root: logDir };
+		}
+
+		const args = [
+			`--ROOTPATH=${dataRootDir}`,
+			`--AUTHENTICATION_AUTHORIZELOCAL=true`,
+			`--HDB_ADMIN_USERNAME=${DEFAULT_ADMIN_USERNAME}`,
+			`--HDB_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}`,
+			'--THREADS_COUNT=1',
+			'--THREADS_DEBUG=false',
+			`--NODE_HOSTNAME=${loopbackAddress}`,
+			`--HTTP_PORT=${loopbackAddress}:${HTTP_PORT}`,
+			`--OPERATIONSAPI_NETWORK_PORT=${loopbackAddress}:${OPERATIONS_API_PORT}`,
+			`--MQTT_NETWORK_PORT=${loopbackAddress}:${MQTT_PORT}`,
+			`--MQTT_NETWORK_SECUREPORT=${loopbackAddress}:${MQTTS_PORT}`,
+			'--LOGGING_LEVEL=debug',
+			'--LOGGING_STDSTREAMS=false',
+		];
+
+		// Bind secure port if HTTPS is needed (mTLS or other TLS config present)
+		if (options?.config?.http?.mtls !== undefined || options?.config?.tls !== undefined) {
+			args.push(`--HTTP_SECUREPORT=${loopbackAddress}:${HTTPS_PORT}`);
+		}
+
+		// HARPER_SET_CONFIG must be passed as an environment variable, not a CLI arg, because
+		// applyRuntimeEnvVarConfig reads from process.env.HARPER_SET_CONFIG. buildHarperChildEnv also isolates the
+		// child's HOME into dataRootDir so Harper's global boot pointer never lands in the developer's real home.
+		const harperEnv = buildHarperChildEnv(dataRootDir, config, options?.env);
+
+		const result = await runHarperCommand({
+			args,
+			env: harperEnv,
+			completionMessage: 'successfully started',
+			logDir,
+			harperBinPath: options?.harperBinPath,
+			timeoutMs: options?.startupTimeoutMs,
+			maxMs: options?.startupMaxMs,
+			reservedAt,
+			onSpawn: (proc) => { spawnedProcess = proc; },
+			hostname: loopbackAddress,
+		});
+
+		publishHarperNode(ctx, {
+			dataRootDir,
+			admin: {
+				username: DEFAULT_ADMIN_USERNAME,
+				password: DEFAULT_ADMIN_PASSWORD,
+			},
+			httpURL: `http://${loopbackAddress}:${HTTP_PORT}`,
+			operationsAPIURL: `http://${loopbackAddress}:${OPERATIONS_API_PORT}`,
+			hostname: loopbackAddress,
+			process: result.process,
+			logDir,
+			startupOutput: { stdout: result.stdout, stderr: result.stderr },
+		});
+
+		return ctx as StartedHarperTestContext;
 	} catch (error) {
+		if (spawnedProcess?.pid !== undefined) {
+			await killHarper({ harper: { process: spawnedProcess } } as StartedHarperTestContext, { graceMs: 0 });
+			if (spawnedProcess.exitCode === null && spawnedProcess.signalCode === null) {
+				console.warn(`[integration-testing] Could not confirm startup process exit; keeping ${loopbackAddress} and ${dataRootDir}`);
+				throw error;
+			}
+		}
+		if (ownsLoopbackAddress && loopbackAddress) {
+			await releaseLoopbackAddress(loopbackAddress).catch((cleanupError) => {
+				console.warn(`[integration-testing] Could not release ${loopbackAddress} after startup failed: ${cleanupError}`);
+			});
+		}
 		if (ownsDataRootDir) {
-			await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+			await rm(dataRootDir, { recursive: true, force: true, maxRetries: 10 }).catch((cleanupError) => {
+				console.warn(`[integration-testing] Could not remove ${dataRootDir} after startup failed: ${cleanupError}`);
+			});
 			if (ctx.harper?.dataRootDir === dataRootDir) ctx.harper = undefined;
 		}
 		throw error;
 	}
-
-	// Set up per-suite log directory when HARPER_INTEGRATION_TEST_LOG_DIR is configured
-	const logDirEnv = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
-	let logDir: string | undefined;
-	if (logDirEnv) {
-		const suiteName = sanitizeForFilesystem(ctx.name || 'unknown');
-		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-		logDir = join(logDirEnv, `${suiteName}-${sanitizeForFilesystem(loopbackAddress)}-${timestamp}`);
-		await mkdir(logDir, { recursive: true });
-
-		// Output for the test runner (e.g. run.ts) to map this log dir to the current test file
-		process.stdout.write(`${LOG_DIR_MARKER_PREFIX} ${logDir}\n`);
-	}
-
-	// Point Harper's log directory to the suite log dir so hdb.log is preserved for upload
-	const config = { ...options?.config };
-	if (logDir) {
-		config.logging = { ...config.logging, root: logDir };
-	}
-
-	const args = [
-		`--ROOTPATH=${dataRootDir}`,
-		`--AUTHENTICATION_AUTHORIZELOCAL=true`,
-		`--HDB_ADMIN_USERNAME=${DEFAULT_ADMIN_USERNAME}`,
-		`--HDB_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}`,
-		'--THREADS_COUNT=1',
-		'--THREADS_DEBUG=false',
-		`--NODE_HOSTNAME=${loopbackAddress}`,
-		`--HTTP_PORT=${loopbackAddress}:${HTTP_PORT}`,
-		`--OPERATIONSAPI_NETWORK_PORT=${loopbackAddress}:${OPERATIONS_API_PORT}`,
-		`--MQTT_NETWORK_PORT=${loopbackAddress}:${MQTT_PORT}`,
-		`--MQTT_NETWORK_SECUREPORT=${loopbackAddress}:${MQTTS_PORT}`,
-		'--LOGGING_LEVEL=debug',
-		'--LOGGING_STDSTREAMS=false',
-	];
-
-	// Bind secure port if HTTPS is needed (mTLS or other TLS config present)
-	if (options?.config?.http?.mtls !== undefined || options?.config?.tls !== undefined) {
-		args.push(`--HTTP_SECUREPORT=${loopbackAddress}:${HTTPS_PORT}`);
-	}
-
-	// HARPER_SET_CONFIG must be passed as an environment variable, not a CLI arg, because
-	// applyRuntimeEnvVarConfig reads from process.env.HARPER_SET_CONFIG. buildHarperChildEnv also isolates the
-	// child's HOME into dataRootDir so Harper's global boot pointer never lands in the developer's real home.
-	const harperEnv = buildHarperChildEnv(dataRootDir, config, options?.env);
-
-	const result = await runHarperCommand({
-		args,
-		env: harperEnv,
-		completionMessage: 'successfully started',
-		logDir,
-		harperBinPath: options?.harperBinPath,
-		timeoutMs: options?.startupTimeoutMs,
-		maxMs: options?.startupMaxMs,
-		hostname: loopbackAddress,
-	});
-
-	publishHarperNode(ctx, {
-		dataRootDir,
-		admin: {
-			username: DEFAULT_ADMIN_USERNAME,
-			password: DEFAULT_ADMIN_PASSWORD,
-		},
-		httpURL: `http://${loopbackAddress}:${HTTP_PORT}`,
-		operationsAPIURL: `http://${loopbackAddress}:${OPERATIONS_API_PORT}`,
-		hostname: loopbackAddress,
-		process: result.process,
-		logDir,
-		startupOutput: { stdout: result.stdout, stderr: result.stderr },
-	});
-
-	return ctx as StartedHarperTestContext;
 }
 
 function signalWindowsProcessTree(pid: number, signal: 'SIGTERM' | 'SIGKILL'): void {
