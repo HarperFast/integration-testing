@@ -125,10 +125,9 @@ runner.on('test:stdout', (data: any) => {
 });
 
 runner.on('test:fail', (data: any) => {
-	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run. A reason can be a
-	// falsy string, e.g. `{ todo: '' }`, so classify by marker presence, not truthiness.
-	const isTodoOrSkip = (data.todo !== undefined && data.todo !== false) || (data.skip !== undefined && data.skip !== false);
-	if (isTodoOrSkip) {
+	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run. The marker is `true`
+	// or the reason string, which can be empty (`{ todo: '' }`).
+	if (data.todo || data.todo === '' || data.skip || data.skip === '') {
 		return;
 	}
 	process.exitCode = 1;
