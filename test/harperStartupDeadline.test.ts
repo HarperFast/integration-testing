@@ -157,7 +157,7 @@ mock.module('node:child_process', {
 	},
 });
 
-const { startHarper, setupHarperWithFixture, killHarper, teardownHarper, HarperStartupError, DEFAULT_STARTUP_MAX_MS } =
+const { startHarper, setupHarperWithFixture, runHarperCommand, killHarper, teardownHarper, HarperStartupError, DEFAULT_STARTUP_MAX_MS } =
 	await import('../src/harperLifecycle.ts');
 const { readPoolFile, getNextAvailableLoopbackAddress } = await import('../src/loopbackAddressPool.ts');
 
@@ -208,6 +208,16 @@ function startupError(maxMs: number): (error: Error) => boolean {
 		return true;
 	};
 }
+
+test('pre-spawn expiry returns a rejected Promise to chained catch handlers', async () => {
+	let capturedError: unknown;
+	await runHarperCommand({ args: [], env: {}, maxMs: 0, harperBinPath: readyScript }).catch((error) => {
+		capturedError = error;
+	});
+	ok(capturedError instanceof HarperStartupError);
+	match(capturedError.message, /maximum startup time of 0ms/);
+	strictEqual(children.length, 0, 'an expired command must never spawn');
+});
 
 for (const maxMs of [0, 1000, DEFAULT_STARTUP_MAX_MS]) {
 	test(`setup at the ${maxMs}ms ceiling refuses spawn and cleans up`, async () => {

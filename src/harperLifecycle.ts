@@ -418,7 +418,7 @@ export function runHarperCommand({
 		// management are unchanged.
 		detached: process.platform !== 'win32',
 	};
-	if (Date.now() >= startupDeadline) throw new HarperStartupError(maxTimeoutMessage, '', '');
+	if (Date.now() >= startupDeadline) return Promise.reject(new HarperStartupError(maxTimeoutMessage, '', ''));
 	const proc = spawn(runtime, runtimeArgs, spawnOptions);
 
 	// Publishes the instance to the shared monitor, which reaps it if this runner dies without
