@@ -109,7 +109,7 @@ The Harper binary is resolved in the following order:
 ```ts
 interface StartHarperOptions {
   startupTimeoutMs?: number;   // Idle timeout: max gap between startup output chunks. Default: 60000 (150000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS
-  startupMaxMs?: number;       // Absolute startup ceiling regardless of output. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
+  startupMaxMs?: number;       // Ceiling from address reservation through readiness, including setup. Default: 120000 (300000 under CI) or HARPER_INTEGRATION_TEST_STARTUP_MAX_MS
   config?: object;             // Harper config overrides (passed via HARPER_SET_CONFIG)
   env?: object;                // Additional environment variables for the Harper process
   harperBinPath?: string;      // Explicit path to dist/bin/harper.js
@@ -118,12 +118,16 @@ interface StartHarperOptions {
 
 Startup readiness is detected by Harper printing `successfully started`. Rather than a single wall-clock deadline (which makes a slow-but-healthy boot indistinguishable from a hang), the watchdog uses an **idle timeout** that resets on every chunk of output — so the limit is time-since-last-progress — plus a generous absolute ceiling as a backstop. This is why a slow CI boot that keeps logging no longer trips the timeout.
 
+`startupMaxMs` starts when the pool slot is claimed, before address validation and log setup. Waiting for a pool slot (including quarantine) and preparing an install or fixture before the claim do not consume it. Setup after reservation leaves only the remaining budget for boot; at or after the deadline, an unlaunched start is refused and late readiness is rejected with `HarperStartupError`. A restart using an existing hostname gets a fresh budget for that call. Readiness ends startup timing; monitor registration can finish afterward.
+
+> **Behavior change:** the absolute ceiling previously began after spawning Harper. Slow setup now consumes that ceiling. After allocation succeeds, failed starts normally release addresses and remove install directories acquired by that call once child exit is confirmed; caller-supplied directories and reused addresses are preserved. Captured stdout/stderr remain on `HarperStartupError`, and configured `HARPER_INTEGRATION_TEST_LOG_DIR` logs are kept, but logs inside a removed install directory are deleted. If exit or release of Harper's ports cannot be confirmed, resources stay in place with a warning. Automatic failure cleanup also leaves a claim at least 6 minutes old untouched: recovery may already have reissued that address to a newer start under the same PID. An unreleased slot can stay reserved until its runner exits. The deadline uses the wall clock, so forward clock adjustments can expire startup; a suspended or blocked runner cannot enforce it until JavaScript resumes.
+
 > **Behavior change:** `startupTimeoutMs` (and `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS`) previously meant an absolute startup deadline. It now means the **idle / no-output window**. If you relied on it as a hard ceiling to fail slow boots quickly, set `startupMaxMs` (or `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS`) instead.
 
 **Environment Variables:**
 
 - `HARPER_INTEGRATION_TEST_STARTUP_TIMEOUT_MS` - Idle startup timeout: max time between chunks of startup output before Harper is treated as hung (resets on output). Default `60000` (`150000` under CI).
-- `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
+- `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling from address reservation through readiness, including setup after reservation, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
 - `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` - Set to `1` or `true` to start a node on an address whose operations or HTTP port another process already accepts connections on, or that could not be checked for one, with a warning instead of an error (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)).
@@ -300,11 +304,11 @@ The pool is one file shared by every process on the machine: `${TMPDIR}/harper-i
 
 A pool file that is unparseable, not an array, or an empty array can still be produced by a writer that doesn't publish by rename (an older version of this package killed mid-write) or by an outside edit. Such a file is either about to be completed or has lost reservations whose holders may not have bound their address yet. Allocation does refuse an address that a Harper node is already listening on, but that check cannot see a reservation nothing is listening on yet. So the file is quarantined rather than reset:
 
-- `getNextAvailableLoopbackAddress()` waits, and both release functions leave the file untouched, until it has gone 6 minutes without modification. That outlasts `startHarper`'s default startup ceiling (2 minutes, 5 under CI), so a `startHarper` that reserved an address before the file broke has bound it or given up by then.
+- `getNextAvailableLoopbackAddress()` waits, and both release functions leave the file untouched, until it has gone 6 minutes without modification. That outlasts `startHarper`'s default reservation-to-readiness ceiling (2 minutes, 5 under CI), including setup after the claim. Expired starts are refused before spawn or killed during boot; this reduces the chance of reissuing their unbound address.
 - After that, the pool is reinitialized with every address free and a warning is logged. From then on, an address still in use is protected only by that listening check.
 - Deleting the file skips the wait, but only do that once every integration-test run on the machine — including ones using older versions of this package — has stopped.
 
-The quarantine bounds, rather than eliminates, the risk of handing out an address twice: a caller that holds an address for longer than that without binding it (for example, with a `startupMaxMs` above 5 minutes) is not covered.
+The quarantine bounds, rather than eliminates, the risk of handing out an address twice: longer custom ceilings, direct or older-version callers, reservations kept unbound between kill and restart, clock changes, and suspended or blocked runners can outlast it. The default ceiling (2 minutes, 5 under CI) leaves at least a minute for failure cleanup; the package cannot guarantee that cleanup completes during a host stall.
 
 ## Node.js Test Runner
 

@@ -32,7 +32,7 @@ const RETRY_DELAY_MS = 1000;
 
 // How long an unusable pool file must go unmodified before it is reinitialized. The reservations it
 // lost may not be bound yet, which the conflict canary can't see, so this must outlast startHarper's
-// reserve-to-bind time: its startup ceiling (DEFAULT_STARTUP_MAX_MS) plus the setup before it.
+// reserve-to-readiness ceiling (DEFAULT_STARTUP_MAX_MS, including setup after reservation).
 const UNUSABLE_POOL_QUARANTINE_MS = 360000;
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
@@ -467,6 +467,11 @@ export async function validateLoopbackAddressPool(): Promise<{
  * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
+	return (await reserveLoopbackAddress()).loopbackAddress;
+}
+
+/** Internal claim-time handoff for startup; intentionally not re-exported from index.ts. */
+export async function reserveLoopbackAddress(): Promise<{ loopbackAddress: string; reservedAt: number }> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
 	// So if the first test process number is 42, it would be assigned to index 0 associated with address 127.0.0.2
 	// [42, null, null, ...];
@@ -490,6 +495,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
 	while (true) {
+		let reservedAt = 0;
 		const assignedIndex = await withLock(async () => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile();
@@ -510,6 +516,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			} else {
 				// Assign the process PID to that index to mark it as used
 				loopbackPool[index] = process.pid;
+				reservedAt = Date.now();
 			}
 			// Write the updated pool back to the file
 			await writePoolFile(loopbackPool);
@@ -520,6 +527,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 		// If we got an index, validate and return the address
 		if (assignedIndex !== null) {
 			const loopbackAddress = `127.0.0.${assignedIndex + HARPER_LOOPBACK_POOL_START}`;
+			const reservation = { loopbackAddress, reservedAt };
 			try {
 				await validateLoopbackAddress(loopbackAddress);
 			} catch (error) {
@@ -544,7 +552,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			if (conflictingPort === null) {
 				// macOS and Windows let the canary's exclusive bind succeed beside a listener on all interfaces; Linux refuses it.
 				if (process.platform === 'linux') {
-					return loopbackAddress;
+					return reservation;
 				}
 				let shadowedPort: number | null;
 				try {
@@ -555,7 +563,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 						console.warn(
 							`[loopback-pool] Could not check ${loopbackAddress} for another process's listener (${reason}); continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set.`
 						);
-						return loopbackAddress;
+						return reservation;
 					}
 					await releaseRefusedAddress(loopbackAddress);
 					throw new LoopbackAddressValidationError(
@@ -565,13 +573,13 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 					);
 				}
 				if (shadowedPort === null) {
-					return loopbackAddress;
+					return reservation;
 				}
 				if (foreignListenersAllowed()) {
 					console.warn(
 						`[loopback-pool] Another process accepts connections on ${loopbackAddress}:${shadowedPort}; continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set. This node's clients reach that process whenever the node has no listener of its own there.`
 					);
-					return loopbackAddress;
+					return reservation;
 				}
 				await releaseRefusedAddress(loopbackAddress);
 				throw new ForeignListenerError(loopbackAddress, shadowedPort);
@@ -621,6 +629,11 @@ function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
  * @throws InvalidLoopbackAddressError if the address format is invalid
  */
 export async function releaseLoopbackAddress(address: string): Promise<void> {
+	await releaseLoopbackReservation(address);
+}
+
+/** Internal release leaves a supplied claim untouched after quarantine age; not re-exported from index.ts. */
+export async function releaseLoopbackReservation(address: string, reservedAt?: number): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);
 
@@ -628,6 +641,10 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 		// Read the pool file
 		const loopbackPool = await readPoolFile();
 		if (!loopbackPool || loopbackPool[index] !== process.pid) return;
+		if (reservedAt !== undefined && Date.now() - reservedAt >= UNUSABLE_POOL_QUARANTINE_MS) {
+			console.warn(`[loopback-pool] Skipping automatic release of ${address}: its old claim may have been replaced during quarantine recovery.`);
+			return;
+		}
 
 		// Release the address by setting it to null
 		loopbackPool[index] = null;
