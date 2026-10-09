@@ -470,6 +470,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	return (await reserveLoopbackAddress()).loopbackAddress;
 }
 
+/** Internal claim-time handoff for startup; intentionally not re-exported from index.ts. */
 export async function reserveLoopbackAddress(): Promise<{ loopbackAddress: string; reservedAt: number }> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
 	// So if the first test process number is 42, it would be assigned to index 0 associated with address 127.0.0.2
@@ -631,6 +632,7 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 	await releaseLoopbackReservation(address);
 }
 
+/** Internal release leaves a supplied claim untouched after quarantine age; not re-exported from index.ts. */
 export async function releaseLoopbackReservation(address: string, reservedAt?: number): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);

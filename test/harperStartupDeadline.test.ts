@@ -69,7 +69,8 @@ let exitElapsedMs = 0;
 let setupError: Error | undefined;
 let corruptDuringSetup = false;
 let replaceDuringSetup = false;
-let unconfirmedChild: childProcess.ChildProcess | undefined;
+let injectedChild: childProcess.ChildProcess | undefined;
+let taskkillCalls = 0;
 let portsRemainHeld = false;
 let observeRelease = false;
 let releasedWhileChildAlive = false;
@@ -109,7 +110,13 @@ mock.module('../src/portUtils.ts', {
 		waitForPortsFree: async (host: string, ports: number[], timeoutMs: number) => {
 			deepStrictEqual(ports, [9925, 9926, 9927, 1883, 8883]);
 			if (portsRemainHeld) return false;
-			return portUtils.waitForPortsFree(host, [testPort], timeoutMs);
+			// A failed group reap must time out even while the startup clock is frozen.
+			const deadline = performance.now() + timeoutMs;
+			while (!(await portUtils.isPortFree(host, testPort))) {
+				if (performance.now() >= deadline) return false;
+				await timersPromises.setTimeout(100);
+			}
+			return true;
 		},
 	},
 });
@@ -131,7 +138,12 @@ mock.module('node:child_process', {
 	namedExports: {
 		...childProcess,
 		spawn: (...args: Parameters<typeof childProcess.spawn>) => {
-			if (unconfirmedChild && args[0] !== 'taskkill') return unconfirmedChild;
+			if (args[0] === 'taskkill') taskkillCalls++;
+			if (injectedChild && args[0] !== 'taskkill') {
+				const child = injectedChild;
+				if (child.exitCode !== null) queueMicrotask(() => child.emit('exit', child.exitCode));
+				return child;
+			}
 			const child = childProcess.spawn(...args);
 			if (args[0] !== 'taskkill') {
 				children.push(child);
@@ -158,7 +170,8 @@ beforeEach(async () => {
 	setupError = undefined;
 	corruptDuringSetup = false;
 	replaceDuringSetup = false;
-	unconfirmedChild = undefined;
+	injectedChild = undefined;
+	taskkillCalls = 0;
 	portsRemainHeld = observeRelease = releasedWhileChildAlive = false;
 	children.length = 0;
 	await fsPromises.writeFile(poolPath, '[null]');
@@ -279,6 +292,27 @@ test('a normal exit observed at the deadline cannot bypass the startup ceiling',
 	await assertCleanFailure(ctx);
 });
 
+test('Windows cleanup never sends taskkill to an already exited leader PID', async () => {
+	injectedChild = Object.assign(new EventEmitter(), {
+		pid: 2147483647,
+		exitCode: 1,
+		signalCode: null,
+		stdout: new PassThrough(),
+		stderr: new PassThrough(),
+		kill: () => true,
+	}) as unknown as childProcess.ChildProcess;
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+	const ctx: HarperTestContext = {};
+	Object.defineProperty(process, 'platform', { value: 'win32' });
+	try {
+		await rejects(startHarper(ctx, { startupMaxMs: 1000, harperBinPath: readyScript }), /failed with exit code\/signal 1/);
+		strictEqual(taskkillCalls, 0, 'an exited PID may now belong to an unrelated process');
+		await assertCleanFailure(ctx);
+	} finally {
+		Object.defineProperty(process, 'platform', originalPlatform);
+	}
+});
+
 test('a failed leader is reaped with its descendant before the slot is released', { skip: process.platform === 'win32' }, async () => {
 	observeRelease = true;
 	let descendantPid: number | undefined;
@@ -397,7 +431,7 @@ test('an unconfirmed child exit keeps its reservation and install parked', async
 		stderr: new PassThrough(),
 		kill: () => true,
 	}) as unknown as childProcess.ChildProcess;
-	unconfirmedChild = child;
+	injectedChild = child;
 	const warn = t.mock.method(console, 'warn', () => {});
 	try {
 		await rejects(startHarper({}, { startupMaxMs: 10, harperBinPath: readyScript }), startupError(10));

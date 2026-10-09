@@ -72,8 +72,8 @@ export const DEFAULT_STARTUP_TIMEOUT_MS =
 
 /**
  * Absolute ceiling from address reservation through readiness, including setup after reservation,
- * regardless of ongoing output — a generous backstop
- * so a process that chatters forever without ever reporting ready still fails. Higher under CI,
+ * regardless of ongoing output — a generous backstop so a process that chatters forever without
+ * ever reporting ready still fails. Higher under CI,
  * where shared/contended runners boot more slowly.
  *
  * Override with `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS`. Default 120s (300s under CI).
@@ -758,6 +758,8 @@ function signalHarperTree(proc: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): vo
 	const pid = proc.pid;
 	if (pid === undefined) return;
 	if (process.platform === 'win32') {
+		// Once the leader exits, taskkill can target a reused PID but cannot follow the old tree.
+		if (proc.exitCode !== null || proc.signalCode !== null) return;
 		try {
 			signalWindowsProcessTree(pid, signal);
 		} catch {
