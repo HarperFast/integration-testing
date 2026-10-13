@@ -5,6 +5,7 @@ import { spec } from 'node:test/reporters';
 import { parseArgs } from 'node:util';
 import { validateLoopbackAddressPool } from './loopbackAddressPool.ts';
 import { LOG_DIR_MARKER_PREFIX } from './harperLifecycle.ts';
+import { buildLogTail } from './logTail.ts';
 import { mkdtemp } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { readFileSync, rmSync, existsSync } from 'node:fs';
@@ -125,6 +126,11 @@ runner.on('test:stdout', (data: any) => {
 });
 
 runner.on('test:fail', (data: any) => {
+	// node:test semantics: a failing `todo` or `skip` test doesn't fail the run. The marker is `true`
+	// or the reason string, which can be empty (`{ todo: '' }`).
+	if (data.todo || data.todo === '' || data.skip || data.skip === '') {
+		return;
+	}
 	process.exitCode = 1;
 	if (data.file) {
 		failedFiles.add(resolve(data.file));
@@ -147,19 +153,7 @@ process.on('exit', () => {
 					if (existsSync(hdbLogPath)) {
 						try {
 							const content = readFileSync(hdbLogPath, 'utf8');
-							let output: string;
-							let tailNote = '';
-							if (LOG_TAIL_LINES > 0) {
-								const lines = content.split('\n');
-								if (lines.length > LOG_TAIL_LINES) {
-									output = lines.slice(-LOG_TAIL_LINES).join('\n');
-									tailNote = ` (last ${LOG_TAIL_LINES} of ${lines.length} lines; set HARPER_INTEGRATION_TEST_LOG_TAIL_LINES=0 for full log)`;
-								} else {
-									output = content;
-								}
-							} else {
-								output = content;
-							}
+							const { output, note: tailNote } = buildLogTail(content, LOG_TAIL_LINES);
 							console.log(`\n--- Log for instance in ${file}${tailNote} ---`);
 							console.log(`Directory: ${dir}`);
 							console.log('-'.repeat(80));

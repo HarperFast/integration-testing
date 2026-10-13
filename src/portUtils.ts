@@ -1,4 +1,4 @@
-import { createServer } from 'node:net';
+import { connect, createServer } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /**
@@ -20,6 +20,58 @@ export function isPortFree(host: string, port: number): Promise<boolean> {
 			server.close(() => resolve(true));
 		});
 	});
+}
+
+/**
+ * Checks whether something accepts TCP connections on `host:port`.
+ *
+ * Resolves `true` once a handshake completes and `false` when the connection is refused. Anything
+ * else, including no answer within `timeoutMs` (a listener whose handshake stalls), means the check
+ * could not be made, so it rejects with that error. The connection is closed as soon as it opens,
+ * before anything is sent.
+ *
+ * @param host The host/address to connect to (e.g. "127.0.0.2")
+ * @param port The port to connect to
+ * @param timeoutMs How long to wait for the handshake (default 1000ms)
+ * @returns A promise resolving to `true` if a connection was accepted, `false` if it was refused
+ */
+export function acceptsConnections(host: string, port: number, timeoutMs = 1000): Promise<boolean> {
+	return new Promise((resolve, reject) => {
+		const socket = connect({ host, port });
+		let settled = false;
+		const settle = (outcome: boolean | Error) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			if (outcome instanceof Error) reject(outcome);
+			else resolve(outcome);
+		};
+		socket.setTimeout(timeoutMs, () =>
+			settle(Object.assign(new Error(`No answer from ${host}:${port} within ${timeoutMs} ms`), { code: 'ETIMEDOUT' }))
+		);
+		socket.once('connect', () => settle(true));
+		socket.on('error', (error: NodeJS.ErrnoException) => settle(error.code === 'ECONNREFUSED' ? false : error));
+	});
+}
+
+/**
+ * Returns the first of `ports` on `host` that accepts a TCP connection (see
+ * {@link acceptsConnections}), or `null` if none does. The ports are probed concurrently. A port that
+ * accepts wins over one that could not be checked; when none accepts, a probe that could not be made
+ * rejects the call with its error.
+ *
+ * @param host The host/address to connect to (e.g. "127.0.0.2")
+ * @param ports The ports to probe
+ * @param timeoutMs How long to wait for each handshake
+ */
+export async function findAcceptingPort(host: string, ports: number[], timeoutMs?: number): Promise<number | null> {
+	const outcomes = await Promise.allSettled(ports.map((port) => acceptsConnections(host, port, timeoutMs)));
+	const index = outcomes.findIndex((outcome) => outcome.status === 'fulfilled' && outcome.value);
+	if (index !== -1) return ports[index];
+	for (const outcome of outcomes) {
+		if (outcome.status === 'rejected') throw outcome.reason;
+	}
+	return null;
 }
 
 /**

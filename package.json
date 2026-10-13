@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/integration-testing",
-	"version": "1.0.0",
+	"version": "1.0.4",
 	"type": "module",
 	"description": "Integration testing utilities for Harper-based projects. Provides Harper instance lifecycle management, loopback address pooling, and a test runner script.",
 	"license": "Apache-2.0",
@@ -39,7 +39,7 @@
 	"scripts": {
 		"check": "tsc",
 		"build": "tsc -p tsconfig.build.json",
-		"test": "node --test \"test/**/*.test.ts\"",
+		"test": "node --experimental-test-module-mocks --test \"test/**/*.test.ts\"",
 		"prepack": "npm run build"
 	},
 	"engines": {

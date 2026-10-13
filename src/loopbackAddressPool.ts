@@ -1,8 +1,10 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { findAcceptingPort } from './portUtils.ts';
 
 // Configuration constants
 // The pool starts at 127.0.0.2 by default (rather than 127.0.0.1) to avoid conflicting
@@ -27,6 +29,16 @@ const HARPER_LOOPBACK_POOL_LOCK_PATH = join(tmpdir(), 'harper-integration-test-l
 // Constants for timeouts and retries
 const LOCK_STALE_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS = 1000;
+// A one-off stall past LOCK_STALE_TIMEOUT_MS loses the lock once; losing it repeatedly means sections keep
+// outlasting it (a stalling event loop, or clock or mtime skew), which retrying cannot fix.
+const LOCK_OWNERSHIP_RETRIES = 3;
+
+let lockTokenCounter = 0;
+
+// How long an unusable pool file must go unmodified before it is reinitialized. The reservations it
+// lost may not be bound yet, which the conflict canary can't see, so this must outlast startHarper's
+// reserve-to-bind time: its startup ceiling (DEFAULT_STARTUP_MAX_MS) plus the setup before it.
+const UNUSABLE_POOL_QUARANTINE_MS = 360000;
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
 // Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
@@ -75,9 +87,10 @@ interface LoopbackAddressError extends Error {
 
 // Custom error classes
 class LoopbackAddressValidationError extends Error {
-	constructor(address: string, cause?: Error) {
+	constructor(address: string, cause?: Error, message?: string) {
 		super(
-			`Failed to validate loopback address ${address}. This likely means your system does not have the required loopback addresses configured/enabled. Refer to the Harper Integration Test documentation (integrationTests/README.md) for more information.`
+			message ??
+				`Failed to validate loopback address ${address}. This likely means your system does not have the required loopback addresses configured/enabled. Refer to the Harper Integration Test documentation (integrationTests/README.md) for more information.`
 		);
 		this.name = 'LoopbackAddressValidationError';
 		if (cause) {
@@ -95,6 +108,52 @@ class InvalidLoopbackAddressError extends Error {
 	}
 }
 
+const ALLOW_FOREIGN_LISTENERS_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
+
+/**
+ * Thrown by {@link getNextAvailableLoopbackAddress} when another process accepts connections on one of
+ * a newly allocated address's canary ports before any Harper node runs there. The usual cause is a
+ * service listening on all interfaces, which covers every pool address, so another address would not
+ * help.
+ */
+export class ForeignListenerError extends Error {
+	loopbackAddress: string;
+	port: number;
+
+	constructor(address: string, port: number) {
+		super(
+			`Another process accepts connections on ${address}:${port}, a port the Harper node on this address will bind, before that node has started — most likely a service listening on all interfaces, such as a local Harper instance. Whenever the node has no listener of its own there (while it starts, while its HTTP workers restart, after teardown), its clients connect to that process instead, and keep-alive connections stay with it. Stop that process or bind it to a specific address (\`lsof -nP -iTCP:${port} -sTCP:LISTEN\`, or \`netstat -ano | findstr :${port}\` on Windows, names it), or set ${ALLOW_FOREIGN_LISTENERS_ENV}=1 to run anyway.`
+		);
+		this.name = 'ForeignListenerError';
+		this.loopbackAddress = address;
+		this.port = port;
+	}
+}
+
+function foreignListenersAllowed(): boolean {
+	const value = process.env[ALLOW_FOREIGN_LISTENERS_ENV];
+	return value === '1' || value?.toLowerCase() === 'true';
+}
+
+/** A failure to return a refused address must not replace the error that says why it was refused. */
+async function releaseRefusedAddress(address: string): Promise<void> {
+	try {
+		await releaseLoopbackAddress(address);
+	} catch (error) {
+		console.warn(`[loopback-pool] Could not return ${address} to the pool; it is reclaimed when this process exits:`, error);
+	}
+}
+
+class LockOwnershipLostError extends Error {
+	constructor(cause?: unknown) {
+		super(
+			`Another process took over the loopback pool lock as stale (older than ${LOCK_STALE_TIMEOUT_MS}ms) before this process published its update`,
+			{ cause }
+		);
+		this.name = 'LockOwnershipLostError';
+	}
+}
+
 /**
  * Acquires a file-based lock by creating the lock file. This enables safe concurrent
  * access to the loopback pool across multiple test processes.
@@ -102,17 +161,20 @@ class InvalidLoopbackAddressError extends Error {
  * Uses the 'wx' file flag which atomically fails if the file already exists, providing
  * a simple but effective cross-process mutex. Handles stale locks by removing lock files
  * older than LOCK_STALE_TIMEOUT_MS (10 seconds).
- *
- * @returns A promise that resolves when the lock is acquired
  */
-async function acquireLock(): Promise<void> {
+async function acquireLock(): Promise<string> {
+	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
 	while (true) {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
-			// We have the lock - close the handle as we don't intend to write to it
-			await lockFileHandle.close();
-			return;
+			// The write may have outlasted the stale timeout, so the path may no longer be ours to unlink.
+			try {
+				await lockFileHandle.writeFile(token);
+			} finally {
+				await lockFileHandle.close();
+			}
+			return token;
 		} catch (error) {
 			// If the lock file already exists, it's either stale or we wait for it to be released
 			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -136,32 +198,47 @@ async function acquireLock(): Promise<void> {
 	}
 }
 
-/**
- * Releases the file-based lock by deleting the lock file.
- */
-async function releaseLock(): Promise<void> {
+/** The read and unlink are not atomic; a takeover between them can still remove a successor's lock. */
+async function releaseLock(token: string): Promise<void> {
 	try {
-		await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
-	} catch {
-		// Ignore errors if lock file is already gone
+		if ((await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8')) === token) {
+			await unlink(HARPER_LOOPBACK_POOL_LOCK_PATH);
+		}
+	} catch {}
+}
+
+async function assertLockHeld(token: string): Promise<void> {
+	let currentToken: string;
+	try {
+		currentToken = await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new LockOwnershipLostError(error);
+		throw error;
+	}
+	if (currentToken !== token) throw new LockOwnershipLostError();
+}
+
+/** Reruns the callback after lock ownership is lost, up to LOCK_OWNERSHIP_RETRIES times; callers must reread shared state. */
+export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		const token = await acquireLock();
+		try {
+			return await callback(token);
+		} catch (error) {
+			if (!(error instanceof LockOwnershipLostError) || attempt > LOCK_OWNERSHIP_RETRIES) throw error;
+			console.warn(
+				`[loopback-pool] ${error.message}; retrying from the current pool state (retry ${attempt} of ${LOCK_OWNERSHIP_RETRIES}).`
+			);
+		} finally {
+			await releaseLock(token);
+		}
 	}
 }
 
-/**
- * Executes a callback function while holding the lock. Automatically acquires
- * and releases the lock, ensuring the lock is always released even if the callback
- * throws an error.
- *
- * @param callback The async function to execute while holding the lock
- * @returns The result of the callback function
- */
-async function withLock<T>(callback: () => Promise<T>): Promise<T> {
-	await acquireLock();
-	try {
-		return await callback();
-	} finally {
-		await releaseLock();
-	}
+const quarantinedPoolPaths = new Set<string>();
+
+function emptyPool(): LoopbackPool {
+	return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
 }
 
 /**
@@ -169,31 +246,96 @@ async function withLock<T>(callback: () => Promise<T>): Promise<T> {
  * index represents a loopback address (127.0.0.2, 127.0.0.3, etc.) and the value
  * is either null (available) or a process PID (in use).
  *
- * If the file doesn't exist, creates and returns a new empty pool with all addresses
- * marked as available (null).
+ * An unusable file (unparseable, not an array, or an empty array) may still be mid-write by a
+ * writer that doesn't publish by rename, or may have lost reservations whose holders haven't bound
+ * their address yet, so it reads as `null` until it has gone UNUSABLE_POOL_QUARANTINE_MS
+ * unmodified, and only then is replaced with an empty pool. A non-empty array of another length
+ * is trusted as-is: two processes configured with different counts would otherwise keep wiping
+ * each other's reservations.
  *
- * @returns The loopback pool array
+ * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
+ * @param lockToken The held lock token used if an aged unusable shared pool needs reinitializing
+ * @returns The loopback pool array, or `null` while the pool file is quarantined
  */
-async function readPoolFile(): Promise<LoopbackPool> {
+export async function readPoolFile(
+	poolPath: string = HARPER_LOOPBACK_POOL_PATH,
+	lockToken?: string
+): Promise<LoopbackPool | null> {
+	let problem: string;
 	try {
-		const content = await readFile(HARPER_LOOPBACK_POOL_PATH, 'utf-8');
-		return JSON.parse(content) as LoopbackPool;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-			// If the pool file doesn't exist yet, create it with null entries
-			return Array<number | null>(HARPER_LOOPBACK_POOL_COUNT).fill(null);
+		const parsed: unknown = JSON.parse(await readFile(poolPath, 'utf-8'));
+		if (Array.isArray(parsed) && parsed.length > 0) {
+			quarantinedPoolPaths.delete(poolPath);
+			return parsed as LoopbackPool;
 		}
+		problem = Array.isArray(parsed) ? 'empty array' : `JSON ${parsed === null ? 'null' : typeof parsed} instead of an array`;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPool();
+		if (!(error instanceof SyntaxError)) throw error;
+		problem = error.message;
+	}
+
+	let modifiedMs: number;
+	try {
+		modifiedMs = (await stat(poolPath)).mtimeMs;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyPool();
 		throw error;
 	}
+	const unmodifiedMs = Date.now() - modifiedMs;
+	if (unmodifiedMs < UNUSABLE_POOL_QUARANTINE_MS) {
+		if (!quarantinedPoolPaths.has(poolPath)) {
+			quarantinedPoolPaths.add(poolPath);
+			console.warn(
+				`[loopback-pool] ${poolPath} is unusable (${problem}); allocation waits until it has gone ${UNUSABLE_POOL_QUARANTINE_MS / 1000}s unmodified, then reinitializes it. Deleting it skips the wait, but only once every integration-test run on this machine has stopped.`
+			);
+		}
+		return null;
+	}
+	quarantinedPoolPaths.delete(poolPath);
+	const pool = emptyPool();
+	await writePoolFile(pool, poolPath, lockToken);
+	console.warn(`[loopback-pool] ${poolPath} has been unusable for ${Math.round(unmodifiedMs / 1000)}s (${problem}); reinitialized.`);
+	return pool;
 }
+
+let pendingWriteCounter = 0;
 
 /**
  * Writes the loopback pool to the pool file as JSON.
  *
+ * Publishes by write-to-temp-then-rename, so readers only ever see the old complete file or
+ * the new complete file. The pending name must be unpredictable, not just unique: `wx` refuses
+ * a file already at that name, so a guessable one could be pre-planted to make every write fail.
+ * The ownership check must stay after the pending file closes and immediately before rename. It narrows,
+ * but does not close, the window in which a takeover lets a stale holder publish over its successor.
+ *
  * @param pool The loopback pool array to persist
+ * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
+ * @param lockToken The held lock token required to publish the shared pool
  */
-async function writePoolFile(pool: LoopbackPool): Promise<void> {
-	await writeFile(HARPER_LOOPBACK_POOL_PATH, JSON.stringify(pool));
+export async function writePoolFile(
+	pool: LoopbackPool,
+	poolPath: string = HARPER_LOOPBACK_POOL_PATH,
+	lockToken?: string
+): Promise<void> {
+	const pendingPath = `${poolPath}.${process.pid}.${++pendingWriteCounter}.${randomBytes(8).toString('hex')}.pending`;
+	try {
+		const pendingFileHandle = await open(pendingPath, 'wx');
+		try {
+			await pendingFileHandle.writeFile(JSON.stringify(pool));
+		} finally {
+			await pendingFileHandle.close();
+		}
+		if (poolPath === HARPER_LOOPBACK_POOL_PATH) {
+			if (!lockToken) throw new Error('A lock token is required to publish the shared loopback pool');
+			await assertLockHeld(lockToken);
+		}
+		await rename(pendingPath, poolPath);
+	} catch (error) {
+		await unlink(pendingPath).catch(() => {});
+		throw error;
+	}
 }
 
 /**
@@ -351,15 +493,21 @@ export async function validateLoopbackAddressPool(): Promise<{
  * 3. Finds the first available (null) slot and assigns the current process PID to it
  * 4. Writes the updated pool back to disk and releases the lock
  * 5. Validates that the allocated address can actually be bound to
- * 6. Returns the loopback address (e.g., "127.0.0.2")
+ * 6. Checks that no other process accepts connections on the address's canary ports
+ * 7. Returns the loopback address (e.g., "127.0.0.2")
  *
- * If no addresses are available, waits and retries until one becomes available.
+ * If no addresses are available, or the pool file is quarantined (see readPoolFile), waits and
+ * retries until one becomes available.
  *
  * **Pool file location:** `${tmpdir()}/harper-integration-test-loopback-pool.json`
  * **Lock file location:** `${tmpdir()}/harper-integration-test-loopback-pool.lock`
  *
  * @returns A promise that resolves with an allocated loopback address
- * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to
+ * @throws {LoopbackAddressValidationError} If the allocated address cannot be bound to, or cannot be
+ * checked for another process's listener (the slot is released in that case)
+ * @throws {ForeignListenerError} If another process accepts connections on the address's canary
+ * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
+ * @throws {LockOwnershipLostError} If ownership is lost on the initial attempt and all three retries
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
@@ -385,9 +533,10 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
 	while (true) {
-		const assignedIndex = await withLock(async () => {
+		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
-			const loopbackPool = await readPoolFile();
+			const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
+			if (!loopbackPool) return null;
 
 			// Find the first available index we haven't already found in-use this attempt
 			let index: number | null = null;
@@ -406,7 +555,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				loopbackPool[index] = process.pid;
 			}
 			// Write the updated pool back to the file
-			await writePoolFile(loopbackPool);
+			await writePoolFile(loopbackPool, HARPER_LOOPBACK_POOL_PATH, lockToken);
 
 			return index;
 		});
@@ -436,7 +585,39 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				throw new LoopbackAddressValidationError(loopbackAddress, error as Error);
 			}
 			if (conflictingPort === null) {
-				return loopbackAddress;
+				// macOS and Windows let the canary's exclusive bind succeed beside a listener on all interfaces; Linux refuses it.
+				if (process.platform === 'linux') {
+					return loopbackAddress;
+				}
+				let shadowedPort: number | null;
+				try {
+					shadowedPort = await findAcceptingPort(loopbackAddress, CONFLICT_PROBE_PORTS);
+				} catch (error) {
+					const reason = error instanceof Error ? error.message : String(error);
+					if (foreignListenersAllowed()) {
+						console.warn(
+							`[loopback-pool] Could not check ${loopbackAddress} for another process's listener (${reason}); continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set.`
+						);
+						return loopbackAddress;
+					}
+					await releaseRefusedAddress(loopbackAddress);
+					throw new LoopbackAddressValidationError(
+						loopbackAddress,
+						error as Error,
+						`Could not check whether another process accepts connections on ${loopbackAddress}'s Harper ports (${reason}). Set ${ALLOW_FOREIGN_LISTENERS_ENV}=1 to skip this check.`
+					);
+				}
+				if (shadowedPort === null) {
+					return loopbackAddress;
+				}
+				if (foreignListenersAllowed()) {
+					console.warn(
+						`[loopback-pool] Another process accepts connections on ${loopbackAddress}:${shadowedPort}; continuing because ${ALLOW_FOREIGN_LISTENERS_ENV} is set. This node's clients reach that process whenever the node has no listener of its own there.`
+					);
+					return loopbackAddress;
+				}
+				await releaseRefusedAddress(loopbackAddress);
+				throw new ForeignListenerError(loopbackAddress, shadowedPort);
 			}
 
 			// Release the slot back to the pool (so it isn't leaked under our PID) and remember
@@ -474,6 +655,11 @@ function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
 /**
  * Releases a loopback address back to the pool, making it available for other processes.
  *
+ * Only a slot this process holds is cleared: once the pool has been reinitialized, the same slot
+ * may already be another runner's reservation. Nothing is written while the pool file is
+ * quarantined (see readPoolFile): the reservation is already gone from it, and rewriting it would
+ * end the quarantine early.
+ *
  * @param address The loopback address to release (e.g., "127.0.0.2")
  * @throws InvalidLoopbackAddressError if the address format is invalid
  */
@@ -481,15 +667,16 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
 	// Validate and parse the address
 	const index = parseLoopbackAddress(address);
 
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
-		const loopbackPool = await readPoolFile();
+		const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
+		if (!loopbackPool || loopbackPool[index] !== process.pid) return;
 
 		// Release the address by setting it to null
 		loopbackPool[index] = null;
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		await writePoolFile(loopbackPool, HARPER_LOOPBACK_POOL_PATH, lockToken);
 	});
 }
 
@@ -498,18 +685,21 @@ export async function releaseLoopbackAddress(address: string): Promise<void> {
  * Useful for cleanup during graceful shutdown.
  */
 export async function releaseAllLoopbackAddressesForCurrentProcess(): Promise<void> {
-	await withLock(async () => {
+	await withLock(async (lockToken) => {
 		// Read the pool file
-		const loopbackPool = await readPoolFile();
+		const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
+		if (!loopbackPool) return;
 
 		// Find and release all addresses assigned to this process
+		let released = false;
 		for (let i = 0; i < loopbackPool.length; i++) {
 			if (loopbackPool[i] === process.pid) {
 				loopbackPool[i] = null;
+				released = true;
 			}
 		}
 
 		// Write the updated pool back to the file
-		await writePoolFile(loopbackPool);
+		if (released) await writePoolFile(loopbackPool, HARPER_LOOPBACK_POOL_PATH, lockToken);
 	});
 }

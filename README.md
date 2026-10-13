@@ -78,6 +78,14 @@ ifconfig lo0 | grep '127.0.0' | tail -3       # aliases present
 
 Edit the `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT` value in the installed plist to change the pool size (it defaults to 32, matching the script). To remove the daemon: `sudo launchctl bootout system/io.harperdb.loopback-setup` and delete the plist. If you edit the installed plist, `bootout` then `bootstrap` again to reload it.
 
+### Other services listening on Harper's ports
+
+Each node binds its fixed ports on its own loopback address, so nodes on different addresses coexist. A process listening on the same port on **all interfaces** is different — a local Harper instance running with its default configuration is the usual one. On macOS and Windows, that process receives a node's connections whenever the node has no listener of its own on its address: while the node starts, while its HTTP workers restart, and after teardown. Keep-alive connections then stay with it, so a suite fails, or passes, against the wrong server.
+
+`getNextAvailableLoopbackAddress`, and therefore `startHarper`, refuses an address when another process already accepts connections on its operations or HTTP port, throwing a `ForeignListenerError` that names the port. Stop the other process or bind it to a specific address (`lsof -nP -iTCP:9926 -sTCP:LISTEN` names it). To run anyway, set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1`, which turns the error into a warning.
+
+On Linux, binding a pool address beside such a listener already fails, so the pool reports each address as still in use by another node instead.
+
 ## API
 
 The lifecycle and utility APIs below are framework-agnostic. They manage Harper child processes and a cross-process loopback address pool. Use them in the setup/teardown hooks of whichever test framework you prefer.
@@ -119,6 +127,7 @@ Startup readiness is detected by Harper printing `successfully started`. Rather 
 - `HARPER_INTEGRATION_TEST_STARTUP_MAX_MS` - Absolute ceiling on total startup time, regardless of ongoing output. Default `120000` (`300000` under CI).
 - `HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR` - Parent directory for temp Harper install dirs (default: OS tmpdir)
 - `HARPER_INTEGRATION_TEST_INSTALL_SCRIPT` - Path to Harper CLI script
+- `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` - Set to `1` or `true` to start a node on an address whose operations or HTTP port another process already accepts connections on, or that could not be checked for one, with a warning instead of an error (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)).
 
 ### `setupHarperWithFixture(ctx, fixturePath, options?)`
 
@@ -126,7 +135,9 @@ Like `startHarper()`, but copies a component directory into the Harper install b
 
 ### `killHarper(ctx, options?)`
 
-Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free. Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+Terminates Harper's whole process tree and waits for it to exit. It sends SIGTERM first, giving Harper a grace period to shut down cleanly (flush RocksDB, release ports, reap workers) before escalating to SIGKILL, then waits briefly for the actual exit. Because Harper is spawned as its own process group (`detached` on POSIX), the signal targets the group — parent and any child processes — rather than only the direct child; on Windows it uses `taskkill /T`. A dead process releases its listening sockets, so once `killHarper` returns the fixed ports are free (it logs a warning when it could not confirm the node stopped). Does not release the loopback address or clean up the install directory. Useful for restart scenarios where the test will call `startHarper` again.
+
+It also stops a node that restarted itself. Harper's `restart` operation relaunches the node as a new, detached process and lets the one `startHarper` spawned exit, so once that process has exited `killHarper` terminates whichever process `<dataRootDir>/hdb.pid` names — the pid file `harper stop` uses — in the same SIGTERM, grace, SIGKILL sequence (on POSIX, waiting for its whole process group), and removes the pid file if the SIGKILL left it behind. The replacement records its pid only after its predecessor has exited, about half a second later on an idle machine. The spawned process prints its readiness line on stdout a second time just before it relaunches, so after that line `killHarper` waits for the pid file to appear, for up to 5 seconds (15 under CI, or `HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS`) from when the announcing process exits. Harper gives that process up to 15 seconds to exit while RocksDB closes, so the wait does not start any earlier. A node that stopped without relaunching reports nothing and pays no wait. If `killHarper` cannot confirm the node stopped — an announced replacement never recorded its pid, or a process outlived SIGKILL — it logs a warning, since its ports may still be held. Only the first relaunch is followed this way: when a replacement restarts again, wait for that restart to finish before tearing down.
 
 `options.graceMs` overrides the SIGTERM→SIGKILL grace period (default `5000`, or `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS`).
 
@@ -134,12 +145,15 @@ Terminates Harper's whole process tree and waits for it to exit. It sends SIGTER
 
 Kills Harper's process tree, releases the loopback address back to the pool, and removes the install directory. Call in a teardown/`after()` hook.
 
-Since `killHarper` waits for the process tree to exit, its fixed ports (Operations API, HTTP/S, MQTT/S) are already released by the time the address is recycled. As a safety assertion, teardown still verifies those ports are free before recycling — the pool only guarantees the *address* is bindable, not that these specific ports are free — and logs a warning if any are somehow still held (a sign a Harper child process escaped the kill). The address is recycled regardless.
+Since `killHarper` waits for the process tree to exit, its fixed ports (Operations API, HTTP/S, MQTT/S) are already released by the time the address is recycled. As a safety assertion, teardown still verifies those ports are free before recycling — the pool only guarantees the *address* is bindable, not that these specific ports are free — and if any are still held (a sign a Harper process escaped the kill) it logs a warning and leaves both the address and the install directory in place: the slot stays parked until this process exits, so a later suite cannot co-bind the ports, and the directory is not deleted under the process still holding them.
+
+If the kill itself could not be confirmed — Harper announced a relaunch but the replacement never recorded its pid, or a process outlived SIGKILL — teardown logs a warning and leaves both the install directory and the address in place rather than deleting the directory under a process that may still be running. This holds for a teardown after a `killHarper` that already warned: the stop stays unconfirmed until that replacement is gone.
 
 **Environment Variables:**
 
 - `HARPER_INTEGRATION_TEST_TEARDOWN_GRACE_MS` - Grace period after SIGTERM before escalating to SIGKILL. Default `5000`.
 - `HARPER_INTEGRATION_TEST_PORT_RELEASE_TIMEOUT_MS` - Max time teardown's safety assertion waits for Harper's ports to be free before recycling the loopback address (normally instant, since the process tree is already dead). Default `5000`.
+- `HARPER_INTEGRATION_TEST_RELAUNCH_WAIT_MS` - After a Harper process that announced a `restart` relaunch exits, how long `killHarper` waits for the replacement to record its pid. Default `5000` (`15000` under CI).
 
 ### `sendOperation(context, operation)`
 
@@ -249,6 +263,10 @@ HARPER_INTEGRATION_TEST_LOG_DIR=/tmp/harper-test-logs npx harper-integration-tes
 
 Additionally, `startupOutput` on `HarperContext` provides the captured stdout/stderr from Harper startup for programmatic access (e.g. attaching to Playwright test results).
 
+On a test failure, the runner also prints a tail of each involved Harper node's `hdb.log` to the console. Runs of consecutive lines that are identical once their timestamp is stripped (e.g. a repeated poll) are collapsed into one line plus a `(repeated N times)` marker before the tail is taken, so noisy repeated lines don't push the actual error out of the printed window. Log files on disk are never modified.
+
+- `HARPER_INTEGRATION_TEST_LOG_TAIL_LINES` - Number of trailing (post-collapse) `hdb.log` lines printed per failed test (one more when the boundary would otherwise split a `(repeated N times)` marker from the line it counts). Default `200`. `0` (or any non-positive value) prints the entire log, uncollapsed.
+
 ### `HarperStartupError`
 
 When Harper fails to start or times out, a `HarperStartupError` is thrown. It extends `Error` and includes structured `stdout` and `stderr` properties for diagnostics:
@@ -267,6 +285,10 @@ try {
 }
 ```
 
+### `ForeignListenerError`
+
+Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when another process already accepts connections on the operations or HTTP port of a newly allocated address (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)). It extends `Error` with `name` set to `'ForeignListenerError'`, plus `loopbackAddress` and `port` properties naming what was reached. The address is returned to the pool before it is thrown. Set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1` (or `true`) to get a warning instead.
+
 ### `targz(dirPath)`
 
 Packs and compresses a directory into a base64-encoded tar.gz string. Useful for `deploy_component` Operations API calls.
@@ -276,9 +298,21 @@ Packs and compresses a directory into a base64-encoded tar.gz string. Useful for
 These are used internally by `startHarper` and `teardownHarper`, but are exported for advanced use cases or custom runner integrations.
 
 - `validateLoopbackAddressPool(): Promise<{ successful: string[]; failed: { loopbackAddress: string; error: Error }[] }>` - Validates all pool addresses can be bound to
-- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool
+- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool; throws a `ForeignListenerError` if another process already accepts connections on its operations or HTTP port (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports))
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
+
+The pool is one file shared by every process on the machine: `${TMPDIR}/harper-integration-test-loopback-pool.json`, a JSON array with one slot per address holding the PID of the process that reserved it (or `null`), guarded by the `harper-integration-test-loopback-pool.lock` mutex beside it. Updates are published by renaming a complete `*.pending` file over it, so a process killed mid-update leaves the previous pool intact (and possibly an inert `*.pending` file). Releasing an address clears its slot only if this process holds it.
+
+A pool file that is unparseable, not an array, or an empty array can still be produced by a writer that doesn't publish by rename (an older version of this package killed mid-write) or by an outside edit. Such a file is either about to be completed or has lost reservations whose holders may not have bound their address yet. Allocation does refuse an address that a Harper node is already listening on, but that check cannot see a reservation nothing is listening on yet. So the file is quarantined rather than reset:
+
+- `getNextAvailableLoopbackAddress()` waits, and both release functions leave the file untouched, until it has gone 6 minutes without modification. That outlasts `startHarper`'s default startup ceiling (2 minutes, 5 under CI), so a `startHarper` that reserved an address before the file broke has bound it or given up by then.
+- After that, the pool is reinitialized with every address free and a warning is logged. From then on, an address still in use is protected only by that listening check.
+- Deleting the file skips the wait, but only do that once every integration-test run on the machine — including ones using older versions of this package — has stopped.
+
+The quarantine bounds, rather than eliminates, the risk of handing out an address twice: a caller that holds an address for longer than that without binding it (for example, with a `startupMaxMs` above 5 minutes) is not covered.
+
+If other processes take over the pool lock as stale (held over 10 seconds) before this process publishes its update, the allocate and release functions retry from the current pool state with a `[loopback-pool]` warning; after four takeovers in a row they reject with an error named `LockOwnershipLostError`.
 
 ## Node.js Test Runner
 
