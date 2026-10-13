@@ -200,10 +200,7 @@ async function acquireLock(): Promise<string> {
 	}
 }
 
-/**
- * Like writePoolFile's ownership check, the token comparison narrows, but does not close, the window
- * in which a holder whose lock was taken over as stale deletes its successor's lock.
- */
+/** The read and unlink are not atomic; a takeover between them can still remove a successor's lock. */
 async function releaseLock(token: string): Promise<void> {
 	try {
 		if ((await readFile(HARPER_LOOPBACK_POOL_LOCK_PATH, 'utf-8')) === token) {
@@ -267,6 +264,7 @@ function emptyPool(): LoopbackPool {
  * each other's reservations.
  *
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
+ * @param lockToken The held lock token used if an aged unusable shared pool needs reinitializing
  * @returns The loopback pool array, or `null` while the pool file is quarantined
  */
 export async function readPoolFile(
@@ -305,9 +303,9 @@ export async function readPoolFile(
 		return null;
 	}
 	quarantinedPoolPaths.delete(poolPath);
-	console.warn(`[loopback-pool] ${poolPath} has been unusable for ${Math.round(unmodifiedMs / 1000)}s (${problem}); reinitializing.`);
 	const pool = emptyPool();
 	await writePoolFile(pool, poolPath, lockToken);
+	console.warn(`[loopback-pool] ${poolPath} has been unusable for ${Math.round(unmodifiedMs / 1000)}s (${problem}); reinitialized.`);
 	return pool;
 }
 
@@ -324,6 +322,7 @@ let pendingWriteCounter = 0;
  *
  * @param pool The loopback pool array to persist
  * @param poolPath The pool file path (overridable for tests; defaults to the shared pool file)
+ * @param lockToken The held lock token required to publish the shared pool
  */
 export async function writePoolFile(
 	pool: LoopbackPool,
@@ -340,8 +339,6 @@ export async function writePoolFile(
 		}
 		if (poolPath === HARPER_LOOPBACK_POOL_PATH) {
 			if (!lockToken) throw new Error('A lock token is required to publish the shared loopback pool');
-			// Check only after the pending file closes and immediately before rename. A takeover after
-			// this point can still publish a stale snapshot; the token narrows but does not close that race.
 			await assertLockHeld(lockToken);
 		}
 		await rename(pendingPath, poolPath);

@@ -2,7 +2,7 @@ import test, { mock } from 'node:test';
 import { deepStrictEqual, notStrictEqual, rejects, strictEqual } from 'node:assert';
 import { EventEmitter } from 'node:events';
 import * as fsPromises from 'node:fs/promises';
-import { mkdtemp, readFile, rm, unlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, unlink, utimes, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,6 +56,40 @@ function createRefusedSocket(): net.Socket {
 	socket.destroy = () => socket;
 	queueMicrotask(() => socket.emit('error', Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' })));
 	return socket;
+}
+
+function mockTakeoverAfterPendingClose(poolPath: string, lockPath: string, successorPool: (number | null)[]): {
+	fsMock: ReturnType<typeof mock.module>;
+	getRenameCount: () => number;
+} {
+	let tookOver = false;
+	let renameCount = 0;
+	const fsMock = mock.module('node:fs/promises', {
+		namedExports: {
+			...fsPromises,
+			open: async (path: string, flags: string) => {
+				const handle = await fsPromises.open(path, flags);
+				if (!path.startsWith(`${poolPath}.`) || !path.endsWith('.pending')) return handle;
+				return {
+					writeFile: (data: string) => handle.writeFile(data),
+					close: async () => {
+						await handle.close();
+						if (tookOver) return;
+						tookOver = true;
+						await writeFile(poolPath, JSON.stringify(successorPool));
+						await writeFile(lockPath, 'successor-holder');
+						const staleTime = new Date(Date.now() - 20000);
+						await utimes(lockPath, staleTime, staleTime);
+					},
+				};
+			},
+			rename: async (from: string, to: string) => {
+				renameCount++;
+				await fsPromises.rename(from, to);
+			},
+		},
+	});
+	return { fsMock, getRenameCount: () => renameCount };
 }
 
 test('a writer superseded after reading cannot erase the successor claim', async () => {
@@ -131,6 +165,95 @@ test('a writer superseded after reading cannot erase the successor claim', async
 		netMock.restore();
 		warn.mock.restore();
 		for (const [name, value] of previousEnv) restoreEnv(name, value);
+		await rm(isolatedTmpDir, { recursive: true, force: true });
+	}
+});
+
+test('a takeover during pending preparation prevents the stale rename and retries from the successor pool', async () => {
+	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-pending-takeover-'));
+	const poolPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.json');
+	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
+	const previousEnv = new Map(
+		[
+			'TMPDIR',
+			'TMP',
+			'TEMP',
+			'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START',
+			'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT',
+		].map((name) => [name, process.env[name]])
+	);
+	process.env.TMPDIR = isolatedTmpDir;
+	process.env.TMP = isolatedTmpDir;
+	process.env.TEMP = isolatedTmpDir;
+	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '2';
+	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '3';
+	const successorPool = [process.ppid, null, null];
+	const takeover = mockTakeoverAfterPendingClose(poolPath, lockPath, successorPool);
+	const netMock = mock.module('node:net', {
+		namedExports: {
+			...net,
+			createServer: createAvailableServer,
+			connect: createRefusedSocket,
+		},
+	});
+	const warn = mock.method(console, 'warn', () => {});
+	try {
+		await writeFile(poolPath, JSON.stringify([null, null, null]));
+		const { getNextAvailableLoopbackAddress } = await import(freshModuleUrl());
+
+		strictEqual(await getNextAvailableLoopbackAddress(), '127.0.0.3');
+		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), [process.ppid, process.pid, null]);
+		strictEqual(takeover.getRenameCount(), 1, 'only the retry should rename a pending file');
+		strictEqual(warn.mock.callCount(), 1);
+		deepStrictEqual(await readdir(isolatedTmpDir), ['harper-integration-test-loopback-pool.json']);
+	} finally {
+		takeover.fsMock.restore();
+		netMock.restore();
+		warn.mock.restore();
+		for (const [name, value] of previousEnv) restoreEnv(name, value);
+		await rm(isolatedTmpDir, { recursive: true, force: true });
+	}
+});
+
+test('read-time repair passes its lock token through pending preparation', async () => {
+	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-repair-takeover-'));
+	const poolPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.json');
+	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
+	const previousTmpEnv = new Map(
+		['TMPDIR', 'TMP', 'TEMP', 'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START', 'HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT']
+			.map((name) => [name, process.env[name]])
+	);
+	process.env.TMPDIR = isolatedTmpDir;
+	process.env.TMP = isolatedTmpDir;
+	process.env.TEMP = isolatedTmpDir;
+	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '2';
+	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '3';
+	const successorPool = [process.ppid, null, null];
+	const takeover = mockTakeoverAfterPendingClose(poolPath, lockPath, successorPool);
+	const netMock = mock.module('node:net', {
+		namedExports: {
+			...net,
+			createServer: createAvailableServer,
+			connect: createRefusedSocket,
+		},
+	});
+	const warn = mock.method(console, 'warn', () => {});
+	try {
+		await writeFile(poolPath, '[');
+		const staleTime = new Date(Date.now() - 10 * 60 * 1000);
+		await utimes(poolPath, staleTime, staleTime);
+		const { getNextAvailableLoopbackAddress } = await import(freshModuleUrl());
+
+		strictEqual(await getNextAvailableLoopbackAddress(), '127.0.0.3');
+		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), [process.ppid, process.pid, null]);
+		strictEqual(takeover.getRenameCount(), 1, 'only allocation after repair retry should rename a pending file');
+		strictEqual(warn.mock.callCount(), 1, 'only the lost-ownership retry should warn before succeeding');
+		deepStrictEqual(await readdir(isolatedTmpDir), ['harper-integration-test-loopback-pool.json']);
+	} finally {
+		takeover.fsMock.restore();
+		netMock.restore();
+		warn.mock.restore();
+		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
 		await rm(isolatedTmpDir, { recursive: true, force: true });
 	}
 });
