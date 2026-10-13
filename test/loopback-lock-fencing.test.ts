@@ -77,7 +77,8 @@ function mockTakeoverAfterPendingClose(poolPath: string, lockPath: string, succe
 						if (tookOver) return;
 						tookOver = true;
 						await writeFile(poolPath, JSON.stringify(successorPool));
-						await writeFile(lockPath, 'successor-holder');
+						await unlink(lockPath);
+						await writeFile(lockPath, 'successor-holder', { flag: 'wx' });
 						const staleTime = new Date(Date.now() - 20000);
 						await utimes(lockPath, staleTime, staleTime);
 					},
@@ -150,7 +151,7 @@ test('a writer superseded after reading cannot erase the successor claim', async
 
 		const successorAddress = await getNextAvailableLoopbackAddress();
 		strictEqual(successorAddress, '127.0.0.3');
-		await writeFile(lockPath, 'replacement-holder');
+		await writeFile(lockPath, 'replacement-holder', { flag: 'wx' });
 		await utimes(lockPath, staleTime, staleTime);
 		resumeStaleWriter.resolve();
 
@@ -272,7 +273,8 @@ test('a superseded holder does not unlink the replacement lock', async () => {
 			await resumeSection.promise;
 		});
 		await sectionEntered.promise;
-		await writeFile(lockPath, 'replacement-holder');
+		await unlink(lockPath);
+		await writeFile(lockPath, 'replacement-holder', { flag: 'wx' });
 		resumeSection.resolve();
 		await staleHolder;
 
@@ -294,11 +296,12 @@ test('a failed token write does not delete a successor lock', async () => {
 			...fsPromises,
 			open: async (path: string, flags: string) => {
 				if (path !== lockPath) return fsPromises.open(path, flags);
-				await writeFile(path, '', { flag: flags });
+				const handle = await fsPromises.open(path, flags);
 				return {
-					close: async () => {},
+					close: () => handle.close(),
 					writeFile: async () => {
-						await writeFile(lockPath, 'replacement-holder');
+						await unlink(lockPath);
+						await writeFile(lockPath, 'replacement-holder', { flag: 'wx' });
 						throw new Error('simulated token write failure');
 					},
 				};
@@ -309,6 +312,37 @@ test('a failed token write does not delete a successor lock', async () => {
 		const { withLock } = await import(freshModuleUrl());
 		await rejects(withLock(async () => {}), /simulated token write failure/);
 		strictEqual(await readFile(lockPath, 'utf-8'), 'replacement-holder');
+	} finally {
+		fsMock.restore();
+		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);
+		await rm(isolatedTmpDir, { recursive: true, force: true });
+	}
+});
+
+test('a failed token write leaves its empty lock for stale reclamation', async () => {
+	const isolatedTmpDir = await mkdtemp(join(tmpdir(), 'loopback-lock-empty-write-failure-'));
+	const lockPath = join(isolatedTmpDir, 'harper-integration-test-loopback-pool.lock');
+	const previousTmpEnv = new Map(['TMPDIR', 'TMP', 'TEMP'].map((name) => [name, process.env[name]]));
+	for (const name of previousTmpEnv.keys()) process.env[name] = isolatedTmpDir;
+	const fsMock = mock.module('node:fs/promises', {
+		namedExports: {
+			...fsPromises,
+			open: async (path: string, flags: string) => {
+				if (path !== lockPath) return fsPromises.open(path, flags);
+				const handle = await fsPromises.open(path, flags);
+				return {
+					close: () => handle.close(),
+					writeFile: async () => {
+						throw new Error('simulated ENOSPC');
+					},
+				};
+			},
+		},
+	});
+	try {
+		const { withLock } = await import(freshModuleUrl());
+		await rejects(withLock(async () => {}), /simulated ENOSPC/);
+		strictEqual(await readFile(lockPath, 'utf-8'), '');
 	} finally {
 		fsMock.restore();
 		for (const [name, value] of previousTmpEnv) restoreEnv(name, value);

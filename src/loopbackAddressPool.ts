@@ -161,8 +161,6 @@ class LockOwnershipLostError extends Error {
  * Uses the 'wx' file flag which atomically fails if the file already exists, providing
  * a simple but effective cross-process mutex. Handles stale locks by removing lock files
  * older than LOCK_STALE_TIMEOUT_MS (10 seconds).
- *
- * @returns The token that identifies this lock acquisition
  */
 async function acquireLock(): Promise<string> {
 	const token = `${process.pid}-${++lockTokenCounter}-${randomBytes(8).toString('hex')}`;
@@ -170,7 +168,7 @@ async function acquireLock(): Promise<string> {
 		try {
 			// The 'wx' flag causes the open to fail if the file already exists
 			const lockFileHandle = await open(HARPER_LOOPBACK_POOL_LOCK_PATH, 'wx');
-			// On a failed write the path may already be a successor's lock, so it is left to stale reclaim.
+			// The write may have outlasted the stale timeout, so the path may no longer be ours to unlink.
 			try {
 				await lockFileHandle.writeFile(token);
 			} finally {
@@ -220,15 +218,7 @@ async function assertLockHeld(token: string): Promise<void> {
 	if (currentToken !== token) throw new LockOwnershipLostError();
 }
 
-/**
- * Executes a callback while holding the lock and checks the current token before attempting release.
- * A section whose lock was taken over as stale before it published is rerun from fresh pool
- * state, up to LOCK_OWNERSHIP_RETRIES times, so teardown callers do not inherit a one-off
- * lost-lock failure.
- *
- * @param callback The async function to execute while holding the lock
- * @returns The result of the callback function
- */
+/** Reruns the callback after lock ownership is lost, up to LOCK_OWNERSHIP_RETRIES times; callers must reread shared state. */
 export async function withLock<T>(callback: (lockToken: string) => Promise<T>): Promise<T> {
 	for (let attempt = 1; ; attempt++) {
 		const token = await acquireLock();
