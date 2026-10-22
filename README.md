@@ -40,9 +40,9 @@ This package also includes a **preconfigured Node.js test runner script** (`harp
 
 Running Harper integration tests concurrently requires multiple loopback addresses so that each Harper instance can bind to a distinct address without port conflicts.
 
-Linux Ubuntu systems have `127.0.0.1–127.255.255.255` enabled by default. macOS and Windows do not.
+Linux and Windows route the whole `127.0.0.0/8` block (`127.0.0.1–127.255.255.255`) to loopback by default, so they need no setup. macOS enables only `127.0.0.1`.
 
-Use the included script to configure them:
+On macOS, use the included script to configure the rest:
 
 ```sh
 npx harper-integration-test-setup-loopback
