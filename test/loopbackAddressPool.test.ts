@@ -1,9 +1,7 @@
-import { test, after, mock } from 'node:test';
+import { test, after } from 'node:test';
 import { deepStrictEqual, match, ok, rejects, strictEqual } from 'node:assert';
-import { createServer, type AddressInfo, type Server } from 'node:net';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
-import * as fsPromises from 'node:fs/promises';
+import { connect, createServer, type AddressInfo, type Server } from 'node:net';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -25,49 +23,44 @@ function close(server: Server): Promise<void> {
 	return new Promise((resolve) => server.close(() => resolve()));
 }
 
-/** Two distinct free ports: both are held at once, so the OS cannot hand out the same one twice. */
-async function twoFreePorts(): Promise<[number, number]> {
-	const servers = await Promise.all([listen(HOST, 0), listen(HOST, 0)]);
+/** Distinct free ports: all are held at once, so the OS cannot hand out the same one twice. */
+async function freePorts(count: number): Promise<number[]> {
+	const servers = await Promise.all(Array.from({ length: count }, () => listen(HOST, 0)));
 	const ports = servers.map((server) => (server.address() as AddressInfo).port);
 	await Promise.all(servers.map(close));
-	return [ports[0], ports[1]];
+	return ports;
 }
 
-// The pool reads these once, when it is imported.
-const poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-test-'));
-const [operationsPort, httpPort] = await twoFreePorts();
-// The pool keeps its state in os.tmpdir(), which prefers TMPDIR on POSIX and TEMP on Windows.
-process.env.TMPDIR = process.env.TEMP = poolDir;
+// The pool reads these once, when it is imported. Every port is ephemeral, so neither a real Harper nor a
+// concurrent run on this machine can make the result depend on the host.
+const scratchDir = mkdtempSync(join(tmpdir(), 'loopback-pool-test-'));
+const [claimPort, operationsPort, httpPort, mqttPort] = await freePorts(4);
+process.env.TMPDIR = process.env.TEMP = scratchDir;
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '1';
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
+process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(claimPort);
 process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort);
 process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = String(httpPort);
+process.env.HARPER_INTEGRATION_TEST_OTHER_CONFLICT_PROBE_PORTS = String(mqttPort);
 delete process.env[ALLOW_ENV];
-const { getNextAvailableLoopbackAddress, releaseLoopbackAddress, readPoolFile, writePoolFile } = await import('../src/loopbackAddressPool.ts');
+const { getNextAvailableLoopbackAddress, releaseLoopbackAddress, releaseAllLoopbackAddressesForCurrentProcess } =
+	await import('../src/loopbackAddressPool.ts');
 const { startHarper, setupHarperWithFixture, publishHarperNode, createHarperContext } = await import(
 	'../src/harperLifecycle.ts'
 );
 
-after(() => rmSync(poolDir, { recursive: true, force: true }));
+after(() => rmSync(scratchDir, { recursive: true, force: true }));
 
-function readPool(): unknown {
-	return JSON.parse(readFileSync(join(poolDir, 'harper-integration-test-loopback-pool.json'), 'utf-8'));
+async function claimIsFree(): Promise<boolean> {
+	return isPortFree(HOST, claimPort);
 }
 
-const CANARY_CATCHES_IT =
-	'an exclusive bind of the pool address conflicts with a listener on all interfaces here, so the conflict canary refuses the address before this check runs';
-
-/** Where an exclusive bind of the pool address conflicts with it (Linux), resolves a reason to skip instead. */
 async function listenOnAllInterfaces(host: string, port: number): Promise<Server | string> {
-	let server: Server;
 	try {
-		server = await listen(host, port);
+		return await listen(host, port);
 	} catch (error) {
 		return `cannot listen on ${host}: ${(error as NodeJS.ErrnoException).code}`;
 	}
-	if (await isPortFree(HOST, port)) return server;
-	await close(server);
-	return CANARY_CATCHES_IT;
 }
 
 /** The allocation's rejection; an address handed out instead goes back first, so the one-slot pool cannot wedge. */
@@ -82,61 +75,53 @@ async function refusal(): Promise<any> {
 	throw new Error(`expected getNextAvailableLoopbackAddress to reject, but it handed out ${address}`);
 }
 
-let freshImportCounter = 0;
-/** Monotonic cache-busting suffix — millisecond-resolution timestamps can collide. */
-function freshModuleUrl(): string {
-	return `../src/loopbackAddressPool.ts?fresh=${++freshImportCounter}`;
-}
-
-async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
-	const dir = await mkdtemp(join(tmpdir(), 'loopback-pool-test-'));
-	try {
-		await body(dir);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-}
-
-const POOL_FILE_NAME = 'harper-integration-test-loopback-pool.json';
-
-async function ageBeyondQuarantine(path: string): Promise<void> {
-	const anHourAgo = new Date(Date.now() - 3600000);
-	await utimes(path, anHourAgo, anHourAgo);
-}
-
-/**
- * A fresh copy of the pool module whose pool and lock live in `dir` and which hands out only
- * 127.0.0.1. Both canary ports are chosen ephemerally, so a real Harper on this machine can't
- * make the result depend on the host.
- */
-async function importIsolatedPool(dir: string): Promise<typeof import('../src/loopbackAddressPool.ts')> {
-	const [operationsPort, httpPort] = await twoFreePorts();
-	const overrides: Record<string, string> = {
-		TMPDIR: dir,
-		TMP: dir,
-		TEMP: dir,
-		HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START: '1',
-		HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT: '1',
-		HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT: String(operationsPort),
-		HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT: String(httpPort),
-	};
-	const saved = Object.fromEntries(Object.keys(overrides).map((name) => [name, process.env[name]]));
-	Object.assign(process.env, overrides);
-	try {
-		return await import(freshModuleUrl());
-	} finally {
-		for (const [name, value] of Object.entries(saved)) {
-			if (value === undefined) delete process.env[name];
-			else process.env[name] = value;
-		}
-	}
-}
-
-test('hands out an address when no other process listens on its ports', async () => {
+test('hands out an address and holds its claim port until released', async () => {
 	const address = await getNextAvailableLoopbackAddress();
 	strictEqual(address, HOST);
+	ok(!(await claimIsFree()), 'the claim port is held while the address is');
 	await releaseLoopbackAddress(address);
-	deepStrictEqual(readPool(), [null]);
+	ok(await claimIsFree(), 'releasing frees the claim port');
+	await releaseLoopbackAddress(address);
+});
+
+test('releasing an address another process holds leaves its claim alone', async () => {
+	const otherHolder = await listen(HOST, claimPort);
+	try {
+		await releaseLoopbackAddress(HOST);
+		ok(otherHolder.listening);
+		ok(!(await claimIsFree()));
+	} finally {
+		await close(otherHolder);
+	}
+});
+
+test('a release that overlaps the next allocation of the same address does not release the new claim', async () => {
+	const first = await getNextAvailableLoopbackAddress();
+	const releasing = releaseLoopbackAddress(first);
+	const second = await getNextAvailableLoopbackAddress();
+	await releasing;
+	strictEqual(second, HOST);
+	ok(!(await claimIsFree()), 'the second claim is still held');
+	await releaseLoopbackAddress(second);
+	ok(await claimIsFree());
+});
+
+test('releaseAllLoopbackAddressesForCurrentProcess frees every claim', async () => {
+	await getNextAvailableLoopbackAddress();
+	await releaseAllLoopbackAddressesForCurrentProcess();
+	ok(await claimIsFree());
+});
+
+test('a release completes while a client that asked for the holder stays connected', { timeout: 5000 }, async () => {
+	const address = await getNextAvailableLoopbackAddress();
+	const client = connect({ host: HOST, port: claimPort });
+	client.on('error', () => {});
+	const reply: string = await new Promise((resolve) => client.once('data', (chunk) => resolve(String(chunk))));
+	match(reply, /"protocol":"harper-integration-test-loopback-claim\/1"/);
+	match(reply, new RegExp(`"pid":${process.pid}`));
+	await releaseLoopbackAddress(address);
+	ok(await claimIsFree());
+	client.destroy();
 });
 
 for (const wildcard of ['0.0.0.0', '::']) {
@@ -158,10 +143,29 @@ for (const wildcard of ['0.0.0.0', '::']) {
 			strictEqual(error.port, port);
 			match(error.message, new RegExp(`${HOST}:${port}`));
 			match(error.message, new RegExp(`${ALLOW_ENV}=1`));
-			deepStrictEqual(readPool(), [null], 'the refused address must go back to the pool');
+			ok(await claimIsFree(), 'the refused address must go back to the pool');
 		});
 	}
 }
+
+test('a listener on all interfaces on an MQTT-class port refuses the address only where it blocks binding it (Linux)', async (t) => {
+	const listener = await listenOnAllInterfaces('0.0.0.0', mqttPort);
+	if (typeof listener === 'string') return t.skip(listener);
+	try {
+		if (process.platform === 'linux') {
+			const error = await refusal();
+			strictEqual(error.name, 'ForeignListenerError');
+			strictEqual(error.port, mqttPort);
+		} else {
+			const address = await getNextAvailableLoopbackAddress();
+			strictEqual(address, HOST);
+			await releaseLoopbackAddress(address);
+		}
+	} finally {
+		await close(listener);
+	}
+	ok(await claimIsFree());
+});
 
 for (const value of ['1', 'true', 'TRUE']) {
 	test(`hands the address out with a warning when ${ALLOW_ENV}=${value}`, async (t) => {
@@ -201,24 +205,33 @@ for (const value of ['0', 'false', '']) {
 	});
 }
 
-test('waits out a listener bound to the address itself instead of refusing it', { timeout: 15000 }, async (t) => {
-	const warn = t.mock.method(console, 'warn', () => {});
-	const canaryWarned = () =>
-		warn.mock.calls.some((call) => String(call.arguments[0]).includes('still in use by another Harper node'));
-	const lingering = await listen(HOST, httpPort);
-	t.after(() => (lingering.listening ? close(lingering) : undefined));
-	const allocation = getNextAvailableLoopbackAddress();
-	while (!canaryWarned()) await sleep(10);
-	await close(lingering);
-	strictEqual(await allocation, HOST);
-	await releaseLoopbackAddress(HOST);
-});
+for (const [portName, port] of [
+	['operations', operationsPort],
+	['HTTP', httpPort],
+	['MQTT-class', mqttPort],
+] as const) {
+	test(`waits out a listener bound to the address's ${portName} port instead of refusing it`, { timeout: 15000 }, async (t) => {
+		const warn = t.mock.method(console, 'warn', () => {});
+		const canaryWarned = () =>
+			warn.mock.calls.some((call) => String(call.arguments[0]).includes(`still in use by another Harper node (port ${port} bound)`));
+		const lingering = await listen(HOST, port);
+		t.after(() => (lingering.listening ? close(lingering) : undefined));
+		const allocation = getNextAvailableLoopbackAddress();
+		while (!canaryWarned()) await sleep(10);
+		ok(await claimIsFree(), 'the skipped address is not held while it waits');
+		await close(lingering);
+		strictEqual(await allocation, HOST);
+		await releaseLoopbackAddress(HOST);
+	});
+}
 
 test('refuses an address whose port answers no handshake, as one that could not be checked', async (t) => {
 	if (process.platform === 'win32') return t.skip('stalling a handshake needs SIGSTOP');
 	const listener = await startChildListener('0.0.0.0', httpPort);
 	try {
-		if (!(await isPortFree(HOST, httpPort))) return t.skip(CANARY_CATCHES_IT);
+		if (!(await isPortFree(HOST, httpPort))) {
+			return t.skip('a listener on all interfaces blocks binding the address here, so the bind check refuses it first');
+		}
 		if (!(await listener.stall())) return t.skip(RESETS_INSTEAD_OF_STALLING);
 		const error = await refusal();
 		strictEqual(error.name, 'LoopbackAddressValidationError');
@@ -227,22 +240,22 @@ test('refuses an address whose port answers no handshake, as one that could not 
 	} finally {
 		await listener.close();
 	}
-	deepStrictEqual(readPool(), [null], 'the refused address must go back to the pool');
+	ok(await claimIsFree(), 'the refused address must go back to the pool');
 });
 
 test('startHarper and setupHarperWithFixture remove the install directory they created when allocation refuses the address', async (t) => {
 	const listener = await listenOnAllInterfaces('0.0.0.0', httpPort);
 	if (typeof listener === 'string') return t.skip(listener);
-	const installParent = join(poolDir, 'installs');
+	const installParent = join(scratchDir, 'installs');
 	mkdirSync(installParent);
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR = installParent;
 	// Were the address handed out, startHarper would go on to launch Harper; make that fail instead.
-	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(poolDir, 'no-such-harper.js');
+	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(scratchDir, 'no-such-harper.js');
 	try {
 		await rejects(startHarper(createHarperContext('refused')), { name: 'ForeignListenerError' });
 		deepStrictEqual(readdirSync(installParent), []);
 
-		const fixture = mkdtempSync(join(poolDir, 'fixture-'));
+		const fixture = mkdtempSync(join(scratchDir, 'fixture-'));
 		writeFileSync(join(fixture, 'config.yaml'), '');
 		const fixtureCtx = createHarperContext('refused-fixture');
 		await rejects(setupHarperWithFixture(fixtureCtx, fixture), { name: 'ForeignListenerError' });
@@ -261,146 +274,24 @@ test('startHarper and setupHarperWithFixture remove the install directory they c
 	}
 });
 
-test('readPoolFile quarantines an unusable pool file, then reinitializes it once it has gone unmodified long enough', async (t) => {
-	t.mock.method(console, 'warn', () => {});
-	await withTempDir(async (dir) => {
-		const poolPath = join(dir, 'pool.json');
-		for (const content of ['[1,2,nul', '', 'null', '{}', '[]']) {
-			await writeFile(poolPath, content);
-			strictEqual(await readPoolFile(poolPath), null, `fresh ${JSON.stringify(content)} should be quarantined`);
+let freshImportCounter = 0;
 
-			await ageBeyondQuarantine(poolPath);
-			const pool = await readPoolFile(poolPath);
-			ok(pool && pool.length > 0 && pool.every((slot) => slot === null), `aged ${JSON.stringify(content)} should reinitialize`);
-			deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), pool, 'the reinitialized pool should be published');
+for (const value of ['0', '65536', '1.5', 'nine']) {
+	test(`refuses HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT=${value} when imported`, async () => {
+		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = value;
+		try {
+			await rejects(import(`../src/loopbackAddressPool.ts?claim-port=${++freshImportCounter}`), /CLAIM_PORT must be an integer/);
+		} finally {
+			process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(claimPort);
 		}
 	});
-});
+}
 
-test('readPoolFile reads a pool file deleted between its read and its stat as missing', async () => {
-	const m = mock.module('node:fs/promises', {
-		namedExports: {
-			...fsPromises,
-			readFile: async () => '[1,2,nul',
-			stat: async () => {
-				const error = new Error('simulated ENOENT') as NodeJS.ErrnoException;
-				error.code = 'ENOENT';
-				throw error;
-			},
-		},
-	});
+test("refuses a claim port that is one of Harper's ports when imported", async () => {
+	process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(mqttPort);
 	try {
-		const { readPoolFile: freshReadPoolFile } = await import(freshModuleUrl());
-		const pool = await freshReadPoolFile('unused');
-		ok(pool.length > 0 && pool.every((slot: number | null) => slot === null));
+		await rejects(import(`../src/loopbackAddressPool.ts?claim-port=${++freshImportCounter}`), /must not be one of Harper's ports/);
 	} finally {
-		m.restore();
+		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(claimPort);
 	}
-});
-
-test('a reservation lost to an unusable pool file is not reissued until the quarantine ends', async (t) => {
-	const warn = t.mock.method(console, 'warn', () => {});
-	await withTempDir(async (dir) => {
-		const pool = await importIsolatedPool(dir);
-		const poolPath = join(dir, POOL_FILE_NAME);
-		strictEqual(await pool.getNextAvailableLoopbackAddress(), '127.0.0.1');
-
-		// A writer that doesn't publish by rename dies mid-write, losing that reservation.
-		await writeFile(poolPath, '[');
-		const reissued = pool.getNextAvailableLoopbackAddress();
-		try {
-			strictEqual(await Promise.race([reissued.then(() => 'reissued'), sleep(2500).then(() => 'waiting')]), 'waiting');
-
-			await pool.releaseLoopbackAddress('127.0.0.1');
-			await pool.releaseAllLoopbackAddressesForCurrentProcess();
-			strictEqual(await readFile(poolPath, 'utf-8'), '[', 'releasing must not end the quarantine');
-
-			await ageBeyondQuarantine(poolPath);
-			strictEqual(await Promise.race([reissued, sleep(5000).then(() => 'still waiting')]), '127.0.0.1');
-		} finally {
-			// Unblocks the allocation if an assertion above failed, so the test can't hang.
-			await rm(poolPath, { force: true });
-			await reissued;
-		}
-		strictEqual(warn.mock.calls.filter((call) => String(call.arguments[0]).includes('is unusable')).length, 1);
-	});
-});
-
-test('releaseLoopbackAddress clears only a slot this process holds', async () => {
-	await withTempDir(async (dir) => {
-		const pool = await importIsolatedPool(dir);
-		const poolPath = join(dir, POOL_FILE_NAME);
-
-		strictEqual(await pool.getNextAvailableLoopbackAddress(), '127.0.0.1');
-		await pool.releaseLoopbackAddress('127.0.0.1');
-		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), [null]);
-
-		const otherRunnerPid = process.pid + 1;
-		await writeFile(poolPath, JSON.stringify([otherRunnerPid]));
-		await pool.releaseLoopbackAddress('127.0.0.1');
-		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), [otherRunnerPid]);
-	});
-});
-
-test('readPoolFile still rethrows errors unrelated to a missing/corrupt file', async () => {
-	await withTempDir(async (dir) => {
-		const poolPath = join(dir, 'pool.json');
-		const m = mock.module('node:fs/promises', {
-			// @types/node 22.0.0 only knows `namedExports`; `exports` isn't in its types yet.
-			namedExports: {
-				...fsPromises,
-				readFile: async () => {
-					const error = new Error('simulated EACCES') as NodeJS.ErrnoException;
-					error.code = 'EACCES';
-					throw error;
-				},
-			},
-		});
-		try {
-			const { readPoolFile: freshReadPoolFile } = await import(freshModuleUrl());
-			await rejects(() => freshReadPoolFile(poolPath), /simulated EACCES/);
-		} finally {
-			m.restore();
-		}
-	});
-});
-
-test('writePoolFile round-trips through readPoolFile and leaves no leftover pending file', async () => {
-	await withTempDir(async (dir) => {
-		const poolPath = join(dir, 'pool.json');
-		const pool = [null, 123, null, 456];
-
-		await writePoolFile(pool, poolPath);
-
-		deepStrictEqual(await readPoolFile(poolPath), pool);
-		deepStrictEqual(await readdir(dir), ['pool.json']);
-	});
-});
-
-test('writePoolFile never leaves a partially-written file visible at the pool path', async () => {
-	await withTempDir(async (dir) => {
-		const poolPath = join(dir, 'pool.json');
-		const original = [null, null, null];
-		await writeFile(poolPath, JSON.stringify(original));
-
-		// A hard kill in this same window (vs. this mocked rejection) bypasses catch/finally and
-		// orphans the pending file — the pool has no reaper for that, unlike the instance registry.
-		const m = mock.module('node:fs/promises', {
-			namedExports: {
-				...fsPromises,
-				rename: async () => {
-					throw new Error('simulated rename failure');
-				},
-			},
-		});
-		try {
-			const { writePoolFile: freshWritePoolFile } = await import(freshModuleUrl());
-			await rejects(() => freshWritePoolFile([1, 2, 3], poolPath), /simulated rename failure/);
-		} finally {
-			m.restore();
-		}
-
-		deepStrictEqual(JSON.parse(await readFile(poolPath, 'utf-8')), original);
-		deepStrictEqual(await readdir(dir), ['pool.json']);
-	});
 });
