@@ -40,8 +40,7 @@ let lockTokenCounter = 0;
 // reserve-to-bind time: its startup ceiling (DEFAULT_STARTUP_MAX_MS) plus the setup before it.
 const UNUSABLE_POOL_QUARANTINE_MS = 360000;
 
-// How long getNextAvailableLoopbackAddress waits for a free address before throwing. It must outlast
-// UNUSABLE_POOL_QUARANTINE_MS, which a quarantined pool file can make every caller wait out.
+// Must outlast UNUSABLE_POOL_QUARANTINE_MS, which a quarantined pool file can make every caller wait out.
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 600000;
 const ACQUIRE_TIMEOUT_MS = (() => {
 	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS || '', 10);
@@ -506,10 +505,7 @@ export async function validateLoopbackAddressPool(): Promise<{
 	);
 }
 
-/**
- * Says who holds the pool, for a caller that is waiting on it. `conflictPorts` maps a free slot's index
- * to the canary port another Harper node was last found binding there.
- */
+/** `conflictPorts` maps a free slot's index to the canary port another Harper node was last found binding there. */
 function describePoolState(pool: LoopbackPool | null, conflictPorts: ReadonlyMap<number, number>): string {
 	if (!pool) {
 		return `The pool file ${HARPER_LOOPBACK_POOL_PATH} is unusable and quarantined (see the earlier [loopback-pool] warning).`;
@@ -595,7 +591,6 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	let lastPool: LoopbackPool | null = null;
 	const conflictPorts = new Map<number, number>();
 	while (true) {
-		let reclaimed = false;
 		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
@@ -603,18 +598,19 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			if (!loopbackPool) return null;
 
 			// Find the first available index we haven't already found in-use this attempt
-			let index: number | null = null;
-			for (let i = 0; i < loopbackPool.length; i++) {
-				if (loopbackPool[i] === null && !triedIndices.has(i)) {
-					index = i;
-					break;
+			const findAvailableIndex = (): number | null => {
+				for (let i = 0; i < loopbackPool.length; i++) {
+					if (loopbackPool[i] === null && !triedIndices.has(i)) return i;
 				}
-			}
-
+				return null;
+			};
+			let index = findAvailableIndex();
 			if (index === null) {
-				// Nothing available - remove any dead processes from the pool and wait for one to become available
-				reclaimed = removeDeadProcessesFromPool(loopbackPool);
-			} else {
+				// Nothing available - remove any dead processes from the pool and claim a slot they held, else wait for one to become available
+				removeDeadProcessesFromPool(loopbackPool);
+				index = findAvailableIndex();
+			}
+			if (index !== null) {
 				// Assign the process PID to that index to mark it as used
 				loopbackPool[index] = process.pid;
 			}
@@ -695,9 +691,6 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			continue;
 		}
 
-		// Dead holders' slots were just freed and published, so claim one now rather than waiting out the delay or the deadline.
-		if (reclaimed) continue;
-
 		// No available addresses; clear the per-attempt skip set so poisoned addresses can be
 		// re-probed (their lingering node may have exited during the wait), then wait and retry.
 		triedIndices.clear();
@@ -718,20 +711,16 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 /**
  * Removes any dead processes from the loopback pool.
  * @param loopbackPool
- * @returns Whether any slot was freed
  */
-function removeDeadProcessesFromPool(loopbackPool: LoopbackPool): boolean {
-	let reclaimed = false;
+function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
 	loopbackPool.forEach((pid, index) => {
 		if (pid === null) return;
 		try {
 			process.kill(pid, 0);
 		} catch {
 			loopbackPool[index] = null;
-			reclaimed = true;
 		}
 	});
-	return reclaimed;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { test, after, mock } from 'node:test';
 import { match, ok, strictEqual } from 'node:assert';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { createServer, type AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,7 +19,6 @@ function freePort(): Promise<number> {
 	});
 }
 
-// The pool reads these once, when it is imported.
 const poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-exhaustion-test-'));
 const canaryPort = await freePort();
 process.env.TMPDIR = process.env.TEMP = poolDir;
@@ -40,6 +40,12 @@ after(() => {
 	holder.kill();
 	rmSync(poolDir, { recursive: true, force: true });
 });
+
+async function kill(child: ChildProcess) {
+	const exited = once(child, 'exit');
+	child.kill('SIGKILL');
+	await exited;
+}
 
 function writePool(pool: (number | null)[]) {
 	writeFileSync(join(poolDir, 'harper-integration-test-loopback-pool.json'), JSON.stringify(pool));
@@ -75,7 +81,7 @@ test('an address freed during the wait is handed out rather than rejected', asyn
 	writePool([process.pid, holderPid]);
 	const [address] = await Promise.all([
 		getNextAvailableLoopbackAddress(),
-		sleep(300).then(() => releaseLoopbackAddress('127.0.0.1')),
+		sleep(500).then(() => releaseLoopbackAddress('127.0.0.1')),
 	]);
 	try {
 		strictEqual(address, '127.0.0.1');
@@ -86,15 +92,19 @@ test('an address freed during the wait is handed out rather than rejected', asyn
 
 test('a holder that dies after the deadline is reclaimed rather than reported', async () => {
 	const dying = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e6)'], { stdio: 'ignore' });
-	writePool([dying.pid!, holderPid]);
-	const [address] = await Promise.all([
-		getNextAvailableLoopbackAddress(),
-		sleep(2500).then(() => dying.kill()),
-	]);
 	try {
-		strictEqual(address, '127.0.0.1');
+		writePool([dying.pid!, holderPid]);
+		const [address] = await Promise.all([
+			getNextAvailableLoopbackAddress(),
+			sleep(2500).then(() => kill(dying)),
+		]);
+		try {
+			strictEqual(address, '127.0.0.1');
+		} finally {
+			await releaseLoopbackAddress(address);
+		}
 	} finally {
-		await releaseLoopbackAddress(address);
+		dying.kill('SIGKILL');
 	}
 });
 
