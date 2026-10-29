@@ -5,6 +5,7 @@ import { createServer, type AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 function freePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
@@ -17,8 +18,7 @@ function freePort(): Promise<number> {
 	});
 }
 
-// The pool reads these once, when it is imported. 127.0.0.1 and 127.0.0.2 are held in every case below,
-// so no address is ever bound except 127.0.0.1 in the case that frees it.
+// The pool reads these once, when it is imported.
 const poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-exhaustion-test-'));
 const canaryPort = await freePort();
 process.env.TMPDIR = process.env.TEMP = poolDir;
@@ -73,9 +73,24 @@ test('an exhausted pool rejects with the pool range and the pids holding it, ins
 
 test('an address freed during the wait is handed out rather than rejected', async () => {
 	writePool([process.pid, holderPid]);
-	const acquiring = getNextAvailableLoopbackAddress();
-	setTimeout(() => releaseLoopbackAddress('127.0.0.1'), 300);
-	const address = await acquiring;
+	const [address] = await Promise.all([
+		getNextAvailableLoopbackAddress(),
+		sleep(300).then(() => releaseLoopbackAddress('127.0.0.1')),
+	]);
+	try {
+		strictEqual(address, '127.0.0.1');
+	} finally {
+		await releaseLoopbackAddress(address);
+	}
+});
+
+test('a holder that dies after the deadline is reclaimed rather than reported', async () => {
+	const dying = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e6)'], { stdio: 'ignore' });
+	writePool([dying.pid!, holderPid]);
+	const [address] = await Promise.all([
+		getNextAvailableLoopbackAddress(),
+		sleep(2500).then(() => dying.kill()),
+	]);
 	try {
 		strictEqual(address, '127.0.0.1');
 	} finally {
@@ -86,10 +101,10 @@ test('an address freed during the wait is handed out rather than rejected', asyn
 test('a pool holding only dead pids is reclaimed, not reported as exhausted', async () => {
 	const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
 	await new Promise((resolve) => dead.once('exit', resolve));
-	writePool([dead.pid!, dead.pid!]);
+	writePool([dead.pid!, holderPid]);
 	const address = await getNextAvailableLoopbackAddress();
 	try {
-		match(address, /^127\.0\.0\.[12]$/);
+		strictEqual(address, '127.0.0.1');
 	} finally {
 		await releaseLoopbackAddress(address);
 	}

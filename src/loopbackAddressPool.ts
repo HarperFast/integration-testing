@@ -47,7 +47,6 @@ const ACQUIRE_TIMEOUT_MS = (() => {
 	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS || '', 10);
 	return Number.isNaN(parsed) || parsed < 1 ? DEFAULT_ACQUIRE_TIMEOUT_MS : parsed;
 })();
-// A wait this long is no longer a sibling suite about to finish, so it gets one warning naming the holders.
 const WAIT_NOTICE_MS = Math.min(30000, ACQUIRE_TIMEOUT_MS / 4);
 
 // Port used as a conflict canary when allocating an address. This MUST be a port that
@@ -591,13 +590,12 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// them within this attempt; the set is cleared before each wait so they can be re-probed once
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
-	// What the exhaustion diagnostic reports: the pool as the last attempt saw it (null while quarantined)
-	// and the canary port that made each skipped address unusable.
 	const waitStartedAt = performance.now();
 	let noticed = false;
 	let lastPool: LoopbackPool | null = null;
 	const conflictPorts = new Map<number, number>();
 	while (true) {
+		let reclaimed = false;
 		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
@@ -615,7 +613,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 
 			if (index === null) {
 				// Nothing available - remove any dead processes from the pool and wait for one to become available
-				removeDeadProcessesFromPool(loopbackPool);
+				reclaimed = removeDeadProcessesFromPool(loopbackPool);
 			} else {
 				// Assign the process PID to that index to mark it as used
 				loopbackPool[index] = process.pid;
@@ -697,6 +695,9 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			continue;
 		}
 
+		// Dead holders' slots were just freed and published, so claim one now rather than waiting out the delay or the deadline.
+		if (reclaimed) continue;
+
 		// No available addresses; clear the per-attempt skip set so poisoned addresses can be
 		// re-probed (their lingering node may have exited during the wait), then wait and retry.
 		triedIndices.clear();
@@ -717,16 +718,20 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 /**
  * Removes any dead processes from the loopback pool.
  * @param loopbackPool
+ * @returns Whether any slot was freed
  */
-function removeDeadProcessesFromPool(loopbackPool: LoopbackPool) {
+function removeDeadProcessesFromPool(loopbackPool: LoopbackPool): boolean {
+	let reclaimed = false;
 	loopbackPool.forEach((pid, index) => {
 		if (pid === null) return;
 		try {
 			process.kill(pid, 0);
 		} catch {
 			loopbackPool[index] = null;
+			reclaimed = true;
 		}
 	});
+	return reclaimed;
 }
 
 /**
