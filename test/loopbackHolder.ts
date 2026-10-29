@@ -49,10 +49,15 @@ export function startHolder({ env = {}, waitForGo = false, pidNamespace = false 
 	const exitedEarly = exited.then(([code]) => {
 		throw new Error(`the holder exited (code ${code}) before reporting`);
 	});
+	const readyOrExit = Promise.race([ready, exitedEarly]);
+	const outcomeOrExit = Promise.race([outcome, exitedEarly]);
+	// A caller that stops at the first rejection would otherwise leave the other one unhandled.
+	readyOrExit.catch(() => {});
+	outcomeOrExit.catch(() => {});
 	return {
 		child,
-		ready: Promise.race([ready, exitedEarly]),
-		outcome: Promise.race([outcome, exitedEarly]),
+		ready: readyOrExit,
+		outcome: outcomeOrExit,
 		go: () => child.stdin!.write('go\n'),
 		async stop() {
 			child.stdin!.end();

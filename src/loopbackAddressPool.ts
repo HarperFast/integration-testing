@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { randomInt } from 'node:crypto';
 import { readlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { connect, createServer, type Server, type Socket } from 'node:net';
@@ -225,7 +226,6 @@ function answerIdentity(claim: Claim, socket: Socket): void {
 	socket.write(`${JSON.stringify({ protocol: IDENTITY_PROTOCOL, ...getOwnIdentity(), checking: !claim.accepted })}\n`);
 }
 
-/** Resolves the claim, or `null` when another listener already holds the address's claim port. */
 function claimAddress(address: string): Promise<Claim | null> {
 	return new Promise((resolve, reject) => {
 		const server = createServer((socket) => answerIdentity(claim, socket));
@@ -276,7 +276,7 @@ function parseIdentity(line: string): HolderIdentity | null {
 	};
 }
 
-/** Asks a claim's holder who it is. Whatever answers is untrusted, and only ever described. */
+/** Whatever answers is untrusted, and only ever described. */
 function queryHolder(address: string): Promise<HolderReport> {
 	return new Promise((resolve) => {
 		const socket = connect({ host: address, port: CLAIM_PORT });
@@ -383,10 +383,10 @@ function isPortInUseOnAddress(port: number, loopbackAddress: string): Promise<bo
  * of one address beside such a listener, and there a bind of an address outside the pool conflicts with it too.
  * A `true` cannot rule out a second listener on the pool address itself.
  */
-async function isHeldOnAllInterfaces(port: number, loopbackAddress: string): Promise<boolean> {
+async function isHeldOnAllInterfaces(port: number, controlAddress: string): Promise<boolean> {
 	if (process.platform !== 'linux') return false;
 	try {
-		return await isPortInUseOnAddress(port, controlAddressFor(loopbackAddress));
+		return await isPortInUseOnAddress(port, controlAddress);
 	} catch {
 		return false;
 	}
@@ -410,7 +410,7 @@ async function findConflictingPort(loopbackAddress: string): Promise<PortConflic
 	let allInterfacesConflict: PortConflict | null = null;
 	for (const port of CONFLICT_PROBE_PORTS) {
 		if (!(await isPortInUseOnAddress(port, loopbackAddress))) continue;
-		if (!(await isHeldOnAllInterfaces(port, loopbackAddress))) return { port, scope: 'address' };
+		if (!(await isHeldOnAllInterfaces(port, controlAddressFor(loopbackAddress)))) return { port, scope: 'address' };
 		allInterfacesConflict ??= { port, scope: 'all-interfaces' };
 	}
 	return allInterfacesConflict;
@@ -485,7 +485,8 @@ async function describePoolState(claimed: readonly number[], conflictPorts: Read
 	for (const [holder, addresses] of addressesByHolder) lines.push(`  ${holder} ${addresses.join(', ')}`);
 	if (unidentifiedIndices.length > 0) {
 		lines.push(`  held by a process that did not identify itself: ${unidentifiedIndices.map(addressAt).join(', ')}`);
-		if (await isHeldOnAllInterfaces(CLAIM_PORT, addressAt(unidentifiedIndices[0]))) {
+		// Waiters hold no claim here, so each probes a random control address rather than one they might share.
+		if (await isHeldOnAllInterfaces(CLAIM_PORT, `127.254.${randomInt(256)}.${randomInt(1, 255)}`)) {
 			lines.push(
 				`  port ${CLAIM_PORT} is bound on all interfaces by another program, which holds every address; set HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT to a free port for every run`
 			);
