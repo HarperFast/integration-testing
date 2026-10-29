@@ -18,11 +18,9 @@ export interface Holder {
 	ready: Promise<void>;
 	/** The allocation's outcome; rejects if the child exits without one. */
 	outcome: Promise<HolderOutcome>;
-	/** Starts the allocation of a holder started with `waitForGo`. */
 	go(): void;
 	/** Ends stdin, which makes the holder exit, and waits for it. */
 	stop(): Promise<void>;
-	/** SIGKILLs the holder and waits for it. */
 	kill(): Promise<void>;
 }
 

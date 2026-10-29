@@ -6,15 +6,21 @@ import { acceptsConnections, isPortFree } from '../src/portUtils.ts';
 const HOST = '127.0.0.1';
 const ALLOW_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
 
-async function freePort(): Promise<number> {
-	const server = createServer();
-	await new Promise<void>((resolve, reject) => {
-		server.once('error', reject);
-		server.listen(0, HOST, () => resolve());
-	});
-	const { port } = server.address() as AddressInfo;
-	await new Promise<void>((resolve) => server.close(() => resolve()));
-	return port;
+/** Distinct free ports: all are held at once, so the OS cannot hand out the same one twice. */
+async function freePorts(count: number): Promise<number[]> {
+	const servers = Array.from({ length: count }, () => createServer());
+	await Promise.all(
+		servers.map(
+			(server) =>
+				new Promise<void>((resolve, reject) => {
+					server.once('error', reject);
+					server.listen(0, HOST, () => resolve());
+				})
+		)
+	);
+	const ports = servers.map((server) => (server.address() as AddressInfo).port);
+	await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+	return ports;
 }
 
 /**
@@ -36,11 +42,12 @@ describe('an address that cannot be checked', { skip: await skipReason() }, () =
 	let pool: typeof import('../src/loopbackAddressPool.ts');
 
 	before(async () => {
-		claimPort = await freePort();
+		let operationsPort: number;
+		[claimPort, operationsPort] = await freePorts(2);
 		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '1';
 		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
 		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(claimPort);
-		process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(await freePort());
+		process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort);
 		process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = '0';
 		process.env.HARPER_INTEGRATION_TEST_OTHER_CONFLICT_PROBE_PORTS = '';
 		delete process.env[ALLOW_ENV];

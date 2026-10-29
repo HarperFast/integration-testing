@@ -1,6 +1,6 @@
 import { test, after, mock } from 'node:test';
 import { match, ok, strictEqual } from 'node:assert';
-import { createServer, type AddressInfo, type Socket } from 'node:net';
+import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,20 +9,24 @@ import { pidNamespaceUnavailable, startHolder, type Holder } from './loopbackHol
 
 const HOST = '127.0.0.1';
 
-function freePort(): Promise<number> {
+function listen(port: number): Promise<Server> {
 	return new Promise((resolve, reject) => {
 		const server = createServer();
 		server.once('error', reject);
-		server.listen(0, HOST, () => {
-			const { port } = server.address() as AddressInfo;
-			server.close(() => resolve(port));
-		});
+		server.listen(port, HOST, () => resolve(server));
 	});
 }
 
+/** Distinct free ports: all are held at once, so the OS cannot hand out the same one twice. */
+async function freePorts(count: number): Promise<number[]> {
+	const servers = await Promise.all(Array.from({ length: count }, () => listen(0)));
+	const ports = servers.map((server) => (server.address() as AddressInfo).port);
+	await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+	return ports;
+}
+
 const scratchDir = mkdtempSync(join(tmpdir(), 'loopback-pool-exhaustion-test-'));
-const claimPort = await freePort();
-const canaryPort = await freePort();
+const [claimPort, canaryPort] = await freePorts(2);
 // The pool reads these once, when it is imported; the holder processes inherit them.
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '1';
 process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
@@ -42,9 +46,32 @@ after(() => rmSync(scratchDir, { recursive: true, force: true }));
 async function holdingHolder(options: Parameters<typeof startHolder>[0] = {}): Promise<Holder> {
 	const ownTmp = mkdtempSync(join(scratchDir, 'holder-tmp-'));
 	const holder = startHolder({ ...options, env: { TMPDIR: ownTmp, TMP: ownTmp, TEMP: ownTmp, ...options.env } });
-	const outcome = await holder.outcome;
-	strictEqual(outcome.address, HOST, `the holder should hold ${HOST}, got ${JSON.stringify(outcome)}`);
+	try {
+		const outcome = await holder.outcome;
+		strictEqual(outcome.address, HOST, `the holder should hold ${HOST}, got ${JSON.stringify(outcome)}`);
+	} catch (error) {
+		await holder.kill();
+		throw error;
+	}
 	return holder;
+}
+
+/** Resolves once `allocation` has logged that it is waiting, proving it found the pool full first. */
+async function untilWaiting(warn: ReturnType<typeof mock.method>, allocation: Promise<string>): Promise<void> {
+	let settled = false;
+	allocation.then(
+		() => (settled = true),
+		() => (settled = true)
+	);
+	while (!warn.mock.calls.some((call) => String(call.arguments[0]).includes('Still waiting'))) {
+		if (settled) throw new Error('the allocation settled without waiting');
+		await sleep(10);
+	}
+}
+
+/** Returns an allocation's address to the pool whether it has settled yet or not. */
+async function settleAllocation(allocation: Promise<string>): Promise<void> {
+	await allocation.then(releaseLoopbackAddress, () => {});
 }
 
 async function exhaustion(): Promise<any> {
@@ -92,21 +119,31 @@ test("this process's own claim is listed as this process", async () => {
 
 test('an address released during the wait is handed out rather than rejected', async () => {
 	const held = await getNextAvailableLoopbackAddress();
-	const [address] = await Promise.all([getNextAvailableLoopbackAddress(), sleep(500).then(() => releaseLoopbackAddress(held))]);
+	const warn = mock.method(console, 'warn', () => {});
+	const allocation = getNextAvailableLoopbackAddress();
 	try {
-		strictEqual(address, HOST);
+		await untilWaiting(warn, allocation);
+		await releaseLoopbackAddress(held);
+		strictEqual(await allocation, HOST);
 	} finally {
-		await releaseLoopbackAddress(address);
+		warn.mock.restore();
+		await releaseLoopbackAddress(held);
+		await settleAllocation(allocation);
 	}
 });
 
 test('a holder that exits during the wait frees its address at once', async () => {
 	const holder = await holdingHolder();
-	const [address] = await Promise.all([getNextAvailableLoopbackAddress(), sleep(500).then(() => holder.stop())]);
+	const warn = mock.method(console, 'warn', () => {});
+	const allocation = getNextAvailableLoopbackAddress();
 	try {
-		strictEqual(address, HOST);
+		await untilWaiting(warn, allocation);
+		await holder.stop();
+		strictEqual(await allocation, HOST);
 	} finally {
-		await releaseLoopbackAddress(address);
+		warn.mock.restore();
+		await holder.stop();
+		await settleAllocation(allocation);
 	}
 });
 
@@ -201,6 +238,10 @@ const strangers: [string, (socket: Socket) => void][] = [
 	['answers with something else', (socket) => socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')],
 	['answers with an unknown protocol', (socket) => socket.write('{"protocol":"other","pid":1}\n')],
 	['sends a reply too long to be one', (socket) => socket.write('x'.repeat(64 * 1024))],
+	[
+		'sends an identity line too long to be one',
+		(socket) => socket.write(`${JSON.stringify({ protocol: 'harper-integration-test-loopback-claim/1', pid: 4242, padding: 'x'.repeat(4096) })}\n`),
+	],
 	['never answers', () => {}],
 ];
 for (const [behavior, onConnection] of strangers) {
@@ -219,3 +260,18 @@ for (const [behavior, onConnection] of strangers) {
 		}
 	});
 }
+
+test('a claim still being checked by another allocation is not listed as holding its address', async () => {
+	const checking = await listenOnClaimPort((socket) =>
+		socket.write(`${JSON.stringify({ protocol: 'harper-integration-test-loopback-claim/1', pid: 4242, checking: true })}\n`)
+	);
+	const warn = mock.method(console, 'warn', () => {});
+	try {
+		const error = await exhaustion();
+		match(error.message, /pid 4242 is checking 127\.0\.0\.1/);
+		ok(!/pid 4242 holds/.test(error.message), error.message);
+	} finally {
+		warn.mock.restore();
+		await checking.close();
+	}
+});

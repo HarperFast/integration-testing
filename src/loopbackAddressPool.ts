@@ -80,13 +80,19 @@ if (CONFLICT_PROBE_PORTS.includes(CLAIM_PORT)) {
 	throw new Error(`HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT (${CLAIM_PORT}) must not be one of Harper's ports`);
 }
 
-// Linux routes all of 127.0.0.0/8 to lo; this address is outside the pool's 127.0.0.x range.
-const CONTROL_ADDRESS = '127.255.255.254';
+/**
+ * An address outside the pool (Linux routes all of 127.0.0.0/8 to lo) for telling a listener on all interfaces from
+ * one on a pool address. Each pool address gets its own, which only that address's claim holder binds, so concurrent
+ * probes of different addresses cannot mistake each other for such a listener.
+ */
+function controlAddressFor(loopbackAddress: string): string {
+	return loopbackAddress.replace(/^127\.0\.0\./, '127.255.0.');
+}
 
 const IDENTITY_PROTOCOL = 'harper-integration-test-loopback-claim/1';
 const IDENTITY_SERVE_MS = 2000;
 const IDENTITY_QUERY_MS = 1000;
-const IDENTITY_MAX_BYTES = 1024;
+const IDENTITY_MAX_CHARACTERS = 1024;
 
 interface LoopbackAddressError extends Error {
 	loopbackAddress: string;
@@ -160,6 +166,8 @@ interface Claim {
 	server: Server;
 	/** Identity queries in flight; release resets them so they cannot hold the claim port open. */
 	connections: Set<Socket>;
+	/** False while allocation still checks the address's Harper ports, and may yet let it go. */
+	accepted: boolean;
 }
 
 // Shared by every copy of this module in the process, so release-all keeps meaning "this process".
@@ -181,6 +189,7 @@ interface HolderIdentity {
 	pid: number;
 	pidNamespace: string | null;
 	hostname: string | null;
+	checking?: boolean;
 }
 
 let ownIdentity: HolderIdentity | undefined;
@@ -192,15 +201,18 @@ function getOwnIdentity(): HolderIdentity {
 				pidNamespace = readlinkSync('/proc/self/ns/pid');
 			} catch {}
 		}
-		ownIdentity = { pid: process.pid, pidNamespace, hostname: hostname() };
+		let ownHostname: string | null = null;
+		try {
+			ownHostname = hostname();
+		} catch {}
+		ownIdentity = { pid: process.pid, pidNamespace, hostname: ownHostname };
 	}
 	return ownIdentity;
 }
 
-let identityLine: string | undefined;
-
 /** The client closes first, so the claim port never sits in TIME_WAIT on the holder's side. */
-function answerIdentity(connections: Set<Socket>, socket: Socket): void {
+function answerIdentity(claim: Claim, socket: Socket): void {
+	const { connections } = claim;
 	connections.add(socket);
 	socket.on('error', () => {});
 	socket.unref();
@@ -210,14 +222,14 @@ function answerIdentity(connections: Set<Socket>, socket: Socket): void {
 		connections.delete(socket);
 	});
 	socket.resume();
-	socket.write((identityLine ??= `${JSON.stringify({ protocol: IDENTITY_PROTOCOL, ...getOwnIdentity() })}\n`));
+	socket.write(`${JSON.stringify({ protocol: IDENTITY_PROTOCOL, ...getOwnIdentity(), checking: !claim.accepted })}\n`);
 }
 
 /** Resolves the claim, or `null` when another listener already holds the address's claim port. */
 function claimAddress(address: string): Promise<Claim | null> {
 	return new Promise((resolve, reject) => {
-		const connections = new Set<Socket>();
-		const server = createServer((socket) => answerIdentity(connections, socket));
+		const server = createServer((socket) => answerIdentity(claim, socket));
+		const claim: Claim = { server, connections: new Set(), accepted: false };
 		const onError = (error: NodeJS.ErrnoException) => {
 			if (error.code === 'EADDRINUSE') {
 				resolve(null);
@@ -232,7 +244,7 @@ function claimAddress(address: string): Promise<Claim | null> {
 			// An accept failure (EMFILE) must not crash the holder; the claim stays bound.
 			server.on('error', () => {});
 			server.unref();
-			resolve({ server, connections });
+			resolve(claim);
 		});
 	});
 }
@@ -254,12 +266,13 @@ function parseIdentity(line: string): HolderIdentity | null {
 		return null;
 	}
 	if (typeof reply !== 'object' || reply === null) return null;
-	const { protocol, pid, pidNamespace, hostname } = reply as Record<string, unknown>;
+	const { protocol, pid, pidNamespace, hostname, checking } = reply as Record<string, unknown>;
 	if (protocol !== IDENTITY_PROTOCOL || !Number.isSafeInteger(pid) || (pid as number) < 1) return null;
 	return {
 		pid: pid as number,
 		pidNamespace: typeof pidNamespace === 'string' && /^pid:\[\d+\]$/.test(pidNamespace) ? pidNamespace : null,
 		hostname: typeof hostname === 'string' && /^[\w.-]{1,253}$/.test(hostname) ? hostname : null,
+		checking: checking === true,
 	};
 }
 
@@ -281,8 +294,8 @@ function queryHolder(address: string): Promise<HolderReport> {
 		socket.on('data', (chunk: string) => {
 			reply += chunk;
 			const newline = reply.indexOf('\n');
-			if (newline !== -1) settle(parseIdentity(reply.slice(0, newline)) ?? 'unidentified');
-			else if (reply.length > IDENTITY_MAX_BYTES) settle('unidentified');
+			if ((newline === -1 ? reply.length : newline) > IDENTITY_MAX_CHARACTERS) settle('unidentified');
+			else if (newline !== -1) settle(parseIdentity(reply.slice(0, newline)) ?? 'unidentified');
 		});
 		socket.on('error', (error: NodeJS.ErrnoException) => settle(error.code === 'ECONNREFUSED' ? 'released' : 'unidentified'));
 		socket.on('end', () => settle('unidentified'));
@@ -291,6 +304,9 @@ function queryHolder(address: string): Promise<HolderReport> {
 
 function describeHolder(identity: HolderIdentity): string {
 	const own = getOwnIdentity();
+	if (identity.pid === own.pid && identity.pidNamespace === own.pidNamespace && identity.hostname === own.hostname) {
+		return `pid ${own.pid} (this process)`;
+	}
 	let description = `pid ${identity.pid}`;
 	if (identity.pidNamespace && own.pidNamespace && identity.pidNamespace !== own.pidNamespace) {
 		description += ` in another PID namespace (${identity.pidNamespace})`;
@@ -367,10 +383,10 @@ function isPortInUseOnAddress(port: number, loopbackAddress: string): Promise<bo
  * of one address beside such a listener, and there a bind of an address outside the pool conflicts with it too.
  * A `true` cannot rule out a second listener on the pool address itself.
  */
-async function isHeldOnAllInterfaces(port: number): Promise<boolean> {
+async function isHeldOnAllInterfaces(port: number, loopbackAddress: string): Promise<boolean> {
 	if (process.platform !== 'linux') return false;
 	try {
-		return await isPortInUseOnAddress(port, CONTROL_ADDRESS);
+		return await isPortInUseOnAddress(port, controlAddressFor(loopbackAddress));
 	} catch {
 		return false;
 	}
@@ -394,7 +410,7 @@ async function findConflictingPort(loopbackAddress: string): Promise<PortConflic
 	let allInterfacesConflict: PortConflict | null = null;
 	for (const port of CONFLICT_PROBE_PORTS) {
 		if (!(await isPortInUseOnAddress(port, loopbackAddress))) continue;
-		if (!(await isHeldOnAllInterfaces(port))) return { port, scope: 'address' };
+		if (!(await isHeldOnAllInterfaces(port, loopbackAddress))) return { port, scope: 'address' };
 		allInterfacesConflict ??= { port, scope: 'all-interfaces' };
 	}
 	return allInterfacesConflict;
@@ -435,7 +451,7 @@ export async function validateLoopbackAddressPool(): Promise<{
 
 /**
  * @param claimed Indices whose claim port was already bound at the last pass
- * @param conflictPorts Maps an unclaimed index to the Harper port another node was last found binding there
+ * @param conflictPorts Maps an index to the Harper port another node was last found binding there during this wait
  */
 async function describePoolState(claimed: readonly number[], conflictPorts: ReadonlyMap<number, number>): Promise<string> {
 	const isOwn = (index: number) => claims.has(claimKey(addressAt(index)));
@@ -443,32 +459,42 @@ async function describePoolState(claimed: readonly number[], conflictPorts: Read
 	const others = claimed.filter((index) => !isOwn(index));
 	const reports = await Promise.all(others.map((index) => queryHolder(addressAt(index))));
 	const addressesByHolder = new Map<string, string[]>();
-	const unidentified: string[] = [];
+	const addHolder = (holder: string, index: number) =>
+		addressesByHolder.set(holder, [...(addressesByHolder.get(holder) ?? []), addressAt(index)]);
+	const unidentifiedIndices: number[] = [];
+	const occupied = new Map([...conflictPorts].filter(([index]) => !claimed.includes(index)));
 	others.forEach((index, i) => {
 		const report = reports[i];
-		if (report === 'released') return;
 		if (report === 'unidentified') {
-			unidentified.push(addressAt(index));
+			unidentifiedIndices.push(index);
 			return;
 		}
-		const holder = describeHolder(report);
-		addressesByHolder.set(holder, [...(addressesByHolder.get(holder) ?? []), addressAt(index)]);
+		// A claim given up or still being checked is another allocation trying the address, not a holder of it.
+		if (report === 'released' || report.checking) {
+			const port = conflictPorts.get(index);
+			if (port !== undefined) occupied.set(index, port);
+			else if (report !== 'released') addHolder(`${describeHolder(report)} is checking`, index);
+			return;
+		}
+		addHolder(`${describeHolder(report)} holds`, index);
 	});
 	const lines = [
 		`Pool ${addressAt(0)}-${addressAt(HARPER_LOOPBACK_POOL_COUNT - 1)} (${HARPER_LOOPBACK_POOL_COUNT} addresses), each held by a listener on its port ${CLAIM_PORT}:`,
 	];
 	if (ownAddresses.length > 0) lines.push(`  pid ${process.pid} (this process) holds ${ownAddresses.join(', ')}`);
-	for (const [holder, addresses] of addressesByHolder) lines.push(`  ${holder} holds ${addresses.join(', ')}`);
-	if (unidentified.length > 0) {
-		lines.push(`  held by a process that did not identify itself: ${unidentified.join(', ')}`);
-		if (await isHeldOnAllInterfaces(CLAIM_PORT)) {
+	for (const [holder, addresses] of addressesByHolder) lines.push(`  ${holder} ${addresses.join(', ')}`);
+	if (unidentifiedIndices.length > 0) {
+		lines.push(`  held by a process that did not identify itself: ${unidentifiedIndices.map(addressAt).join(', ')}`);
+		if (await isHeldOnAllInterfaces(CLAIM_PORT, addressAt(unidentifiedIndices[0]))) {
 			lines.push(
 				`  port ${CLAIM_PORT} is bound on all interfaces by another program, which holds every address; set HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT to a free port for every run`
 			);
 		}
 	}
-	const occupied = [...conflictPorts].map(([index, port]) => `${addressAt(index)} (port ${port})`);
-	if (occupied.length > 0) lines.push(`  unclaimed but bound by another Harper node: ${occupied.join(', ')}`);
+	if (occupied.size > 0) {
+		const addresses = [...occupied].sort(([a], [b]) => a - b).map(([index, port]) => `${addressAt(index)} (port ${port})`);
+		lines.push(`  unclaimed but bound by another Harper node: ${addresses.join(', ')}`);
+	}
 	lines.push(
 		`Each holder is alive: its listener closes when it exits. \`lsof -nP -iTCP@<address>:${CLAIM_PORT} -sTCP:LISTEN\` names a holder by its pid on this host, and \`lsof -nP -iTCP@<address> -sTCP:LISTEN\` what binds an address's Harper ports (\`netstat -ano | findstr <address>:\` on Windows). Stop what leaked.`
 	);
@@ -476,23 +502,13 @@ async function describePoolState(claimed: readonly number[], conflictPorts: Read
 }
 
 /**
- * Retrieves the next available loopback address from the pool. Safe across concurrent processes,
- * whatever their PID namespace or TMPDIR, as long as they share a network namespace.
+ * Allocates a loopback address from the pool, safely across concurrent processes that share a network namespace,
+ * whatever their PID namespace or TMPDIR. The address stays held until it is released or this process exits. An
+ * address whose Harper ports are still bound, such as by a node that outlived its runner, is skipped. If every
+ * address is held, waits for one for up to `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default 10 minutes),
+ * logging one warning naming the holders after 30 seconds.
  *
- * **How it works:**
- * 1. Claims the first address whose claim port (`HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT`, default
- *    9924) no other process listens on, by listening there itself until the address is released or
- *    this process exits
- * 2. Skips an address whose Harper ports (operations, HTTP, HTTPS, MQTT, MQTTS) are already bound
- *    on it, such as by a Harper node that outlived its runner, and tries the next one
- * 3. Checks that no other process accepts connections on the address's operations and HTTP ports
- * 4. Returns the loopback address (e.g., "127.0.0.2")
- *
- * If every address is held, waits and retries until one becomes available, for up to
- * `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default 10 minutes). A wait of 30 seconds or
- * more logs one warning naming the holders.
- *
- * @returns A promise that resolves with an allocated loopback address
+ * @returns A promise that resolves with an allocated loopback address (e.g. "127.0.0.2")
  * @throws {LoopbackAddressValidationError} If the address cannot be bound to, or cannot be checked for
  * another process's listener
  * @throws {ForeignListenerError} If another process accepts connections on the address's Harper ports and
@@ -502,10 +518,10 @@ async function describePoolState(claimed: readonly number[], conflictPorts: Read
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	const waitStartedAt = performance.now();
 	const warnedConflicts = new Set<string>();
+	const conflictPorts = new Map<number, number>();
 	let noticed = false;
 	while (true) {
 		const claimed: number[] = [];
-		const conflictPorts = new Map<number, number>();
 		for (let index = 0; index < HARPER_LOOPBACK_POOL_COUNT; index++) {
 			const loopbackAddress = addressAt(index);
 			const claim = await claimAddress(loopbackAddress);
@@ -521,6 +537,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 				throw error;
 			}
 			if (accepted) {
+				claim.accepted = true;
 				claims.set(claimKey(loopbackAddress), claim);
 				return loopbackAddress;
 			}

@@ -55,7 +55,6 @@ async function claimIsFree(): Promise<boolean> {
 	return isPortFree(HOST, claimPort);
 }
 
-/** Resolves a reason to skip where this host cannot listen on all interfaces. */
 async function listenOnAllInterfaces(host: string, port: number): Promise<Server | string> {
 	try {
 		return await listen(host, port);
