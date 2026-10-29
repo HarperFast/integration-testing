@@ -289,6 +289,10 @@ try {
 
 Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when another process already accepts connections on the operations or HTTP port of a newly allocated address (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)). It extends `Error` with `name` set to `'ForeignListenerError'`, plus `loopbackAddress` and `port` properties naming what was reached. The address is returned to the pool before it is thrown. Set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1` (or `true`) to get a warning instead.
 
+### `LoopbackPoolExhaustedError`
+
+Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when no address became free within `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`, 10 minutes). It extends `Error` with `name` set to `'LoopbackPoolExhaustedError'`; the message gives the pool range and, for each holding pid, the addresses it holds, plus any unclaimed address a Harper node still has bound. The same listing is logged as a `[loopback-pool]` warning once a wait reaches 30 seconds (or a quarter of the timeout, if shorter). See [Loopback Pool Utilities](#loopback-pool-utilities).
+
 ### `targz(dirPath)`
 
 Packs and compresses a directory into a base64-encoded tar.gz string. Useful for `deploy_component` Operations API calls.
@@ -298,11 +302,13 @@ Packs and compresses a directory into a base64-encoded tar.gz string. Useful for
 These are used internally by `startHarper` and `teardownHarper`, but are exported for advanced use cases or custom runner integrations.
 
 - `validateLoopbackAddressPool(): Promise<{ successful: string[]; failed: { loopbackAddress: string; error: Error }[] }>` - Validates all pool addresses can be bound to
-- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool; throws a `ForeignListenerError` if another process already accepts connections on its operations or HTTP port (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports))
+- `getNextAvailableLoopbackAddress(): Promise<string>` - Allocates an address from the pool, waiting for one to be released if all are held; throws a `ForeignListenerError` if another process already accepts connections on its operations or HTTP port (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)), or a `LoopbackPoolExhaustedError` if the wait outlasts `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS`
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
 
 The pool is one file shared by every process on the machine: `${TMPDIR}/harper-integration-test-loopback-pool.json`, a JSON array with one slot per address holding the PID of the process that reserved it (or `null`), guarded by the `harper-integration-test-loopback-pool.lock` mutex beside it. Updates are published by renaming a complete `*.pending` file over it, so a process killed mid-update leaves the previous pool intact (and possibly an inert `*.pending` file). Releasing an address clears its slot only if this process holds it.
+
+Addresses held by dead processes are reclaimed each time the pool is found full. When every address is held by a live process, allocation waits up to `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`) and then throws a [`LoopbackPoolExhaustedError`](#loopbackpoolexhaustederror) naming the holders, rather than waiting forever. The default outlasts the quarantine below. Raise it if suites legitimately queue for longer than that.
 
 A pool file that is unparseable, not an array, or an empty array can still be produced by a writer that doesn't publish by rename (an older version of this package killed mid-write) or by an outside edit. Such a file is either about to be completed or has lost reservations whose holders may not have bound their address yet. Allocation does refuse an address that a Harper node is already listening on, but that check cannot see a reservation nothing is listening on yet. So the file is quarantined rather than reset:
 

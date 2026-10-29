@@ -24,6 +24,7 @@ export {
 	releaseLoopbackAddress,
 	releaseAllLoopbackAddressesForCurrentProcess,
 	ForeignListenerError,
+	LoopbackPoolExhaustedError,
 } from './loopbackAddressPool.ts';
 
 export { targz } from './targz.ts';

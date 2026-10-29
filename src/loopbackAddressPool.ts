@@ -40,6 +40,16 @@ let lockTokenCounter = 0;
 // reserve-to-bind time: its startup ceiling (DEFAULT_STARTUP_MAX_MS) plus the setup before it.
 const UNUSABLE_POOL_QUARANTINE_MS = 360000;
 
+// How long getNextAvailableLoopbackAddress waits for a free address before throwing. It must outlast
+// UNUSABLE_POOL_QUARANTINE_MS, which a quarantined pool file can make every caller wait out.
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 600000;
+const ACQUIRE_TIMEOUT_MS = (() => {
+	const parsed = parseInt(process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS || '', 10);
+	return Number.isNaN(parsed) || parsed < 1 ? DEFAULT_ACQUIRE_TIMEOUT_MS : parsed;
+})();
+// A wait this long is no longer a sibling suite about to finish, so it gets one warning naming the holders.
+const WAIT_NOTICE_MS = Math.min(30000, ACQUIRE_TIMEOUT_MS / 4);
+
 // Port used as a conflict canary when allocating an address. This MUST be a port that
 // Harper binds WITHOUT SO_REUSEPORT (the operations API — `OPERATIONS_API_PORT` in
 // harperLifecycle.ts — does exactly that, main-thread-only). Because that port is
@@ -105,6 +115,20 @@ class InvalidLoopbackAddressError extends Error {
 			`Invalid loopback address format: ${address}. Expected format: 127.0.0.X where X is between ${HARPER_LOOPBACK_POOL_START} and ${HARPER_LOOPBACK_POOL_START + HARPER_LOOPBACK_POOL_COUNT - 1}`
 		);
 		this.name = 'InvalidLoopbackAddressError';
+	}
+}
+
+/**
+ * Thrown by {@link getNextAvailableLoopbackAddress} when no address became free within
+ * `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS`. The message names the pool range and the pids
+ * holding its addresses.
+ */
+export class LoopbackPoolExhaustedError extends Error {
+	constructor(waitedMs: number, poolState: string) {
+		super(
+			`No loopback address became free within ${Math.round(waitedMs / 1000)}s. ${poolState}\nIf that much queuing is expected, raise HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS (now ${ACQUIRE_TIMEOUT_MS}).`
+		);
+		this.name = 'LoopbackPoolExhaustedError';
 	}
 }
 
@@ -484,6 +508,39 @@ export async function validateLoopbackAddressPool(): Promise<{
 }
 
 /**
+ * Says who holds the pool, for a caller that is waiting on it. `conflictPorts` maps a free slot's index
+ * to the canary port another Harper node was last found binding there.
+ */
+function describePoolState(pool: LoopbackPool | null, conflictPorts: ReadonlyMap<number, number>): string {
+	if (!pool) {
+		return `The pool file ${HARPER_LOOPBACK_POOL_PATH} is unusable and quarantined (see the earlier [loopback-pool] warning).`;
+	}
+	const address = (index: number) => `127.0.0.${index + HARPER_LOOPBACK_POOL_START}`;
+	const addressesByPid = new Map<number, string[]>();
+	const occupiedFree: string[] = [];
+	pool.forEach((pid, index) => {
+		if (pid !== null) {
+			addressesByPid.set(pid, [...(addressesByPid.get(pid) ?? []), address(index)]);
+		} else if (conflictPorts.has(index)) {
+			occupiedFree.push(`${address(index)} (port ${conflictPorts.get(index)})`);
+		}
+	});
+	const lines = [
+		`Pool ${address(0)}-${address(pool.length - 1)} (${pool.length} addresses) in ${HARPER_LOOPBACK_POOL_PATH}:`,
+		...[...addressesByPid].map(
+			([pid, addresses]) => `  pid ${pid}${pid === process.pid ? ' (this process)' : ''} holds ${addresses.join(', ')}`
+		),
+	];
+	if (occupiedFree.length > 0) {
+		lines.push(`  unclaimed but bound by another Harper node: ${occupiedFree.join(', ')}`);
+	}
+	lines.push(
+		'Each pid is alive; `ps -p <pid>` shows what it is, and `lsof -nP -iTCP:<port> -sTCP:LISTEN` what holds a port. Stop what leaked.'
+	);
+	return lines.join('\n');
+}
+
+/**
  * Retrieves the next available loopback address from the pool using a file-based
  * locking mechanism to safely allocate addresses across concurrent test processes.
  *
@@ -497,7 +554,8 @@ export async function validateLoopbackAddressPool(): Promise<{
  * 7. Returns the loopback address (e.g., "127.0.0.2")
  *
  * If no addresses are available, or the pool file is quarantined (see readPoolFile), waits and
- * retries until one becomes available.
+ * retries until one becomes available, for up to `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS`
+ * (default 10 minutes). A wait of 30 seconds or more logs one warning naming the holders.
  *
  * **Pool file location:** `${tmpdir()}/harper-integration-test-loopback-pool.json`
  * **Lock file location:** `${tmpdir()}/harper-integration-test-loopback-pool.lock`
@@ -508,6 +566,7 @@ export async function validateLoopbackAddressPool(): Promise<{
  * @throws {ForeignListenerError} If another process accepts connections on the address's canary
  * ports and `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS` is not set (the slot is released)
  * @throws {LockOwnershipLostError} If ownership is lost on the initial attempt and all three retries
+ * @throws {LoopbackPoolExhaustedError} If no address became free within the timeout
  */
 export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// Each index maps to a different loopback address (index 0 -> 127.0.0.2, index 1 -> 127.0.0.3, etc.)
@@ -532,10 +591,17 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 	// them within this attempt; the set is cleared before each wait so they can be re-probed once
 	// the lingering node has had time to exit.
 	const triedIndices = new Set<number>();
+	// What the exhaustion diagnostic reports: the pool as the last attempt saw it (null while quarantined)
+	// and the canary port that made each skipped address unusable.
+	const waitStartedAt = performance.now();
+	let noticed = false;
+	let lastPool: LoopbackPool | null = null;
+	const conflictPorts = new Map<number, number>();
 	while (true) {
 		const assignedIndex = await withLock(async (lockToken) => {
 			// Read the pool file
 			const loopbackPool = await readPoolFile(HARPER_LOOPBACK_POOL_PATH, lockToken);
+			lastPool = loopbackPool;
 			if (!loopbackPool) return null;
 
 			// Find the first available index we haven't already found in-use this attempt
@@ -624,6 +690,7 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 			// not to re-try it this attempt; loop to claim the next available one.
 			await releaseLoopbackAddress(loopbackAddress);
 			triedIndices.add(assignedIndex);
+			conflictPorts.set(assignedIndex, conflictingPort);
 			console.warn(
 				`[loopback-pool] ${loopbackAddress} is still in use by another Harper node (port ${conflictingPort} bound); skipping to avoid an SO_REUSEPORT co-bind.`
 			);
@@ -633,6 +700,16 @@ export async function getNextAvailableLoopbackAddress(): Promise<string> {
 		// No available addresses; clear the per-attempt skip set so poisoned addresses can be
 		// re-probed (their lingering node may have exited during the wait), then wait and retry.
 		triedIndices.clear();
+		const waitedMs = performance.now() - waitStartedAt;
+		if (waitedMs >= ACQUIRE_TIMEOUT_MS) {
+			throw new LoopbackPoolExhaustedError(waitedMs, describePoolState(lastPool, conflictPorts));
+		}
+		if (!noticed && waitedMs >= WAIT_NOTICE_MS) {
+			noticed = true;
+			console.warn(
+				`[loopback-pool] Still waiting for a free loopback address after ${Math.round(waitedMs / 1000)}s; giving up after ${Math.round(ACQUIRE_TIMEOUT_MS / 1000)}s. ${describePoolState(lastPool, conflictPorts)}`
+			);
+		}
 		await sleep(RETRY_DELAY_MS);
 	}
 }
