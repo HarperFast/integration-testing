@@ -30,7 +30,7 @@ npm install --save-dev @harperfast/integration-testing
 
 ## Framework Agnosticism
 
-The core lifecycle and loopback pool APIs in this package — `startHarper`, `teardownHarper`, `killHarper`, and the loopback utilities — are **not tied to any specific test runner or framework**. They spawn and manage Harper child processes and allocate loopback addresses safely across concurrent processes using a file-based locking mechanism. This means they can be used with any testing framework that supports async setup and teardown: Node.js `node:test`, Vitest, Playwright, or anything else.
+The core lifecycle and loopback pool APIs in this package — `startHarper`, `teardownHarper`, `killHarper`, and the loopback utilities — are **not tied to any specific test runner or framework**. They spawn and manage Harper child processes and allocate loopback addresses safely across concurrent processes, whatever their PID namespace or `TMPDIR`. This means they can be used with any testing framework that supports async setup and teardown: Node.js `node:test`, Vitest, Playwright, or anything else.
 
 The key responsibility these APIs place on you is **thinking critically about Harper instance scope**. Starting a Harper instance has real cost — it spawns a process, allocates a loopback address from the pool, and creates a temporary install directory. How you scope instances depends on your framework and what you're testing. A single instance shared across many assertions in one logical test block may be perfectly appropriate; spinning up a fresh instance for every individual assertion would be wasteful. What matters is that concurrently executing scopes each have their own instance and loopback address — the pool handles cross-process allocation safely, but your setup and teardown hooks determine the boundaries.
 
@@ -84,7 +84,7 @@ Each node binds its fixed ports on its own loopback address, so nodes on differe
 
 `getNextAvailableLoopbackAddress`, and therefore `startHarper`, refuses an address when another process already accepts connections on its operations or HTTP port, throwing a `ForeignListenerError` that names the port. Stop the other process or bind it to a specific address (`lsof -nP -iTCP:9926 -sTCP:LISTEN` names it). To run anyway, set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1`, which turns the error into a warning.
 
-On Linux, binding a pool address beside such a listener already fails, so the pool reports each address as still in use by another node instead.
+On Linux, such a listener also stops anything else from binding that port on a single address, Harper included, so there the same error covers Harper's HTTPS, MQTT and MQTTS ports too. With the variable set on Linux, the address is handed out even though a Harper node bound to that address under the other listener cannot be ruled out.
 
 ## API
 
@@ -287,11 +287,11 @@ try {
 
 ### `ForeignListenerError`
 
-Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when another process already accepts connections on the operations or HTTP port of a newly allocated address (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)). It extends `Error` with `name` set to `'ForeignListenerError'`, plus `loopbackAddress` and `port` properties naming what was reached. The address is returned to the pool before it is thrown. Set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1` (or `true`) to get a warning instead.
+Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when another process already accepts connections on the operations or HTTP port of a newly allocated address, or on Linux on any of its Harper ports through a listener on all interfaces (see [Other services listening on Harper's ports](#other-services-listening-on-harpers-ports)). It extends `Error` with `name` set to `'ForeignListenerError'`, plus `loopbackAddress` and `port` properties naming what was reached. The address is released before the error is thrown. Set `HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS=1` (or `true`) to get a warning instead.
 
 ### `LoopbackPoolExhaustedError`
 
-Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when no address became free within `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`, 10 minutes). It extends `Error` with `name` set to `'LoopbackPoolExhaustedError'`; the message gives the pool range and, for each holding pid, the addresses it holds, plus any unclaimed address a Harper node still has bound. The same listing is logged as a `[loopback-pool]` warning once a wait reaches 30 seconds (or a quarter of the timeout, if shorter). See [Loopback Pool Utilities](#loopback-pool-utilities).
+Thrown by `getNextAvailableLoopbackAddress`, and so by `startHarper`, when no address became free within `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`, 10 minutes). It extends `Error` with `name` set to `'LoopbackPoolExhaustedError'`. The message gives the pool range and, for each holding process, the addresses it holds: its pid, the PID namespace when that differs from this process's, and the host name when that differs. It also lists any address held by a process that did not identify itself, and any unclaimed address a Harper node still has bound. The same listing is logged as a `[loopback-pool]` warning once a wait reaches 30 seconds (or a quarter of the timeout, if shorter). See [Loopback Pool Utilities](#loopback-pool-utilities).
 
 ### `targz(dirPath)`
 
@@ -306,19 +306,13 @@ These are used internally by `startHarper` and `teardownHarper`, but are exporte
 - `releaseLoopbackAddress(address: string): Promise<void>` - Returns an address to the pool
 - `releaseAllLoopbackAddressesForCurrentProcess(): Promise<void>` - Releases all addresses held by this process
 
-The pool is one file shared by every process on the machine: `${TMPDIR}/harper-integration-test-loopback-pool.json`, a JSON array with one slot per address holding the PID of the process that reserved it (or `null`), guarded by the `harper-integration-test-loopback-pool.lock` mutex beside it. Updates are published by renaming a complete `*.pending` file over it, so a process killed mid-update leaves the previous pool intact (and possibly an inert `*.pending` file). Releasing an address clears its slot only if this process holds it.
+A process holds an address by listening on its **claim port** (`HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT`, default `9924`). The kernel allows one listener per address and port, so while one process holds an address, no other process can claim it. The kernel also closes the listener when its process exits, however it exits. This covers every process in one network namespace, which is where two Harper nodes on one address would collide, whatever their PID namespace or `TMPDIR`. Processes in separate network namespaces, such as most containers, have separate loopback interfaces and cannot collide. Every run on a machine must use the same claim port. Nothing is written to disk.
 
-Addresses held by dead processes are reclaimed each time the pool is found full. When every address is held by a live process, allocation waits up to `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`) and then throws a [`LoopbackPoolExhaustedError`](#loopbackpoolexhaustederror) naming the holders, rather than waiting forever. The default outlasts the quarantine below. Raise it if suites legitimately queue for longer than that.
+Allocation takes the first address whose claim port is free, so an address left by a process that died is reused at once. It then skips an address on which Harper's operations, HTTP, HTTPS, MQTT or MQTTS port is still bound, such as by a node that outlived a killed test runner, and tries the next. Replication is not checked: harper-pro's default replication port has no host, so every node binds it on all interfaces. Releasing an address only frees a claim this process holds.
 
-A pool file that is unparseable, not an array, or an empty array can still be produced by a writer that doesn't publish by rename (an older version of this package killed mid-write) or by an outside edit. Such a file is either about to be completed or has lost reservations whose holders may not have bound their address yet. Allocation does refuse an address that a Harper node is already listening on, but that check cannot see a reservation nothing is listening on yet. So the file is quarantined rather than reset:
+When every address is held, allocation waits up to `HARPER_INTEGRATION_TEST_LOOPBACK_POOL_TIMEOUT_MS` (default `600000`), then throws a [`LoopbackPoolExhaustedError`](#loopbackpoolexhaustederror) naming the holders, rather than waiting forever. Raise the timeout if suites legitimately queue for longer than that. To name its holder, a claim answers a connection with one JSON line: its process's pid, PID namespace and host name. Allocation itself never connects to a claim.
 
-- `getNextAvailableLoopbackAddress()` waits, and both release functions leave the file untouched, until it has gone 6 minutes without modification. That outlasts `startHarper`'s default startup ceiling (2 minutes, 5 under CI), so a `startHarper` that reserved an address before the file broke has bound it or given up by then.
-- After that, the pool is reinitialized with every address free and a warning is logged. From then on, an address still in use is protected only by that listening check.
-- Deleting the file skips the wait, but only do that once every integration-test run on the machine — including ones using older versions of this package — has stopped.
-
-The quarantine bounds, rather than eliminates, the risk of handing out an address twice: a caller that holds an address for longer than that without binding it (for example, with a `startupMaxMs` above 5 minutes) is not covered.
-
-If other processes take over the pool lock as stale (held over 10 seconds) before this process publishes its update, the allocate and release functions retry from the current pool state with a `[loopback-pool]` warning; after four takeovers in a row they reject with an error named `LockOwnershipLostError`.
+Versions 1.0.5 and earlier kept the pool as a file of process IDs in `${TMPDIR}/harper-integration-test-loopback-pool.json`. They do not see claims, and this version does not read that file. Until every run on a machine uses this version, the two can hand out one address to two runs before either has started its node. Let runs on the old version finish before switching. The old file can then be deleted.
 
 ## Node.js Test Runner
 

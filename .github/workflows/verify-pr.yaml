@@ -38,8 +38,15 @@ jobs:
         run: npm run check
       - name: Build
         run: npm run build
+      # The loopback pool's PID-namespace test runs its holder under `unshare --user`, which Ubuntu's
+      # AppArmor default blocks for unprivileged users.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       # Tests run the TypeScript sources directly via Node's native type stripping (Node >= 22.18,
       # enforced by devEngines). They spawn short-lived node processes and bind loopback ports, so
       # no real Harper instance or loopback-pool setup is required.
       - name: Run tests
         run: npm test
+        env:
+          LOOPBACK_POOL_TEST_REQUIRE_PID_NAMESPACE: ${{ runner.os == 'Linux' && '1' || '' }}
