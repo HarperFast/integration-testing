@@ -1,23 +1,26 @@
-import { after, before, describe, test } from 'node:test';
-import { deepStrictEqual, match, ok, strictEqual } from 'node:assert';
+import { before, describe, test } from 'node:test';
+import { match, ok, strictEqual } from 'node:assert';
 import { createServer, type AddressInfo } from 'node:net';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { acceptsConnections } from '../src/portUtils.ts';
+import { acceptsConnections, isPortFree } from '../src/portUtils.ts';
 
 const HOST = '127.0.0.1';
 const ALLOW_ENV = 'HARPER_INTEGRATION_TEST_ALLOW_FOREIGN_LISTENERS';
 
-async function freePort(): Promise<number> {
-	const server = createServer();
-	await new Promise<void>((resolve, reject) => {
-		server.once('error', reject);
-		server.listen(0, HOST, () => resolve());
-	});
-	const { port } = server.address() as AddressInfo;
-	await new Promise<void>((resolve) => server.close(() => resolve()));
-	return port;
+/** Distinct free ports: all are held at once, so the OS cannot hand out the same one twice. */
+async function freePorts(count: number): Promise<number[]> {
+	const servers = Array.from({ length: count }, () => createServer());
+	await Promise.all(
+		servers.map(
+			(server) =>
+				new Promise<void>((resolve, reject) => {
+					server.once('error', reject);
+					server.listen(0, HOST, () => resolve());
+				})
+		)
+	);
+	const ports = servers.map((server) => (server.address() as AddressInfo).port);
+	await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+	return ports;
 }
 
 /**
@@ -26,7 +29,7 @@ async function freePort(): Promise<number> {
  * (EADDRNOTAVAIL on macOS). Resolves why they cannot run here, or false when they can.
  */
 async function skipReason(): Promise<string | false> {
-	if (process.platform === 'linux') return 'Linux skips the probe';
+	if (process.platform === 'linux') return 'Linux checks for a listener on all interfaces by binding, not by connecting';
 	const probeFails = await acceptsConnections(HOST, 0).then(
 		() => false,
 		() => true
@@ -35,29 +38,22 @@ async function skipReason(): Promise<string | false> {
 }
 
 describe('an address that cannot be checked', { skip: await skipReason() }, () => {
-	let poolDir: string | undefined;
+	let claimPort: number;
 	let pool: typeof import('../src/loopbackAddressPool.ts');
 
 	before(async () => {
-		poolDir = mkdtempSync(join(tmpdir(), 'loopback-pool-probe-test-'));
-		// The pool keeps its state in os.tmpdir(), which prefers TMPDIR on POSIX and TEMP on Windows.
-		process.env.TMPDIR = process.env.TEMP = poolDir;
+		let operationsPort: number;
+		[claimPort, operationsPort] = await freePorts(2);
 		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_START = '1';
 		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_POOL_COUNT = '1';
-		process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(await freePort());
+		process.env.HARPER_INTEGRATION_TEST_LOOPBACK_CLAIM_PORT = String(claimPort);
+		process.env.HARPER_INTEGRATION_TEST_CONFLICT_PROBE_PORT = String(operationsPort);
 		process.env.HARPER_INTEGRATION_TEST_HTTP_CONFLICT_PROBE_PORT = '0';
+		process.env.HARPER_INTEGRATION_TEST_OTHER_CONFLICT_PROBE_PORTS = '';
 		delete process.env[ALLOW_ENV];
 		// The pool reads these once, when it is imported.
 		pool = await import('../src/loopbackAddressPool.ts');
 	});
-
-	after(() => {
-		if (poolDir) rmSync(poolDir, { recursive: true, force: true });
-	});
-
-	function readPool(): unknown {
-		return JSON.parse(readFileSync(join(poolDir!, 'harper-integration-test-loopback-pool.json'), 'utf-8'));
-	}
 
 	test('is refused, with the reason, and goes back to the pool', async () => {
 		let error: any;
@@ -71,7 +67,7 @@ describe('an address that cannot be checked', { skip: await skipReason() }, () =
 		match(error.message, /Could not check whether another process accepts connections on 127\.0\.0\.1/);
 		match(error.message, new RegExp(`${ALLOW_ENV}=1`));
 		ok(error.cause, 'the probe error is the cause');
-		deepStrictEqual(readPool(), [null]);
+		ok(await isPortFree(HOST, claimPort), 'the refused address goes back to the pool');
 	});
 
 	test(`is handed out with a warning when ${ALLOW_ENV} is set`, async (t) => {

@@ -1112,11 +1112,11 @@ export async function teardownHarper(ctx: StartedHarperTestContext): Promise<voi
 		} else {
 			// A Harper child escaped the tree kill and still holds this address's ports. Do NOT
 			// recycle the address — under SO_REUSEPORT a later suite could silently co-bind it
-			// (the exact failure the loopback pool exists to prevent). Leave the slot parked under
-			// this process's PID; it is reclaimed when this (per-file) process exits and its PID
-			// goes dead. The conflict canary in getNextAvailableLoopbackAddress is the backstop if
-			// the address is somehow handed out before then. The install directory stays too: the
-			// process holding the ports may still be using it.
+			// (the exact failure the loopback pool exists to prevent). Keep this process's claim on
+			// the address; the kernel drops it when this (per-file) process exits. After that, the
+			// pool's check of the address's Harper ports keeps it from being handed out while the
+			// escaped child still binds them. The install directory stays too: the process holding
+			// the ports may still be using it.
 			console.warn(
 				`Harper ports on ${ctx.harper.hostname} still in use after teardown (${DEFAULT_PORT_RELEASE_TIMEOUT_MS}ms); NOT recycling the address or removing ${ctx.harper.dataRootDir} (a Harper child outlived the kill). The slot will be reclaimed when this process exits.`
 			);
